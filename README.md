@@ -2,6 +2,8 @@
 
 这是当前保留的 query-skill / query-multiskill 数据生成代码版本。
 
+接手者请先读 [HANDOFF.md](HANDOFF.md)，那里包含远端路径、API profile、运行命令、数据口径和已知边界。
+
 核心口径：
 
 ```text
