@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Replay the 2026-06-01 400-row pilot with the current query prompts.
+"""Replay the SkillRouter Reference-400 candidate set with current query prompts.
 
-The historical pilot already contains the sampled single skills and redundant
-multi-skill candidate panels. This script keeps those rows fixed and only
-regenerates the query payload with the current SkillRouter-aligned prompts.
+Reference-400 was frozen on 2026-06-01 and already contains the sampled
+single skills and redundant multi-skill candidate panels. This script keeps
+those rows fixed and only regenerates the query payload with the current
+SkillRouter-aligned prompts. Historical input and output filenames still use
+pilot_100_* / pilot_400_* for backward compatibility.
 """
 
 from __future__ import annotations
@@ -314,6 +316,37 @@ def workflow_quality_filter(
     }
 
 
+def relax_official_gt_multiskill_filter(
+    row: dict[str, Any],
+    evaluation: dict[str, Any],
+    workflow_quality: dict[str, Any],
+) -> dict[str, Any]:
+    """Treat official GT co-occurrence as evidence against over-strict redundancy rejection."""
+    if row.get("panel_source_tier") != "skillrouter_gt_multiskill_v1":
+        return workflow_quality
+    if evaluation.get("hard_issues"):
+        return workflow_quality
+
+    relaxable_reasons = {
+        "near_duplicate_selected_skills",
+        "weak_unrelated_or_overlapping_bundle",
+    }
+    reject_reasons = set(workflow_quality.get("reject_reasons") or [])
+    if not reject_reasons or not reject_reasons.issubset(relaxable_reasons):
+        return workflow_quality
+
+    out = dict(workflow_quality)
+    weak_reasons = set(out.get("weak_reasons") or [])
+    weak_reasons.update(f"official_gt_relaxed_reject:{reason}" for reason in sorted(reject_reasons))
+    out["accepted"] = True
+    out["status"] = "weak"
+    out["reject_reasons"] = []
+    out["weak_reasons"] = sorted(weak_reasons)
+    if out.get("workflow_type") == "invalid":
+        out["workflow_type"] = "capability_bundle"
+    return out
+
+
 def raw_response_path(output_dir: Path, target: int, index: int) -> Path:
     return output_dir / "raw_responses" / f"k{target}" / f"{index:04d}.json"
 
@@ -386,6 +419,14 @@ def call_multi(
         best_of_n=1,
         strict_candidate_filter=False,
     )
+    generation_guidance = str(row.get("generation_guidance") or "").strip()
+    if generation_guidance:
+        messages = [dict(message) for message in messages]
+        messages[-1]["content"] = (
+            messages[-1]["content"]
+            + "\n\nAdditional generation guidance for this row:\n"
+            + generation_guidance
+        )
     response = multi.call_chat_completion(
         profile["base_url"],
         profile["api_key"],
@@ -409,6 +450,7 @@ def call_multi(
         strict_candidate_filter=False,
     )
     workflow_quality = workflow_quality_filter(generated, evaluation, panel, target)
+    workflow_quality = relax_official_gt_multiskill_filter(row, evaluation, workflow_quality)
     return {
         "index": row_number,
         "source_index": row.get("index"),
@@ -420,6 +462,9 @@ def call_multi(
         "target_skill_count": target,
         "old_generated": row.get("generated"),
         "old_selected_skill_ids": (row.get("generated") or {}).get("selected_skill_ids"),
+        "input_sampling": row.get("sampling"),
+        "input_official_task": row.get("official_task"),
+        "generation_guidance": row.get("generation_guidance"),
         "generated": generated,
         "workflow_quality_filter": workflow_quality,
         "accepted_for_training": workflow_quality["accepted"],

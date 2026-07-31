@@ -1,19 +1,27 @@
-# SkillSearch Query Generation
+# SkillSearch Data Synthesis
 
-这是当前保留的 query-skill / query-multiskill 数据生成代码版本。
+这是当前保留的 query-skill / query-multiskill 数据合成代码版本。
 
-接手者请先读 [HANDOFF.md](HANDOFF.md)，那里包含远端路径、API profile、运行命令、数据口径和已知边界。
+接手者请先读 [HANDOFF_20260731.md](HANDOFF_20260731.md)。它是当前完整的研究、代码、资产、复现、迁移和运维说明；[HANDOFF_20260720.md](HANDOFF_20260720.md) 与 [HANDOFF.md](HANDOFF.md) 保留为历史实验快照和逐日取证。
 
 核心口径：
 
 ```text
-固定 0601 pilot candidate inputs
+固定 SkillRouter Reference-400 candidate inputs
 + SkillRouter-style plain-text query prompt
 + 400 条版本的 metadata-as-body-preview input construction
 + 当前 selected-id repair / quality filter / reclassification
 ```
 
-这版代码对应当前给 partner 审阅的 400 条数据：
+`Reference-400` 的正式全称是：
+
+```text
+SkillRouter Reference-400 Candidate Set (2026-06-01 freeze)
+```
+
+历史文件名中仍可能出现 `pilot_100_*`、`pilot_400_*`；这些是兼容旧输出和脚本的路径名，不再作为正式叙述名称。
+
+这版代码对应当前给 partner 审阅的 400 条参考数据：
 
 ```text
 /Users/chenyufei/Documents/GR&Agentic/partner_review/0605_skillrouter_replay_reclassified_v2/pilot_400.jsonl
@@ -178,11 +186,63 @@ output: $10  / 1M tokens
 
 ## Main Commands
 
+Generate five clean task-style pseudo queries for every training-catalog skill using one fixed-budget `n=8` request per skill:
+
+```bash
+python3 scripts/build_longtail_pseudo_queries.py generate-catalog \
+  --skills-jsonl outputs/train/skill_gr_21k_single_docaug_20260703/prepare_train/selected_skills.jsonl \
+  --profile profiles/gpt4o_huayanapi.json \
+  --output-dir outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713 \
+  --candidate-count 8 \
+  --keep-per-skill 5 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --max-tokens 512 \
+  --workers 4
+```
+
+After generation is complete, validate full coverage and append the pseudo rows to the base decoder data:
+
+```bash
+python3 scripts/build_longtail_pseudo_queries.py augment-catalog \
+  --base-rows outputs/train/skill_gr_21k_single_docaug_20260703/prepare_train/decoder_rows.base.jsonl \
+  --pseudo-rows outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/selected_task5.jsonl \
+  --skills-jsonl outputs/train/skill_gr_21k_single_docaug_20260703/prepare_train/selected_skills.jsonl \
+  --output outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/decoder_rows.base_plus_task5.jsonl \
+  --manifest outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/augment_manifest.json
+```
+
+Canonicalize retrieval-identical skill documents, remap all labels, and reuse the aligned Qwen embeddings:
+
+```bash
+python3 scripts/skill_gr_pipeline.py canonicalize-skill-aliases \
+  --skills-jsonl outputs/train/skill_gr_21k_single_docaug_20260703/prepare_train/selected_skills.jsonl \
+  --rows outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/decoder_rows.base_plus_task5.jsonl \
+  --embeddings outputs/train/skill_gr_21k_single_docaug_20260703/skill_embeddings/skill_embeddings.pt \
+  --output-dir outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_learned_d4_inputs
+```
+
+Train collision-free four-level LETTER semantic IDs. In `learned_codes` mode, the output contains four learned codes and no ordinal dedup column; residual collisions are resolved by a minimum-cost unique assignment in the final codebook:
+
+```bash
+python3 scripts/train_letter_rqvae_official.py \
+  --letter-rqvae-dir external/LETTER/RQ-VAE \
+  --embeddings outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_learned_d4_inputs/canonical_skill_embeddings.pt \
+  --rows outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_learned_d4_inputs/rows_000.decoder_rows.base_plus_task5.jsonl \
+  --output-dir outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/letter_d4_learned_codes \
+  --semantic-id-mode learned_codes \
+  --num-emb-list 256,256,256,256 \
+  --e-dim 32 \
+  --layers 2048,1024,512,256,128,64 \
+  --batch-size 1024 \
+  --epochs 100
+```
+
 Run the 400-row replay with the frozen prompt defaults:
 
 ```bash
 python3 scripts/replay_pilot_400_skillrouter_prompt.py \
-  --profile profiles/gpt4o_openrouter.json \
+  --profile profiles/gpt4o_huayanapi.json \
   --output-dir outputs/eval/skillrouter_metadata_replay \
   --k-values 1,2,3,4 \
   --workers 4 \
@@ -194,5 +254,6 @@ Run tests:
 
 ```bash
 python3 -m py_compile scripts/generate_single_skill_probe.py scripts/generate_multiskill_probe.py scripts/replay_pilot_400_skillrouter_prompt.py
-python3 -m unittest tests/test_skillrouter_prompt_alignment.py
+python3 -m unittest discover -s tests -p 'test_skillrouter_prompt_alignment.py'
+python3 -m unittest discover -s tests -p 'test_longtail_pseudo_queries.py'
 ```

@@ -160,6 +160,7 @@ def call_chat_completion(
     timeout: int,
     use_schema: bool,
     max_tokens: int,
+    n: int = 1,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
@@ -170,6 +171,8 @@ def call_chat_completion(
         body["max_tokens"] = max_tokens
     if top_p > 0:
         body["top_p"] = top_p
+    if n > 1:
+        body["n"] = n
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -185,20 +188,30 @@ def call_chat_completion(
         method="POST",
     )
     retryable_http_codes = {403, 408, 409, 425, 429, 500, 502, 503, 504}
+    max_attempts = 6
     last_exc: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(max_attempts):
+        retry_after = 0.0
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if exc.code not in retryable_http_codes or attempt == 3:
+            if exc.code not in retryable_http_codes or attempt == max_attempts - 1:
                 raise
-        except urllib.error.URLError as exc:
+            header_value = str((exc.headers or {}).get("Retry-After") or "").strip()
+            if header_value:
+                try:
+                    retry_after = max(0.0, float(header_value))
+                except ValueError:
+                    retry_after = 0.0
+        except (urllib.error.URLError, TimeoutError) as exc:
             last_exc = exc
-            if attempt == 3:
+            if attempt == max_attempts - 1:
                 raise
-        time.sleep(min(12.0, 1.5 * (2 ** attempt)))
+        backoff = min(20.0, 1.5 * (2 ** attempt))
+        jitter = random.uniform(0.0, min(1.0, backoff * 0.2))
+        time.sleep(max(backoff, retry_after) + jitter)
     assert last_exc is not None
     raise last_exc
 
