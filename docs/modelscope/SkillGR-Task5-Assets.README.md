@@ -6,7 +6,7 @@ language:
   - en
 ---
 
-# SkillGR Task5 Data
+# SkillGR Task5 Assets
 
 Private reproducibility dataset for SkillSearch / SkillGR experiments.
 
