@@ -4,6 +4,8 @@
 
 接手者请先读 [HANDOFF_20260731.md](HANDOFF_20260731.md)。它是当前完整的研究、代码、资产、复现、迁移和运维说明；[HANDOFF_20260720.md](HANDOFF_20260720.md) 与 [HANDOFF.md](HANDOFF.md) 保留为历史实验快照和逐日取证。
 
+GR 的 RIPOR/PAG 接入、单节点 8 卡启动方式和不能安全套用普通 DDP 的码本阶段见 [docs/ripor-pag-ddp.md](docs/ripor-pag-ddp.md)。
+
 核心口径：
 
 ```text

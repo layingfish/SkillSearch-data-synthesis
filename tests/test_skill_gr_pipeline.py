@@ -29,6 +29,7 @@ from skill_gr_pipeline import (  # noqa: E402
     allowed_next_tokens_for_skill_trie,
     build_decoder_target,
     build_arg_parser,
+    build_ripor_candidate_batch,
     build_single_sid_catalog_rows,
     expand_single_sid_query_rows,
     build_prefix_trie,
@@ -47,7 +48,9 @@ from skill_gr_pipeline import (  # noqa: E402
     load_semantic_ids_with_mode,
     load_structured_decoder_checkpoint,
     make_structured_t5_sid_model,
+    load_ranked_skill_candidates_with_scores,
     native_semantic_id_text,
+    pag_prefix_planner_score,
     prepared_selected_skill_ids,
     remap_row_skill_aliases,
     resolve_eval_max_source_length,
@@ -487,6 +490,81 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(stopped_beam["completed"], [(1, 3, 5, 0)])
         self.assertTrue(stopped_beam["stopped"])
         self.assertAlmostEqual(stopped_beam["score"], -2.75)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_ripor_candidate_batch_keeps_sibling_positives_and_teacher_scores(self) -> None:
+        import torch
+
+        semantic_ids = {"skill/a": [1, 2], "skill/b": [1, 3], "skill/c": [4, 5]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "teacher.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "index": "query-1",
+                        "ranked_skill_ids": ["skill/c", "skill/a"],
+                        "ranked_skill_scores": {"skill/c": 0.2, "skill/a": 0.8},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            candidate_map, score_map = load_ranked_skill_candidates_with_scores(path)
+
+        batch = build_ripor_candidate_batch(
+            [
+                {
+                    "index": "query-1",
+                    "selected_skill_ids": ["skill/a"],
+                    "source_selected_skill_ids": ["skill/a", "skill/b"],
+                }
+            ],
+            semantic_ids,
+            depth=2,
+            max_negatives=1,
+            hard_negative_map=candidate_map,
+            teacher_score_map=score_map,
+            seed=7,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(batch["ripor_candidate_positive"].tolist()[0][:2], [True, True])
+        self.assertAlmostEqual(float(batch["ripor_candidate_teacher_scores"][0, 0]), 0.8, places=5)
+        self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 3, 2))
+
+    def test_pag_planner_excludes_completed_skill_from_shared_prefix(self) -> None:
+        descendants = {(1,): ["skill/done", "skill/sibling"]}
+        scores = {"skill/done": 10.0, "skill/sibling": 1.0}
+        self.assertEqual(
+            pag_prefix_planner_score([1], scores, descendants, "max", excluded_skill_ids={"skill/done"}),
+            1.0,
+        )
+
+    def test_pag_zero_weight_preserves_baseline_beam_score(self) -> None:
+        beam = {
+            "decoder_input_ids": [772],
+            "current_prefix": [],
+            "completed": [],
+            "score": -2.0,
+            "stopped": False,
+        }
+        baseline = advance_structured_beam(
+            beam, 0, 1, -0.5, codebook_size=256, depth=3, dedup_size=4
+        )
+        pag_zero = advance_structured_beam(
+            beam,
+            0,
+            1,
+            -0.5,
+            codebook_size=256,
+            depth=3,
+            dedup_size=4,
+            planner_increment=100.0,
+            planner_weight=0.0,
+        )
+        self.assertEqual(pag_zero["decoder_input_ids"], baseline["decoder_input_ids"])
+        self.assertEqual(pag_zero["completed"], baseline["completed"])
+        self.assertEqual(pag_zero["score"], baseline["score"])
 
     def test_native_semantic_id_text_uses_base_vocab_words_and_digits(self) -> None:
         self.assertEqual(

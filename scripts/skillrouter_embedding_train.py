@@ -28,6 +28,15 @@ from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from skill_gr_pipeline import compute_at_k_metrics, load_jsonl, write_json, write_jsonl  # noqa: E402
+from distributed_utils import (
+    all_gather_tensor,
+    all_gather_tensor_with_grad,
+    barrier,
+    destroy_distributed,
+    initialize_distributed,
+    unwrap_model,
+    wrap_ddp,
+)
 
 
 QUERY_INSTRUCTION = (
@@ -648,12 +657,18 @@ def command_train(args: argparse.Namespace) -> None:
     dataset = PairDataset(args.pairs, args.max_examples)
     if len(dataset) == 0:
         raise SystemExit("empty training pair dataset")
-    rng = random.Random(args.seed)
+    context = initialize_distributed(cpu=args.cpu)
+    if args.training_mode == "gradcache" and context.enabled:
+        raise SystemExit(
+            "--training-mode gradcache is intentionally single-process: its manual recomputation path "
+            "needs a dedicated cross-rank gradient cache; use --training-mode standard for 8-GPU DDP"
+        )
+    rng = random.Random(args.seed + context.rank)
     random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed + context.rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+        torch.cuda.manual_seed_all(args.seed + context.rank)
+    device = context.device
     if args.training_mode == "gradcache" and args.fp16:
         raise SystemExit("gradcache mode currently supports bf16/fp32 only; use --bf16 instead of --fp16")
     use_gradient_checkpointing = not args.no_gradient_checkpointing and args.training_mode == "standard"
@@ -663,11 +678,12 @@ def command_train(args: argparse.Namespace) -> None:
         args.bf16,
         gradient_checkpointing=use_gradient_checkpointing,
     )
+    model = wrap_ddp(model, context)
     model.train()
     if args.training_mode == "gradcache":
         ensure_gradcache_deterministic(model)
     wandb_run = None
-    if args.wandb_project:
+    if context.is_main and args.wandb_project:
         try:
             import wandb
 
@@ -681,9 +697,12 @@ def command_train(args: argparse.Namespace) -> None:
             print(f"wandb disabled: {exc}", flush=True)
 
     def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-        # Shuffle negatives per epoch/step so the first explicit negatives do not dominate.
+        # Shuffle negatives per epoch/step.  Keep a fixed doc tensor shape for
+        # cross-rank all-gather, but mask missing negatives instead of repeating
+        # a real document (which would change its InfoNCE denominator weight).
         query_texts = [row["query_text"] for row in batch]
         doc_texts: list[str] = []
+        doc_valid: list[bool] = []
         labels: list[int] = []
         for row in batch:
             negs = list(row.get("negative_texts") or [])
@@ -691,10 +710,40 @@ def command_train(args: argparse.Namespace) -> None:
             negs = negs[: args.negatives_per_pair]
             labels.append(len(doc_texts))
             doc_texts.append(row["positive_text"])
+            doc_valid.append(True)
             doc_texts.extend(negs)
-        return {"queries": query_texts, "docs": doc_texts, "labels": torch.tensor(labels, dtype=torch.long)}
+            doc_valid.extend([True] * len(negs))
+            missing = args.negatives_per_pair - len(negs)
+            if missing > 0:
+                doc_texts.extend([""] * missing)
+                doc_valid.extend([False] * missing)
+        return {
+            "queries": query_texts,
+            "docs": doc_texts,
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "doc_valid_mask": torch.tensor(doc_valid, dtype=torch.bool),
+        }
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate)
+    sampler = None
+    if context.enabled:
+        from torch.utils.data.distributed import DistributedSampler
+
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=context.world_size,
+            rank=context.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=False,
+        )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=collate,
+    )
     if args.fused_optimizer and device.type != "cuda":
         raise SystemExit("--fused-optimizer requires CUDA")
     optimizer = torch.optim.AdamW(
@@ -710,43 +759,53 @@ def command_train(args: argparse.Namespace) -> None:
     scaler_enabled = args.fp16 and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(
-        args.output_dir / "train_manifest.json",
-        {
-            "pairs": str(args.pairs),
-            "examples": len(dataset),
-            "model": args.model,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "grad_accum": args.grad_accum,
-            "negatives_per_pair": args.negatives_per_pair,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "warmup_ratio": args.warmup_ratio,
-            "temperature": args.temperature,
-            "max_length": args.max_length,
-            "bf16": args.bf16,
-            "fp16": args.fp16,
-            "training_mode": args.training_mode,
-            "gradient_checkpointing": use_gradient_checkpointing,
-            "query_chunk_size": args.query_chunk_size,
-            "doc_chunk_size": args.doc_chunk_size,
-            "length_sort": args.length_sort,
-            "fused_optimizer": args.fused_optimizer,
-            "gradcache_tokenization_reuse": args.training_mode == "gradcache",
-        },
-    )
+    if context.is_main:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            args.output_dir / "train_manifest.json",
+            {
+                "pairs": str(args.pairs),
+                "examples": len(dataset),
+                "model": args.model,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "negatives_per_pair": args.negatives_per_pair,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "warmup_ratio": args.warmup_ratio,
+                "temperature": args.temperature,
+                "max_length": args.max_length,
+                "bf16": args.bf16,
+                "fp16": args.fp16,
+                "training_mode": args.training_mode,
+                "gradient_checkpointing": use_gradient_checkpointing,
+                "query_chunk_size": args.query_chunk_size,
+                "doc_chunk_size": args.doc_chunk_size,
+                "length_sort": args.length_sort,
+                "fused_optimizer": args.fused_optimizer,
+                "gradcache_tokenization_reuse": args.training_mode == "gradcache",
+                "ddp_world_size": context.world_size,
+                "per_device_batch_size": args.batch_size,
+                "global_batch_size": args.batch_size * context.world_size,
+                "cross_rank_in_batch_negatives": bool(context.enabled),
+                "short_negative_padding": "masked_dummy_docs",
+            },
+        )
     log_path = args.output_dir / "train_loss.jsonl"
-    if log_path.exists():
+    if context.is_main and log_path.exists():
         log_path.unlink()
+    barrier(context)
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     started = time.time()
     for epoch in range(1, args.epochs + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch - 1)
         for step, batch in enumerate(loader, start=1):
             labels = batch["labels"].to(device)
+            doc_valid_mask = batch["doc_valid_mask"].to(device)
             autocast_enabled = args.bf16 and device.type == "cuda"
             if args.training_mode == "gradcache":
                 query_chunks = tokenize_text_chunks(
@@ -771,7 +830,11 @@ def command_train(args: argparse.Namespace) -> None:
                         doc_emb = encode_tokenized_text_chunks(
                             doc_chunks, len(batch["docs"]), model, device, detach=True
                         ).requires_grad_(True)
-                    scores = (query_emb @ doc_emb.T) / args.temperature
+                    global_doc_emb = all_gather_tensor_with_grad(doc_emb, context)
+                    global_doc_valid = all_gather_tensor(doc_valid_mask.to(torch.uint8), context).bool()
+                    labels = labels + context.rank * doc_emb.shape[0]
+                    scores = (query_emb @ global_doc_emb.T) / args.temperature
+                    scores = scores.masked_fill(~global_doc_valid.unsqueeze(0), torch.finfo(scores.dtype).min)
                     loss = F.cross_entropy(scores, labels) / args.grad_accum
                 loss.backward()
                 query_grad = query_emb.grad.detach()
@@ -799,7 +862,11 @@ def command_train(args: argparse.Namespace) -> None:
                         args.doc_chunk_size,
                         args.length_sort,
                     )
-                    scores = (query_emb @ doc_emb.T) / args.temperature
+                    global_doc_emb = all_gather_tensor_with_grad(doc_emb, context)
+                    global_doc_valid = all_gather_tensor(doc_valid_mask.to(torch.uint8), context).bool()
+                    labels = labels + context.rank * doc_emb.shape[0]
+                    scores = (query_emb @ global_doc_emb.T) / args.temperature
+                    scores = scores.masked_fill(~global_doc_valid.unsqueeze(0), torch.finfo(scores.dtype).min)
                     loss = F.cross_entropy(scores, labels) / args.grad_accum
                 if scaler_enabled:
                     scaler.scale(loss).backward()
@@ -826,11 +893,12 @@ def command_train(args: argparse.Namespace) -> None:
                     "lr": float(scheduler.get_last_lr()[0]),
                     "elapsed": time.time() - started,
                 }
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
-                if wandb_run is not None:
-                    wandb_run.log({"train/loss": event["loss"], "train/lr": event["lr"], "train/epoch": epoch}, step=global_step)
-                if global_step % args.logging_steps == 0 or global_step == 1:
+                if context.is_main:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    if wandb_run is not None:
+                        wandb_run.log({"train/loss": event["loss"], "train/lr": event["lr"], "train/epoch": epoch}, step=global_step)
+                if context.is_main and (global_step % args.logging_steps == 0 or global_step == 1):
                     print(
                         f"epoch={epoch} update={global_step}/{total_updates} "
                         f"loss={event['loss']:.6f} lr={event['lr']:.2e} elapsed={event['elapsed']:.1f}s",
@@ -838,19 +906,25 @@ def command_train(args: argparse.Namespace) -> None:
                     )
                 if args.save_steps and global_step % args.save_steps == 0:
                     checkpoint_dir = args.output_dir / f"checkpoint-{global_step}"
-                    model.save_pretrained(checkpoint_dir)
-                    tokenizer.save_pretrained(checkpoint_dir)
-                    print(f"saved checkpoint to {checkpoint_dir}", flush=True)
+                    if context.is_main:
+                        unwrap_model(model).save_pretrained(checkpoint_dir)
+                        tokenizer.save_pretrained(checkpoint_dir)
+                        print(f"saved checkpoint to {checkpoint_dir}", flush=True)
+                    barrier(context)
                 if args.max_updates and global_step >= args.max_updates:
                     break
         if args.max_updates and global_step >= args.max_updates:
             break
 
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    if context.is_main:
+        unwrap_model(model).save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
     if wandb_run is not None:
         wandb_run.finish()
-    print(f"saved model to {args.output_dir}", flush=True)
+    if context.is_main:
+        print(f"saved model to {args.output_dir}", flush=True)
+    barrier(context)
+    destroy_distributed(context)
 
 
 def command_eval(args: argparse.Namespace) -> None:
