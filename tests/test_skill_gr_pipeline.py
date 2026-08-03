@@ -30,6 +30,7 @@ from skill_gr_pipeline import (  # noqa: E402
     build_decoder_target,
     build_arg_parser,
     build_ripor_candidate_batch,
+    build_teacher_rank_examples,
     build_single_sid_catalog_rows,
     expand_single_sid_query_rows,
     build_prefix_trie,
@@ -49,9 +50,13 @@ from skill_gr_pipeline import (  # noqa: E402
     load_structured_decoder_checkpoint,
     make_structured_t5_sid_model,
     load_ranked_skill_candidates_with_scores,
+    load_pag_set_token_ids,
     native_semantic_id_text,
+    ripor_prefix_alphas,
     pag_prefix_planner_score,
     prepared_selected_skill_ids,
+    ranked_skill_ids_from_structured_beams,
+    ranked_skill_ids_from_marginal_structured_beams,
     remap_row_skill_aliases,
     resolve_eval_max_source_length,
     save_structured_decoder_checkpoint,
@@ -532,6 +537,105 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(float(batch["ripor_candidate_teacher_scores"][0, 0]), 0.8, places=5)
         self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 3, 2))
 
+    def test_scoreless_ranked_candidates_are_not_silent_teacher_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scoreless.jsonl"
+            path.write_text(
+                json.dumps({"index": "q", "ranked_skill_ids": ["skill/neg"]}) + "\n",
+                encoding="utf-8",
+            )
+            candidate_map, score_map = load_ranked_skill_candidates_with_scores(path)
+
+        self.assertTrue(candidate_map)
+        self.assertTrue(all(not values for values in score_map.values()))
+        with self.assertRaisesRegex(ValueError, "teacher scores"):
+            build_teacher_rank_examples(
+                [{"index": "q", "query": "q", "selected_skill_ids": ["skill/pos"]}],
+                [
+                    {"skill_id": "skill/pos", "skillrouter_text": "positive"},
+                    {"skill_id": "skill/neg", "skillrouter_text": "negative"},
+                ],
+                candidate_map,
+                score_map,
+                max_negatives=1,
+                allow_weak_teacher=False,
+            )
+
+    def test_pag_set_manifest_requires_fixed_m_when_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "set.json"
+            path.write_text(
+                json.dumps({"vocab_size": 20, "max_tokens": 2, "skill_token_ids": {"a": [3, 4]}}),
+                encoding="utf-8",
+            )
+            token_ids, vocab_size = load_pag_set_token_ids(path)
+        self.assertEqual(token_ids, {"a": [3, 4]})
+        self.assertEqual(vocab_size, 20)
+
+    def test_beam_skill_scores_snapshot_at_sid_completion(self) -> None:
+        beam = {
+            "decoder_input_ids": [772],
+            "current_prefix": [],
+            "completed": [],
+            "completed_records": [],
+            "score": 0.0,
+            "model_score": 0.0,
+            "planner_score": 0.0,
+            "stopped": False,
+        }
+        code = advance_structured_beam(
+            beam,
+            0,
+            1,
+            2.0,
+            codebook_size=256,
+            depth=1,
+            dedup_size=0,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+        )
+        completed = advance_structured_beam(
+            code,
+            1,
+            1,
+            3.0,
+            codebook_size=256,
+            depth=1,
+            dedup_size=0,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+        )
+        continued = {**completed, "score": 100.0}
+        self.assertEqual(completed["completed_records"][0]["score"], 5.0)
+        self.assertEqual(continued["completed_records"][0]["score"], 5.0)
+        self.assertEqual(completed["completed_records"][0]["decoder_length"], 3)
+
+    def test_multi_sid_ranking_uses_completion_snapshots_globally(self) -> None:
+        beams = [
+            {
+                "score": 0.0,
+                "completed": [(1,)],
+                "completed_records": [
+                    {"semantic_id": (1,), "score": 2.0, "decoder_length": 2}
+                ],
+            },
+            {
+                "score": 100.0,
+                "completed": [(2,)],
+                "completed_records": [
+                    {"semantic_id": (2,), "score": 1.0, "decoder_length": 2}
+                ],
+            },
+        ]
+        sequence_to_skill_id = {(1,): "skill/one", (2,): "skill/two"}
+        self.assertEqual(
+            ranked_skill_ids_from_structured_beams(beams, sequence_to_skill_id, max_rank=2),
+            ["skill/one", "skill/two"],
+        )
+        ranked, scores = ranked_skill_ids_from_marginal_structured_beams(
+            beams, sequence_to_skill_id, max_rank=2, length_normalize=True
+        )
+        self.assertEqual(ranked, ["skill/one", "skill/two"])
+        self.assertGreater(scores["skill/one"], scores["skill/two"])
+
     def test_pag_planner_excludes_completed_skill_from_shared_prefix(self) -> None:
         descendants = {(1,): ["skill/done", "skill/sibling"]}
         scores = {"skill/done": 10.0, "skill/sibling": 1.0}
@@ -565,6 +669,14 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(pag_zero["decoder_input_ids"], baseline["decoder_input_ids"])
         self.assertEqual(pag_zero["completed"], baseline["completed"])
         self.assertEqual(pag_zero["score"], baseline["score"])
+
+    def test_ripor_prefix_alphas_are_concave_and_full_margin_is_one(self) -> None:
+        values = ripor_prefix_alphas(4)
+        self.assertEqual(len(values), 4)
+        self.assertAlmostEqual(values[-1], 1.0)
+        self.assertTrue(all(left < right for left, right in zip(values, values[1:])))
+        increments = [right - left for left, right in zip(values, values[1:])]
+        self.assertTrue(all(left >= right for left, right in zip(increments, increments[1:])))
 
     def test_native_semantic_id_text_uses_base_vocab_words_and_digits(self) -> None:
         self.assertEqual(

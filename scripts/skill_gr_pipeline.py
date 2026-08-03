@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import random
@@ -23,6 +24,7 @@ from typing import Any
 from distributed_utils import (
     DistributedContext,
     all_gather_object,
+    all_gather_tensor_with_grad,
     barrier,
     destroy_distributed,
     distributed_epoch_batches,
@@ -51,6 +53,8 @@ GR_SOURCE_TEXT_POLICY = "skillrouter_query_1500_chars_with_instruction_v1"
 SEMANTIC_ID_MODE_DEDUP = "rq_codes_with_dedup"
 SEMANTIC_ID_MODE_LEARNED = "learned_codes"
 SEMANTIC_ID_MODES = (SEMANTIC_ID_MODE_DEDUP, SEMANTIC_ID_MODE_LEARNED)
+DEFAULT_RIPOR_ALPHA_BETA = 0.5
+DEFAULT_PAG_SET_TOP_N = 0
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -72,6 +76,21 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def stable_payload_sha256(payload: Any) -> str:
+    """Hash JSON-compatible provenance metadata independently of formatting."""
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
+    """Return a streaming SHA-256 for a checkpoint/artifact file."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def append_loss_history(path: Path, row: dict[str, Any]) -> None:
@@ -148,6 +167,7 @@ def save_structured_decoder_checkpoint(
         "depth": depth,
         "dedup_size": dedup_size,
         "semantic_id_mode": normalize_semantic_id_mode(semantic_id_mode),
+        "pag_set_vocab_size": int(getattr(model, "pag_set_vocab_size", 0) or 0),
         "seed": seed,
         "training_formulation": training_formulation,
     }
@@ -178,12 +198,31 @@ def load_structured_decoder_checkpoint(
                 "semantic id mode does not match the decoder checkpoint: "
                 f"checkpoint={checkpoint_mode}, requested={expected_mode}"
             )
-    model.load_state_dict(checkpoint["state_dict"])
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    optional_missing_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+    unexpected_required = [key for key in unexpected_keys if not key.startswith(optional_missing_prefixes)]
+    missing_required = [key for key in missing_keys if not key.startswith(optional_missing_prefixes)]
+    if unexpected_required or missing_required:
+        raise ValueError(
+            "structured decoder checkpoint parameter mismatch: "
+            f"missing={missing_required[:5]}, unexpected={unexpected_required[:5]}"
+        )
+    optimizer_state_loaded = False
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            optimizer_state_loaded = True
+        except (RuntimeError, ValueError) as exc:
+            # Older checkpoints predate the RIPOR/PAG parameter groups.  The
+            # model weights remain a valid initialization, but their optimizer
+            # state cannot be mapped onto the expanded parameter set.
+            if not any(key.startswith(optional_missing_prefixes) for key in missing_keys):
+                raise
+            logging.warning("Skipping incompatible optimizer state from %s: %s", checkpoint_dir, exc)
         if lr is not None:
             for group in optimizer.param_groups:
                 group["lr"] = lr
+    checkpoint["optimizer_state_loaded"] = optimizer_state_loaded
     return checkpoint
 
 
@@ -1061,6 +1100,36 @@ def load_candidate_skill_texts(skills_jsonl: Path) -> list[dict[str, str]]:
     return rows
 
 
+def load_pag_set_token_ids(path: Path | None) -> tuple[dict[str, list[int]], int]:
+    if path is None:
+        return {}, 0
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "skill_token_ids" in payload:
+        values = payload["skill_token_ids"]
+        vocab_size = int(payload.get("vocab_size", 0) or 0)
+        expected_m = int(payload.get("max_tokens", 0) or 0)
+    else:
+        raise ValueError(f"PAG set id manifest must contain skill_token_ids: {path}")
+    if not isinstance(values, dict):
+        raise ValueError(f"PAG set id manifest must be a mapping: {path}")
+    result: dict[str, list[int]] = {}
+    for sid, token_ids in values.items():
+        normalized = sorted({int(token_id) for token_id in token_ids})
+        if not normalized:
+            raise ValueError(f"PAG set id manifest contains an empty set: {sid}")
+        if expected_m > 0 and len(normalized) != expected_m:
+            raise ValueError(
+                f"PAG set id manifest must contain exactly m={expected_m} unique tokens; "
+                f"skill={sid} has {len(normalized)}"
+            )
+        result[str(sid)] = normalized
+        if normalized:
+            vocab_size = max(vocab_size, max(normalized) + 1)
+    if vocab_size <= 0:
+        raise ValueError(f"PAG set id manifest has no vocabulary size: {path}")
+    return result, vocab_size
+
+
 def expand_single_sid_query_rows(
     rows: list[dict[str, Any]],
     semantic_ids: dict[str, list[int]],
@@ -1128,7 +1197,7 @@ def build_single_sid_catalog_rows(
 def retrieval_row_keys(row: dict[str, Any]) -> list[str]:
     """Stable keys shared by training rows and retrieval prediction files."""
     keys: list[str] = []
-    for field in ("source_index", "index"):
+    for field in ("source_index", "index", "qid", "query_id"):
         value = row.get(field)
         if value is not None and str(value) != "":
             keys.append(f"{field}:{value}")
@@ -1161,15 +1230,72 @@ def ripor_positive_skill_ids(row: dict[str, Any], semantic_ids: dict[str, list[i
     return positives
 
 
+def ripor_prefix_alphas(depth: int, beta: float = DEFAULT_RIPOR_ALPHA_BETA) -> list[float]:
+    """Return the normalized concave prefix weights from RIPOR Eq. (1).
+
+    ``alpha_L`` is exactly one, so the full DocID margin remains calibrated to
+    the teacher margin while early prefixes receive a larger relative target.
+    """
+    if depth <= 0:
+        raise ValueError(f"RIPOR depth must be positive, got {depth}")
+    if not 0.0 < beta < 1.0:
+        raise ValueError(f"RIPOR alpha beta must be in (0, 1), got {beta}")
+    normalizer = 1.0 - beta**depth
+    return [(1.0 - beta**length) / normalizer for length in range(1, depth + 1)]
+
+
+def build_pag_set_token_ids(
+    skills: list[dict[str, Any]],
+    tokenizer,
+    *,
+    max_tokens: int = 16,
+) -> dict[str, list[int]]:
+    """Build lexical set identifiers used by the PAG set branch.
+
+    The official PAG branch represents each document by a sparse lexical set.
+    This project has no external SPLADE checkpoint in the decoder pipeline, so
+    the manifest is intentionally explicit and reproducible: it keeps the
+    first ``max_tokens`` unique non-special tokenizer ids from the frozen skill
+    document text.  A learned PAG sparse head is trained against this manifest;
+    no dense/BM25 predictions enter the decoding score.
+    """
+    if max_tokens <= 0:
+        raise ValueError(f"PAG set max_tokens must be positive, got {max_tokens}")
+    special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", [])}
+    result: dict[str, list[int]] = {}
+    for skill in skills:
+        sid = skill_id(skill)
+        if not sid:
+            raise ValueError("PAG set manifest contains a skill without skill_id")
+        text = str(skill.get("skillrouter_text") or format_skillrouter_skill(skill))
+        encoded = tokenizer(text, add_special_tokens=True, padding=False, truncation=False)
+        values: list[int] = []
+        seen: set[int] = set()
+        for raw_value in encoded["input_ids"]:
+            value = int(raw_value)
+            if value in special_ids or value in seen:
+                continue
+            seen.add(value)
+            values.append(value)
+            if len(values) >= max_tokens:
+                break
+        if not values:
+            raise ValueError(f"PAG set manifest has no lexical ids for skill: {sid}")
+        result[sid] = values
+    return result
+
+
 def load_ranked_skill_candidates_with_scores(
     path: Path | None,
 ) -> tuple[dict[str, list[str]], dict[str, dict[str, float]]]:
     """Load ranked candidates and their teacher relevance scores.
 
     Dense predictions usually provide ``ranked_scores`` while structured GR
-    marginal decoding uses ``ranked_skill_scores``.  When a prediction only
-    contains an ordered list, reciprocal rank is retained as an explicit weak
-    teacher score instead of silently discarding the ranking signal.
+    marginal decoding uses ``ranked_skill_scores``.  Candidate IDs and teacher
+    scores are deliberately kept separate: an ordered list without numeric
+    scores is a candidate pool only, never an observed teacher target.  Weak
+    reciprocal-rank/anchor targets are created later only when the caller
+    explicitly enables ``allow_weak_teacher``.
     """
     if path is None:
         return {}, {}
@@ -1183,36 +1309,254 @@ def load_ranked_skill_candidates_with_scores(
             "negative_skill_ids",
             "hard_negative_skill_ids",
             "ripor_negative_skill_ids",
+            "docids",
+            "candidate_skill_ids",
+            "positive_skill_ids",
         ):
             values.extend(list(row.get(field) or []))
         if not values:
             continue
         ordered = _unique_preserving_order([str(value) for value in values])
-        score_payload = row.get("ranked_scores") or row.get("ranked_skill_scores") or []
+        score_payload = (
+            row.get("ranked_scores")
+            or row.get("ranked_skill_scores")
+            or row.get("teacher_scores")
+            or row.get("skill_scores")
+            or row.get("scores")
+            or []
+        )
         score_by_skill = (
             {str(sid): value for sid, value in score_payload.items()}
             if isinstance(score_payload, dict)
             else None
         )
         raw_scores = list(score_payload) if score_by_skill is None else []
-        ranked_ids = [str(value) for value in row.get("ranked_skill_ids", [])]
+        ranked_ids = [
+            str(value)
+            for value in (
+                row.get("ranked_skill_ids")
+                or row.get("docids")
+                or row.get("candidate_skill_ids")
+                or row.get("positive_skill_ids")
+                or []
+            )
+        ]
         row_scores: dict[str, float] = {}
         for rank, sid in enumerate(ranked_ids):
             if score_by_skill is not None:
-                value = score_by_skill.get(sid, 1.0 / float(rank + 1))
+                if sid not in score_by_skill:
+                    continue
+                value = score_by_skill[sid]
             elif rank < len(raw_scores):
                 value = raw_scores[rank]
             else:
-                value = 1.0 / float(rank + 1)
+                # The ranked ID is still a valid candidate, but it does not
+                # have an observed teacher score.
+                continue
             try:
                 score = float(value)
             except (TypeError, ValueError):
-                score = 1.0 / float(rank + 1)
-            row_scores[sid] = score if math.isfinite(score) else 1.0 / float(rank + 1)
+                continue
+            if math.isfinite(score):
+                row_scores[sid] = score
+        # Some preprocessing stages store scores by skill id without a
+        # corresponding ranked list.  Preserve those values so strict RIPOR/
+        # PAG MarginMSE training can consume the same manifest.
+        if isinstance(score_payload, dict):
+            for sid, value in score_payload.items():
+                try:
+                    score = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(score):
+                    row_scores[str(sid)] = score
         for key in retrieval_row_keys(row):
             candidate_map.setdefault(key, ordered)
             teacher_score_map.setdefault(key, {}).update(row_scores)
     return candidate_map, teacher_score_map
+
+
+def build_teacher_rank_examples(
+    rows: list[dict[str, Any]],
+    skills: list[dict[str, Any]],
+    candidate_map: dict[str, list[str]],
+    teacher_score_map: dict[str, dict[str, float]],
+    *,
+    max_negatives: int,
+    allow_weak_teacher: bool,
+) -> list[dict[str, Any]]:
+    """Create query/positive/negative examples for the official MarginMSE stages.
+
+    RIPOR and PAG both train a frozen-teacher ranking objective before their
+    identifier stages.  The project rows provide positives while the optional
+    ranked-candidate file supplies hard negatives and calibrated scores.  A
+    missing score is fatal in the reproduction path; the binary/anchor fallback
+    is available only through an explicit weak-teacher ablation flag.
+    """
+    known_skills = {
+        skill_id(skill): str(skill.get("skillrouter_text") or format_skillrouter_skill(skill))
+        for skill in skills
+        if skill_id(skill)
+    }
+    if not known_skills:
+        raise ValueError("no skill documents are available for ranking-stage training")
+    if max_negatives <= 0:
+        raise ValueError(f"max_negatives must be positive, got {max_negatives}")
+    examples: list[dict[str, Any]] = []
+    for row in rows:
+        query = decoder_source_text(row)
+        source_positive_ids = row.get("source_selected_skill_ids")
+        positive_values = source_positive_ids if source_positive_ids is not None else row.get("selected_skill_ids", [])
+        positives = [
+            sid for sid in _unique_preserving_order([str(value) for value in positive_values or []])
+            if sid in known_skills
+        ]
+        if not query or not positives:
+            continue
+        positive_set = set(positives)
+        candidates = ranked_candidates_for_row(row, candidate_map)
+        negatives = [sid for sid in candidates if sid in known_skills and sid not in positive_set]
+        if len(negatives) < max_negatives:
+            # Keep the deterministic random completion only for the explicitly
+            # weak-teacher mode.  Strict reproduction must use mined negatives.
+            if not allow_weak_teacher:
+                raise ValueError(
+                    "strict ranking-stage reproduction requires mined negatives for every row; "
+                    f"missing row={row.get('index')}"
+                )
+            stable_seed = int.from_bytes(
+                hashlib.sha256(str(retrieval_row_keys(row)[0]).encode("utf-8")).digest()[:8],
+                byteorder="big",
+            )
+            pool = [sid for sid in sorted(known_skills) if sid not in positive_set and sid not in negatives]
+            random.Random(stable_seed).shuffle(pool)
+            negatives.extend(pool[: max_negatives - len(negatives)])
+        if not negatives:
+            raise ValueError(f"no negative skill is available for row={row.get('index')}")
+        row_scores: dict[str, float] = {}
+        for key in retrieval_row_keys(row):
+            row_scores.update(teacher_score_map.get(key, {}))
+        known_scores: list[float] = []
+        for value in row_scores.values():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                known_scores.append(numeric)
+        for positive_sid in positives:
+            positive_score = row_scores.get(positive_sid)
+            selected_negative = None
+            negative_score = None
+            for negative_sid in negatives[:max_negatives]:
+                if negative_sid in row_scores:
+                    selected_negative = negative_sid
+                    negative_score = row_scores[negative_sid]
+                    break
+            if positive_score is None or negative_score is None:
+                if not allow_weak_teacher:
+                    missing = positive_sid if positive_score is None else selected_negative
+                    raise ValueError(
+                        "strict ranking-stage reproduction requires teacher scores for positive and negative "
+                        f"skills; missing skill={missing}, row={row.get('index')}"
+                    )
+                positive_score = max(known_scores, default=0.0) + 1.0
+                selected_negative = selected_negative or negatives[0]
+                negative_score = min(known_scores, default=0.0) - 1.0
+            examples.append(
+                {
+                    "query": query,
+                    "positive_skill_id": positive_sid,
+                    "positive_text": known_skills[positive_sid],
+                    "negative_skill_id": selected_negative,
+                    "negative_text": known_skills[selected_negative],
+                    "teacher_positive_score": float(positive_score),
+                    "teacher_negative_score": float(negative_score),
+                }
+            )
+    if not examples:
+        raise ValueError("no query/positive/negative examples were built for ranking-stage training")
+    return examples
+
+
+def build_pag_set_candidate_batch(
+    rows: list[dict[str, Any]],
+    skills: list[dict[str, Any]],
+    pag_set_token_ids: dict[str, list[int]],
+    candidate_map: dict[str, list[str]],
+    teacher_score_map: dict[str, dict[str, float]],
+    *,
+    max_negatives: int,
+    allow_weak_teacher: bool,
+    device,
+) -> dict[str, Any]:
+    """Build the lexical set candidates consumed by PAG MarginMSE."""
+    import torch
+
+    examples_by_row: list[list[dict[str, Any]]] = []
+    for row in rows:
+        row_examples = build_teacher_rank_examples(
+            [row],
+            skills,
+            candidate_map,
+            teacher_score_map,
+            max_negatives=max_negatives,
+            allow_weak_teacher=allow_weak_teacher,
+        )
+        if not row_examples:
+            raise ValueError(f"no PAG set MarginMSE example for row={row.get('index')}")
+        examples_by_row.append(row_examples)
+    if not examples_by_row:
+        raise ValueError("no PAG set MarginMSE examples were built for the batch")
+    candidate_ids_by_row: list[list[str]] = []
+    candidate_scores_by_row: list[dict[str, float]] = []
+    positive_ids_by_row: list[set[str]] = []
+    for row_examples in examples_by_row:
+        candidate_ids: list[str] = []
+        candidate_scores: dict[str, float] = {}
+        positive_ids: set[str] = set()
+        for example in row_examples:
+            positive_sid = str(example["positive_skill_id"])
+            negative_sid = str(example["negative_skill_id"])
+            positive_ids.add(positive_sid)
+            for sid in (positive_sid, negative_sid):
+                if sid not in candidate_ids:
+                    candidate_ids.append(sid)
+            candidate_scores[positive_sid] = float(example["teacher_positive_score"])
+            candidate_scores.setdefault(negative_sid, float(example["teacher_negative_score"]))
+        candidate_ids_by_row.append(candidate_ids)
+        candidate_scores_by_row.append(candidate_scores)
+        positive_ids_by_row.append(positive_ids)
+    max_candidates = max(len(values) for values in candidate_ids_by_row)
+    max_tokens = max(
+        len(pag_set_token_ids.get(sid, []))
+        for candidate_ids in candidate_ids_by_row
+        for sid in candidate_ids
+    )
+    if max_tokens <= 0:
+        raise ValueError("PAG set manifest has no token ids for a sampled candidate")
+    token_ids = torch.zeros((len(candidate_ids_by_row), max_candidates, max_tokens), dtype=torch.long, device=device)
+    token_mask = torch.zeros((len(candidate_ids_by_row), max_candidates, max_tokens), dtype=torch.bool, device=device)
+    valid = torch.zeros((len(candidate_ids_by_row), max_candidates), dtype=torch.bool, device=device)
+    positive = torch.zeros((len(candidate_ids_by_row), max_candidates), dtype=torch.bool, device=device)
+    teacher_scores = torch.zeros((len(candidate_ids_by_row), max_candidates), dtype=torch.float32, device=device)
+    for index, candidate_ids in enumerate(candidate_ids_by_row):
+        for candidate_index, sid in enumerate(candidate_ids):
+            values = [int(value) for value in pag_set_token_ids.get(sid, [])]
+            if not values:
+                raise ValueError(f"PAG set manifest is missing token ids for skill={sid}")
+            token_ids[index, candidate_index, : len(values)] = torch.tensor(values, dtype=torch.long, device=device)
+            token_mask[index, candidate_index, : len(values)] = True
+            valid[index, candidate_index] = True
+            positive[index, candidate_index] = sid in positive_ids_by_row[index]
+            teacher_scores[index, candidate_index] = candidate_scores_by_row[index][sid]
+    return {
+        "pag_set_candidate_token_ids": token_ids,
+        "pag_set_candidate_token_mask": token_mask,
+        "pag_set_candidate_valid": valid,
+        "pag_set_candidate_positive": positive,
+        "pag_set_candidate_teacher_scores": teacher_scores,
+    }
 
 
 def load_ranked_skill_candidates(path: Path | None) -> dict[str, list[str]]:
@@ -1240,6 +1584,7 @@ def build_ripor_candidate_batch(
     teacher_score_map: dict[str, dict[str, float]] | None = None,
     seed: int,
     device,
+    require_teacher_scores: bool = False,
 ) -> dict[str, Any]:
     """Build teacher-forced SID paths for RIPOR relevance-prefix ranking.
 
@@ -1282,6 +1627,7 @@ def build_ripor_candidate_batch(
     candidate_valid = torch.zeros((len(rows), max_candidates), dtype=torch.bool, device=device)
     candidate_positive = torch.zeros((len(rows), max_candidates), dtype=torch.bool, device=device)
     candidate_teacher_scores = torch.zeros((len(rows), max_candidates), dtype=torch.float32, device=device)
+    candidate_teacher_observed = torch.zeros((len(rows), max_candidates), dtype=torch.bool, device=device)
     for row_index, (positives, candidates) in enumerate(zip(positives_by_row, candidate_lists)):
         positive_set = set(positives)
         row_teacher_scores: dict[str, float] = {}
@@ -1299,7 +1645,13 @@ def build_ripor_candidate_batch(
             candidate_positive[row_index, candidate_index] = sid in positive_set
             if sid in row_teacher_scores and math.isfinite(row_teacher_scores[sid]):
                 teacher_score = row_teacher_scores[sid]
+                candidate_teacher_observed[row_index, candidate_index] = True
             else:
+                if require_teacher_scores:
+                    raise ValueError(
+                        "RIPOR reproduction requires a frozen teacher score for every sampled "
+                        f"candidate; missing skill={sid}, row={rows[row_index].get('index')}"
+                    )
                 teacher_score = positive_fallback if sid in positive_set else negative_fallback
             candidate_teacher_scores[row_index, candidate_index] = float(teacher_score)
     return {
@@ -1307,6 +1659,7 @@ def build_ripor_candidate_batch(
         "ripor_candidate_valid": candidate_valid,
         "ripor_candidate_positive": candidate_positive,
         "ripor_candidate_teacher_scores": candidate_teacher_scores,
+        "ripor_candidate_teacher_observed": candidate_teacher_observed,
     }
 
 
@@ -1381,6 +1734,74 @@ _BM25_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 def bm25_tokenize(text: str) -> list[str]:
     return _BM25_TOKEN_RE.findall(str(text).lower())
+
+
+def command_build_pag_set_ids(args: argparse.Namespace) -> None:
+    import torch
+    from transformers import AutoConfig, AutoTokenizer
+
+    skills = load_jsonl(args.skills_jsonl)
+    model_name = str(args.model)
+    if args.sparse_checkpoint is not None:
+        checkpoint = torch.load(args.sparse_checkpoint / "pag_sparse_encoder.pt", map_location="cpu")
+        model_name = str(checkpoint["model"])
+        vocab_size = int(checkpoint["vocab_size"])
+        tokenizer = AutoTokenizer.from_pretrained(args.sparse_checkpoint)
+        model = make_pag_sparse_encoder(model_name, vocab_size)
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        model.eval()
+        special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", [])}
+        token_ids: dict[str, list[int]] = {}
+        with torch.no_grad():
+            for start in range(0, len(skills), args.batch_size):
+                chunk = skills[start : start + args.batch_size]
+                encoded = tokenizer(
+                    [str(skill.get("skillrouter_text") or format_skillrouter_skill(skill)) for skill in chunk],
+                    padding=True,
+                    truncation=True,
+                    max_length=args.max_length,
+                    return_tensors="pt",
+                )
+                logits = model(encoded["input_ids"], encoded["attention_mask"])
+                available = logits.shape[-1] - len(special_ids)
+                if args.max_tokens <= 0 or args.max_tokens > available:
+                    raise ValueError(
+                        f"PAG top-m={args.max_tokens} exceeds available non-special vocabulary {available}"
+                    )
+                masked_logits = logits.clone()
+                if special_ids:
+                    masked_logits[:, sorted(special_ids)] = float("-inf")
+                top_ids = torch.topk(masked_logits, k=args.max_tokens, dim=-1).indices.tolist()
+                for skill, values in zip(chunk, top_ids):
+                    if len(set(values)) != args.max_tokens or any(int(value) in special_ids for value in values):
+                        raise ValueError(f"PAG set for {skill_id(skill)} is not exactly top-m unique non-special ids")
+                    token_ids[skill_id(skill)] = [int(value) for value in values]
+        source_format = "pag_sparse_encoder_top_tokens"
+    else:
+        if not args.lexical_fallback:
+            raise ValueError(
+                "build-pag-set-ids requires --sparse-checkpoint for the PAG set branch; "
+                "pass --lexical-fallback only for a clearly labeled ablation"
+            )
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        token_ids = build_pag_set_token_ids(skills, tokenizer, max_tokens=args.max_tokens)
+        vocab_size = int(AutoConfig.from_pretrained(args.model).vocab_size)
+        if vocab_size <= 0:
+            vocab_size = max(max(values) for values in token_ids.values()) + 1
+        source_format = "explicit_lexical_fallback_ablation"
+    payload = {
+        "format": "pag_lexical_set_ids_v2",
+        "model": model_name,
+        "vocab_size": vocab_size,
+        "max_tokens": args.max_tokens,
+        "skill_token_ids": token_ids,
+        "source_skills": str(args.skills_jsonl),
+        "source_format": source_format,
+        "sparse_checkpoint": str(args.sparse_checkpoint) if args.sparse_checkpoint else None,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"output": str(args.output), "skills": len(token_ids), "vocab_size": vocab_size}, sort_keys=True))
 
 
 def command_canonicalize_skill_aliases(args: argparse.Namespace) -> None:
@@ -1548,6 +1969,402 @@ def command_prepare(args: argparse.Namespace) -> None:
     print(f"prepared rows={len(train_rows)} unique_skills={len(skill_rows)} output={args.output_dir}")
 
 
+def make_pag_sparse_encoder(base_model: str, vocab_size: int):
+    import torch
+    import torch.nn as nn
+    from transformers import T5ForConditionalGeneration
+
+    class PAGSparseEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = T5ForConditionalGeneration.from_pretrained(base_model)
+            if int(self.backbone.config.vocab_size) != int(vocab_size):
+                raise ValueError(
+                    "PAG SPLADE vocabulary must equal the T5 LM head vocabulary: "
+                    f"model={self.backbone.config.vocab_size}, requested={vocab_size}"
+                )
+
+        def forward(self, input_ids, attention_mask):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                # PAG's lexical branch scores every query-token decoder
+                # position and max-pools the transformed LM coordinates.
+                decoder_input_ids=input_ids,
+                return_dict=True,
+            )
+            # This is the official SPLADE/T5 representation used by PAG:
+            # log(1 + ReLU(T5 logits)), followed by top-m lexical coordinates.
+            lexical = torch.log1p(torch.relu(outputs.logits))
+            lexical = lexical * attention_mask.unsqueeze(-1).to(dtype=lexical.dtype)
+            return lexical.max(dim=1).values
+
+    return PAGSparseEncoder()
+
+
+def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
+    """Train PAG's official SPLADE sparse encoder with MarginMSE + FLOPS."""
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoConfig, AutoTokenizer
+
+    context = initialize_distributed(cpu=args.cpu)
+    torch.manual_seed(args.seed + context.rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + context.rank)
+    rows = load_jsonl(args.rows) if args.rows is not None else []
+    skills = load_jsonl(args.skills_jsonl)
+    candidate_map, teacher_score_map = load_ranked_skill_candidates_with_scores(args.hard_negatives)
+    examples = build_teacher_rank_examples(
+        rows,
+        skills,
+        candidate_map,
+        teacher_score_map,
+        max_negatives=args.max_negatives,
+        allow_weak_teacher=args.allow_weak_teacher,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    vocab_size = int(AutoConfig.from_pretrained(args.model).vocab_size)
+    if vocab_size <= 0:
+        raise ValueError("PAG sparse encoder requires a tokenizer vocabulary")
+    special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", [])}
+    model_core = make_pag_sparse_encoder(args.model, vocab_size).to(context.device)
+    model = wrap_ddp(model_core, context)
+    optimizer = torch.optim.AdamW(model_core.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    steps_per_epoch = max(1, math.ceil(len(examples) / (args.batch_size * context.world_size)))
+    total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.epochs
+    step = 0
+    epoch = 0
+    model.train()
+    while step < total_steps:
+        for batch_rows in distributed_epoch_batches(examples, args.batch_size, context, seed=args.seed, epoch=epoch):
+            if step >= total_steps:
+                break
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=bool(args.bf16 and getattr(context.device, "type", "") == "cuda"),
+            ):
+                def encode_batch(texts: list[str]):
+                    encoded = tokenizer(
+                        texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=args.max_length,
+                        return_tensors="pt",
+                    )
+                    return model(
+                        input_ids=encoded["input_ids"].to(context.device),
+                        attention_mask=encoded["attention_mask"].to(context.device),
+                    )
+
+                query_rep = encode_batch(
+                    [row["query"] for row in batch_rows]
+                )
+                pos_rep = encode_batch(
+                    [row["positive_text"] for row in batch_rows]
+                )
+                neg_rep = encode_batch(
+                    [row["negative_text"] for row in batch_rows]
+                )
+                student_margin = (query_rep * pos_rep).sum(dim=-1) - (query_rep * neg_rep).sum(dim=-1)
+                teacher_margin = torch.tensor(
+                    [row["teacher_positive_score"] - row["teacher_negative_score"] for row in batch_rows],
+                    dtype=student_margin.dtype,
+                    device=context.device,
+                )
+                rank_loss = F.mse_loss(student_margin, teacher_margin, reduction="sum")
+                global_query_rep = all_gather_tensor_with_grad(query_rep, context)
+                global_pos_rep = all_gather_tensor_with_grad(pos_rep, context)
+                global_neg_rep = all_gather_tensor_with_grad(neg_rep, context)
+                query_reg = torch.mean(torch.abs(global_query_rep), dim=0).square().sum()
+                doc_reg = (
+                    torch.mean(torch.abs(global_pos_rep), dim=0).square().sum()
+                    + torch.mean(torch.abs(global_neg_rep), dim=0).square().sum()
+                ) / 2.0
+                rank_loss = global_normalized_loss(
+                    rank_loss,
+                    torch.tensor(float(len(batch_rows)), device=context.device),
+                    context,
+                )
+                # FLOPS is computed after an autograd-preserving all-gather, so
+                # it is the same global-batch objective under 1 or 8 GPUs.
+                loss = rank_loss + float(args.query_reg_weight) * query_reg + float(args.doc_reg_weight) * doc_reg
+            loss.backward()
+            optimizer.step()
+            step += 1
+            if context.is_main and (step % args.logging_steps == 0 or step == total_steps):
+                print(f"pag_sparse_step={step} loss={float(loss.detach().cpu()):.6f}", flush=True)
+        epoch += 1
+    barrier(context)
+    if context.is_main:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "state_dict": model_core.state_dict(),
+                "model": args.model,
+                "vocab_size": vocab_size,
+                "max_length": args.max_length,
+                "top_k": args.top_k,
+                "objective": "T5SPLADE MarginMSE + FLOPS (PAG stage 1)",
+                "query_reg_weight": args.query_reg_weight,
+                "doc_reg_weight": args.doc_reg_weight,
+                "examples": len(examples),
+            },
+            args.output_dir / "pag_sparse_encoder.pt",
+        )
+        tokenizer.save_pretrained(str(args.output_dir))
+    barrier(context)
+    local_rows = [
+        (index, skill_id(skill), str(skill.get("skillrouter_text") or format_skillrouter_skill(skill)))
+        for index, skill in enumerate(skills)
+        if skill_id(skill) and index % context.world_size == context.rank
+    ]
+    local_sets: list[tuple[int, str, list[int]]] = []
+    model_core.eval()
+    with torch.no_grad():
+        for start in range(0, len(local_rows), args.batch_size):
+            chunk = local_rows[start : start + args.batch_size]
+            encoded = tokenizer(
+                [item[2] for item in chunk],
+                padding=True,
+                truncation=True,
+                max_length=args.max_length,
+                return_tensors="pt",
+            )
+            reps = model_core(
+                encoded["input_ids"].to(context.device),
+                encoded["attention_mask"].to(context.device),
+            )
+            if args.top_k <= 0 or args.top_k > reps.shape[-1] - len(special_ids):
+                raise ValueError(
+                    f"PAG top-m={args.top_k} exceeds available non-special vocabulary "
+                    f"{reps.shape[-1] - len(special_ids)}"
+                )
+            masked_reps = reps.clone()
+            if special_ids:
+                masked_reps[:, sorted(special_ids)] = float("-inf")
+            top_ids = torch.topk(masked_reps, k=args.top_k, dim=-1).indices.cpu().tolist()
+            local_sets.extend(
+                (item[0], item[1], [int(value) for value in values])
+                for item, values in zip(chunk, top_ids)
+            )
+    gathered = all_gather_object(local_sets, context)
+    if context.is_main:
+        merged = sorted((item for part in gathered for item in part), key=lambda item: item[0])
+        write_json(
+            args.output_dir / "pag_set_ids.json",
+            {
+                "format": "pag_splade_lexical_set_ids_v2",
+                "model": args.model,
+                "vocab_size": vocab_size,
+                "max_tokens": args.top_k,
+                "skill_token_ids": {item[1]: item[2] for item in merged},
+                "source_checkpoint": str(args.output_dir / "pag_sparse_encoder.pt"),
+                "objective": "T5SPLADE top-m lexical coordinates",
+            },
+        )
+    barrier(context)
+    destroy_distributed(context)
+
+
+def command_train_ripor_relevance_encoder(args: argparse.Namespace) -> None:
+    """Train RIPOR's relevance-based T5 dense encoder with MarginMSE."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer, T5Model
+
+    context = initialize_distributed(cpu=args.cpu)
+    torch.manual_seed(args.seed + context.rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + context.rank)
+    rows = load_jsonl(args.rows)
+    skills = load_jsonl(args.skills_jsonl)
+    candidate_map, teacher_score_map = load_ranked_skill_candidates_with_scores(args.hard_negatives)
+    examples = build_teacher_rank_examples(
+        rows,
+        skills,
+        candidate_map,
+        teacher_score_map,
+        max_negatives=args.max_negatives,
+        allow_weak_teacher=args.allow_weak_teacher,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    class RelevanceEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = T5Model.from_pretrained(args.model)
+            self.decoder_length = int(args.decoder_length)
+
+        def forward(self, input_ids, attention_mask):
+            start_id = self.backbone.config.decoder_start_token_id
+            if start_id is None:
+                start_id = self.backbone.config.pad_token_id
+            decoder_input_ids = torch.full(
+                (input_ids.shape[0], self.decoder_length),
+                int(self.backbone.config.pad_token_id),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            decoder_input_ids[:, 0] = int(start_id)
+            return self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                return_dict=True,
+            ).last_hidden_state[:, 0, :]
+
+    model_core = RelevanceEncoder().to(context.device)
+    optimizer = torch.optim.AdamW(model_core.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    model = wrap_ddp(model_core, context)
+    steps_per_epoch = max(1, math.ceil(len(examples) / (args.batch_size * context.world_size)))
+    total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.epochs
+    step = 0
+    epoch = 0
+    model.train()
+
+    def encode_batch(texts: list[str], max_length: int):
+        encoded = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        return model(
+            input_ids=encoded["input_ids"].to(context.device),
+            attention_mask=encoded["attention_mask"].to(context.device),
+        )
+
+    while step < total_steps:
+        for batch_rows in distributed_epoch_batches(examples, args.batch_size, context, seed=args.seed, epoch=epoch):
+            if step >= total_steps:
+                break
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=bool(args.bf16 and getattr(context.device, "type", "") == "cuda"),
+            ):
+                query_rep = encode_batch([row["query"] for row in batch_rows], args.max_query_length)
+                pos_rep = encode_batch([row["positive_text"] for row in batch_rows], args.max_skill_length)
+                neg_rep = encode_batch([row["negative_text"] for row in batch_rows], args.max_skill_length)
+                student_margin = (query_rep * pos_rep).sum(dim=-1) - (query_rep * neg_rep).sum(dim=-1)
+                teacher_margin = torch.tensor(
+                    [row["teacher_positive_score"] - row["teacher_negative_score"] for row in batch_rows],
+                    dtype=student_margin.dtype,
+                    device=context.device,
+                )
+                loss = global_normalized_loss(
+                    F.mse_loss(student_margin, teacher_margin, reduction="sum"),
+                    torch.tensor(float(len(batch_rows)), device=context.device),
+                    context,
+                )
+            loss.backward()
+            optimizer.step()
+            step += 1
+            if context.is_main and (step % args.logging_steps == 0 or step == total_steps):
+                print(f"relevance_step={step} loss={float(loss.detach().cpu()):.6f}", flush=True)
+        epoch += 1
+
+    barrier(context)
+    output_dir = args.output_dir
+    if context.is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        m0_checkpoint_path = output_dir / "relevance_encoder.pt"
+        m0_config = model_core.backbone.config.to_dict()
+        m0_config_sha256 = stable_payload_sha256(m0_config)
+        m0_state_keys = sorted(str(key) for key in model_core.state_dict())
+        torch.save(
+            {
+                "artifact_format": "ripor_m0_relevance_v1",
+                "state_dict": model_core.state_dict(),
+                "state_keys": m0_state_keys,
+                "model": args.model,
+                "model_config": m0_config,
+                "model_config_sha256": m0_config_sha256,
+                "max_query_length": args.max_query_length,
+                "max_skill_length": args.max_skill_length,
+                "decoder_length": args.decoder_length,
+                "pairs": len(examples),
+                "world_size": context.world_size,
+                "objective": "RIPOR T5 dense encoder MarginMSE",
+            },
+            m0_checkpoint_path,
+        )
+        tokenizer.save_pretrained(str(output_dir))
+    barrier(context)
+    indexed_skills = [
+        (index, skill_id(skill), str(skill.get("skillrouter_text") or format_skillrouter_skill(skill)))
+        for index, skill in enumerate(skills)
+        if skill_id(skill)
+    ]
+    local_skill_rows = [item for item in indexed_skills if item[0] % context.world_size == context.rank]
+    local_vectors: list[tuple[int, str, list[float]]] = []
+    model_core.eval()
+    with torch.no_grad():
+        for start in range(0, len(local_skill_rows), args.batch_size):
+            chunk = local_skill_rows[start : start + args.batch_size]
+            encoded = tokenizer(
+                [item[2] for item in chunk],
+                padding=True,
+                truncation=True,
+                max_length=args.max_skill_length,
+                return_tensors="pt",
+            )
+            vectors = model_core(
+                encoded["input_ids"].to(context.device),
+                encoded["attention_mask"].to(context.device),
+            )
+            local_vectors.extend(
+                (item[0], item[1], vector.cpu().float().tolist())
+                for item, vector in zip(chunk, vectors)
+            )
+    gathered = all_gather_object(local_vectors, context)
+    if context.is_main:
+        merged = sorted((item for part in gathered for item in part), key=lambda item: item[0])
+        m0_checkpoint_path = output_dir / "relevance_encoder.pt"
+        m0_checkpoint_sha256 = file_sha256(m0_checkpoint_path)
+        torch.save(
+            {
+                "skill_ids": [item[1] for item in merged],
+                "embeddings": torch.tensor([item[2] for item in merged], dtype=torch.float32),
+                "source": str(output_dir / "relevance_encoder.pt"),
+                "objective": "RIPOR relevance-based DocID initialization",
+                "artifact_format": "ripor_m0_skill_embeddings_v1",
+                "source_relevance_checkpoint": str(m0_checkpoint_path),
+                "source_relevance_checkpoint_sha256": m0_checkpoint_sha256,
+                "source_relevance_model": args.model,
+                "source_relevance_model_config_sha256": m0_config_sha256,
+                "source_relevance_decoder_length": int(args.decoder_length),
+                "source_relevance_state_keys": m0_state_keys,
+            },
+            output_dir / "skill_embeddings.pt",
+        )
+        write_json(
+            output_dir / "relevance_encoder_manifest.json",
+            {
+                "rows": str(args.rows),
+                "hard_negatives": str(args.hard_negatives) if args.hard_negatives else None,
+                "skills_jsonl": str(args.skills_jsonl),
+                "pairs": len(examples),
+                "skills": len(merged),
+                "objective": "RIPOR T5 dense MarginMSE before RQ/LETTER quantization",
+                "global_batch_size": args.batch_size * context.world_size,
+                "world_size": context.world_size,
+                "strict_teacher_scores": not args.allow_weak_teacher,
+                "relevance_checkpoint_sha256": m0_checkpoint_sha256,
+                "model_config_sha256": m0_config_sha256,
+                "decoder_length": int(args.decoder_length),
+            },
+        )
+    barrier(context)
+    destroy_distributed(context)
+
+
 def command_encode(args: argparse.Namespace) -> None:
     import torch
     import torch.nn.functional as F
@@ -1634,23 +2451,41 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
     from vector_quantize_pytorch import ResidualVQ
 
     class SkillRQVAE(nn.Module):
-        def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int, codebook_size: int, depth: int) -> None:
+        def __init__(
+            self,
+            input_dim: int,
+            hidden_dim: int,
+            latent_dim: int,
+            codebook_size: int,
+            depth: int,
+            identity_latent: bool,
+        ) -> None:
             super().__init__()
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, latent_dim),
-            )
+            self.identity_latent = bool(identity_latent)
+            if self.identity_latent:
+                if input_dim != latent_dim:
+                    raise ValueError(
+                        "RIPOR identity RQ requires latent_dim to equal the M0 embedding width: "
+                        f"input_dim={input_dim}, latent_dim={latent_dim}"
+                    )
+                self.encoder = nn.Identity()
+                self.decoder = nn.Identity()
+            else:
+                self.encoder = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, latent_dim),
+                )
+                self.decoder = nn.Sequential(
+                    nn.Linear(latent_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, input_dim),
+                )
             self.quantizer = ResidualVQ(
                 dim=latent_dim,
                 num_quantizers=depth,
                 codebook_size=codebook_size,
                 kmeans_init=True,
-            )
-            self.decoder = nn.Sequential(
-                nn.Linear(latent_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, input_dim),
             )
 
         def forward(self, x):
@@ -1666,6 +2501,8 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
             return indices
 
     payload = torch.load(args.embeddings, map_location="cpu")
+    if not isinstance(payload, dict) or "embeddings" not in payload or "skill_ids" not in payload:
+        raise ValueError("--embeddings must be a skill_embeddings.pt artifact from train-ripor-relevance-encoder")
     embeddings = payload["embeddings"].float()
     skill_ids = list(payload["skill_ids"])
     torch.manual_seed(args.seed)
@@ -1673,12 +2510,46 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    latent_dim = int(args.latent_dim or embeddings.shape[1])
+    identity_latent = bool(args.ripor_identity)
+    m0_provenance_keys = (
+        "source_relevance_checkpoint",
+        "source_relevance_checkpoint_sha256",
+        "source_relevance_model",
+        "source_relevance_model_config_sha256",
+        "source_relevance_decoder_length",
+        "source_relevance_state_keys",
+    )
+    if identity_latent:
+        if payload.get("artifact_format") != "ripor_m0_skill_embeddings_v1":
+            raise ValueError(
+                "strict RIPOR identity RQ requires skill_embeddings.pt emitted by "
+                "train-ripor-relevance-encoder"
+            )
+        missing_provenance = [key for key in m0_provenance_keys if payload.get(key) in (None, "", [])]
+        if missing_provenance:
+            raise ValueError(f"M0 skill embeddings are missing provenance fields: {missing_provenance}")
+        source_checkpoint = Path(str(payload["source_relevance_checkpoint"]))
+        if source_checkpoint.exists():
+            actual_source_hash = file_sha256(source_checkpoint)
+            if actual_source_hash != str(payload["source_relevance_checkpoint_sha256"]):
+                raise ValueError(
+                    "M0 skill embeddings do not match their source relevance checkpoint: "
+                    f"expected={payload['source_relevance_checkpoint_sha256']}, got={actual_source_hash}"
+                )
+    if identity_latent and latent_dim != int(embeddings.shape[1]):
+        raise ValueError(
+            "--ripor-identity requires --latent-dim to equal the M0 embedding width; "
+            f"embedding_dim={embeddings.shape[1]}, latent_dim={latent_dim}. "
+            "Use --no-ripor-identity only for a legacy learned bottleneck ablation."
+        )
     model = SkillRQVAE(
         input_dim=embeddings.shape[1],
         hidden_dim=args.hidden_dim,
-        latent_dim=args.latent_dim,
+        latent_dim=latent_dim,
         codebook_size=args.codebook_size,
         depth=args.depth,
+        identity_latent=identity_latent,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loader = DataLoader(TensorDataset(embeddings), batch_size=args.batch_size, shuffle=True)
@@ -1716,15 +2587,37 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
         for sid in sorted(skill_ids)
     ]
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    codebook_embeddings = model.quantizer.codebooks.detach().cpu().float()
+    if codebook_embeddings.ndim != 3:
+        raise ValueError(
+            "ResidualVQ codebooks must have shape [depth, codebook_size, dim], "
+            f"got {tuple(codebook_embeddings.shape)}"
+        )
+    torch.save(
+        {
+            "artifact_format": "ripor_m0_rq_codebook_v1",
+            "codebook_embeddings": codebook_embeddings,
+            "codebook_size": int(args.codebook_size),
+            "depth": int(args.depth),
+            "embedding_dim": int(codebook_embeddings.shape[-1]),
+            "source_embeddings": str(args.embeddings),
+            "objective": "RIPOR relevance-based RQ centroid initialization",
+            "identity_latent": identity_latent,
+            **{key: payload.get(key) for key in m0_provenance_keys},
+        },
+        args.output_dir / "codebook_embeddings.pt",
+    )
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "input_dim": embeddings.shape[1],
             "hidden_dim": args.hidden_dim,
-            "latent_dim": args.latent_dim,
+            "latent_dim": latent_dim,
             "codebook_size": args.codebook_size,
             "depth": args.depth,
             "semantic_id_mode": SEMANTIC_ID_MODE_DEDUP,
+            "identity_latent": identity_latent,
+            **{key: payload.get(key) for key in m0_provenance_keys},
         },
         args.output_dir / "rqvae.pt",
     )
@@ -1736,7 +2629,8 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
             "codebook_size": args.codebook_size,
             "depth": args.depth,
             "hidden_dim": args.hidden_dim,
-            "latent_dim": args.latent_dim,
+            "latent_dim": latent_dim,
+            "identity_latent": identity_latent,
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "lr": args.lr,
@@ -1745,6 +2639,8 @@ def command_train_rqvae(args: argparse.Namespace) -> None:
             "seed": args.seed,
             "final_loss": epoch_loss if args.epochs > 0 else None,
             "code_width": code_width,
+            "codebook_embeddings": str(args.output_dir / "codebook_embeddings.pt"),
+            **{key: payload.get(key) for key in m0_provenance_keys},
             "dedup_column": True,
             "collision_groups": sum(count > 1 for count in Counter(tuple(v) for v in raw_codes.values()).values()),
         },
@@ -2528,12 +3424,89 @@ def command_eval_t5_dense(args: argparse.Namespace) -> None:
     print(json.dumps(metrics["overall"], ensure_ascii=False, sort_keys=True))
 
 
+def _load_ripor_codebook_embeddings(
+    path: Path | str,
+    *,
+    depth: int,
+    codebook_size: int,
+    d_model: int,
+    expected_relevance_checkpoint: Path | str | None = None,
+):
+    """Load the position-specific RQ centroids used by RIPOR's M0 model."""
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if isinstance(payload, dict):
+        # RIPOR uses residual-quantizer centroids directly as the
+        # position-specific T5 hidden-space vectors E_i.  A learned
+        # bottleneck encoder would put them in an unrelated coordinate
+        # system even when the width happens to match.
+        if payload.get("artifact_format") != "ripor_m0_rq_codebook_v1":
+            raise ValueError(
+                "strict RIPOR codebook initialization requires the provenance-bearing "
+                "codebook_embeddings.pt artifact from train-rqvae"
+            )
+        if payload.get("identity_latent") is not True:
+            raise ValueError(
+                "strict RIPOR codebook initialization requires RQ centroids "
+                "trained directly in the M0/T5 embedding space "
+                "(identity_latent=true)"
+            )
+        provenance_keys = (
+            "source_relevance_checkpoint_sha256",
+            "source_relevance_model_config_sha256",
+            "source_relevance_decoder_length",
+            "source_relevance_state_keys",
+        )
+        missing_provenance = [key for key in provenance_keys if payload.get(key) in (None, "", [])]
+        if missing_provenance:
+            raise ValueError(f"RIPOR codebook is missing M0 provenance fields: {missing_provenance}")
+        if expected_relevance_checkpoint is None:
+            raise ValueError(
+                "strict RIPOR codebook initialization requires the matching "
+                "--ripor-relevance-checkpoint"
+            )
+        expected_path = Path(expected_relevance_checkpoint)
+        actual_hash = file_sha256(expected_path)
+        if actual_hash != str(payload["source_relevance_checkpoint_sha256"]):
+            raise ValueError(
+                "RIPOR codebook/M0 checkpoint hash mismatch: "
+                f"codebook={payload['source_relevance_checkpoint_sha256']}, checkpoint={actual_hash}"
+            )
+        values = payload.get("codebook_embeddings")
+        if values is None:
+            values = payload.get("codebooks")
+    else:
+        raise ValueError(
+            "strict RIPOR codebook initialization requires a provenance-bearing "
+            "codebook_embeddings.pt dictionary, not a raw tensor"
+        )
+    if values is None:
+        raise ValueError(f"RIPOR codebook file has no codebook_embeddings/codebooks tensor: {path}")
+    if isinstance(values, (list, tuple)):
+        values = torch.stack([torch.as_tensor(value) for value in values])
+    values = torch.as_tensor(values).float()
+    expected = (int(depth), int(codebook_size), int(d_model))
+    if tuple(values.shape) != expected:
+        raise ValueError(
+            "RIPOR codebook centroids must match [depth, codebook_size, d_model]: "
+            f"expected={expected}, got={tuple(values.shape)} from {path}"
+        )
+    return values
+
+
 def make_structured_t5_sid_model(
     base_model: str,
     codebook_size: int,
     depth: int,
     dedup_size: int,
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    pag_set_vocab_size: int | None = None,
+    ripor_codebook_embeddings: Path | str | None = None,
+    ripor_relevance_checkpoint: Path | str | None = None,
 ):
     import torch
     import torch.nn as nn
@@ -2549,6 +3522,7 @@ def make_structured_t5_sid_model(
             self.depth = int(depth)
             self.dedup_size = int(dedup_size)
             self.semantic_id_mode = normalize_semantic_id_mode(semantic_id_mode)
+            self.pag_set_vocab_size = int(pag_set_vocab_size or 0)
             if self.semantic_id_mode == SEMANTIC_ID_MODE_LEARNED and self.dedup_size != 0:
                 raise ValueError(f"learned_codes requires dedup_size=0, got {self.dedup_size}")
             self.control_type = structured_sid_control_type(self.depth, self.semantic_id_mode)
@@ -2557,13 +3531,44 @@ def make_structured_t5_sid_model(
                 structured_sid_vocab_size(self.codebook_size, self.depth, self.dedup_size),
                 d_model,
             )
-            self.code_heads = nn.ModuleList(nn.Linear(d_model, self.codebook_size) for _ in range(self.depth))
+            # RIPOR's position-specific output tables are dot products with RQ
+            # centroids; they do not carry a per-token bias term.
+            self.code_heads = nn.ModuleList(
+                nn.Linear(d_model, self.codebook_size, bias=False) for _ in range(self.depth)
+            )
             self.dedup_head = (
                 nn.Linear(d_model, self.dedup_size)
                 if self.semantic_id_mode == SEMANTIC_ID_MODE_DEDUP
                 else None
             )
             self.control_head = nn.Linear(d_model, 2)
+            self.ripor_codebook_init = str(ripor_codebook_embeddings) if ripor_codebook_embeddings else None
+            if ripor_codebook_embeddings:
+                codebooks = _load_ripor_codebook_embeddings(
+                    ripor_codebook_embeddings,
+                    depth=self.depth,
+                    codebook_size=self.codebook_size,
+                    d_model=d_model,
+                    expected_relevance_checkpoint=ripor_relevance_checkpoint,
+                )
+                with torch.no_grad():
+                    for level in range(self.depth):
+                        start = level * self.codebook_size
+                        stop = start + self.codebook_size
+                        self.sid_embedding.weight[start:stop].copy_(codebooks[level])
+                        self.code_heads[level].weight.copy_(codebooks[level])
+                        if self.code_heads[level].bias is not None:
+                            self.code_heads[level].bias.zero_()
+            # PAG's lexical branch uses the T5 LM head over a one-token
+            # decoder, exactly as T5-SPLADE.  It is not a separately learned
+            # pooled classifier; ``pag_set_vocab_size`` records the manifest
+            # vocabulary and is checked against the backbone at runtime.
+            self.pag_set_head = None
+            if self.pag_set_vocab_size and self.pag_set_vocab_size != int(self.backbone.config.vocab_size):
+                raise ValueError(
+                    "PAG set vocabulary must match the T5 LM head vocabulary: "
+                    f"manifest={self.pag_set_vocab_size}, model={self.backbone.config.vocab_size}"
+                )
 
         def configure_distributed(self, context: DistributedContext | None) -> None:
             self.distributed_context = context
@@ -2578,8 +3583,22 @@ def make_structured_t5_sid_model(
             encoder_attention_mask,
             decoder_input_ids,
             decoder_attention_mask,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
         ):
             decoder_embeds = self.sid_embedding(decoder_input_ids)
+            if decoder_prefix_input_ids is not None:
+                prefix_embeds = self.backbone.shared(decoder_prefix_input_ids)
+                decoder_embeds = torch.cat([prefix_embeds, decoder_embeds], dim=1)
+                if decoder_prefix_attention_mask is None:
+                    decoder_prefix_attention_mask = torch.ones(
+                        decoder_prefix_input_ids.shape[:2],
+                        dtype=decoder_attention_mask.dtype,
+                        device=decoder_attention_mask.device,
+                    )
+                decoder_attention_mask = torch.cat(
+                    [decoder_prefix_attention_mask, decoder_attention_mask], dim=1
+                )
             decoder_outputs = self.backbone.decoder(
                 inputs_embeds=decoder_embeds,
                 attention_mask=decoder_attention_mask,
@@ -2587,15 +3606,28 @@ def make_structured_t5_sid_model(
                 encoder_attention_mask=encoder_attention_mask,
                 use_cache=False,
             )
-            return decoder_outputs.last_hidden_state
+            hidden = decoder_outputs.last_hidden_state
+            if decoder_prefix_input_ids is not None:
+                hidden = hidden[:, decoder_prefix_input_ids.shape[1] :, :]
+            return hidden
 
-        def _decoder_hidden(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask):
+        def _decoder_hidden(
+            self,
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            decoder_attention_mask,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
             encoder_hidden_states = self.encode_source(input_ids, attention_mask)
             return self._decoder_hidden_from_encoder(
                 encoder_hidden_states,
                 attention_mask,
                 decoder_input_ids,
                 decoder_attention_mask,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
 
         def _normalize_loss(self, loss_sum, count, global_loss_normalization: bool):
@@ -2603,16 +3635,22 @@ def make_structured_t5_sid_model(
                 return global_normalized_loss(loss_sum, count, self.distributed_context)
             return loss_sum / count.clamp_min(1.0)
 
-        def ripor_prefix_log_scores(
+        def ripor_prefix_scores(
             self,
             encoder_hidden_states,
             encoder_attention_mask,
             candidate_codes,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
         ):
-            """Teacher-force semantic code paths and return cumulative log scores.
+            """Return RIPOR's cumulative conditional *logit* score.
 
-            The dedup suffix is deliberately excluded: it makes identifiers
-            unique but carries no semantic relevance signal.
+            The official RIPOR decoder replaces the normal vocabulary softmax by
+            position-specific codebook output tables and ranks a candidate with
+            ``sum_i h_i @ E_i[c_i]``.  The rank objective therefore uses the raw
+            conditional logits, not ``log_softmax`` probabilities.  Decoding
+            below consumes the same raw score so the teacher-forced objective and
+            constrained beam have identical semantics.
             """
             batch_size, candidate_count, rank_depth = candidate_codes.shape
             if rank_depth != self.depth:
@@ -2636,20 +3674,47 @@ def make_structured_t5_sid_model(
             flat_decoder_mask = torch.ones_like(flat_decoder_ids)
             flat_encoder = encoder_hidden_states.repeat_interleave(candidate_count, dim=0)
             flat_encoder_mask = encoder_attention_mask.repeat_interleave(candidate_count, dim=0)
+            flat_prefix_ids = None
+            flat_prefix_mask = None
+            if decoder_prefix_input_ids is not None:
+                flat_prefix_ids = decoder_prefix_input_ids.repeat_interleave(candidate_count, dim=0)
+                if decoder_prefix_attention_mask is not None:
+                    flat_prefix_mask = decoder_prefix_attention_mask.repeat_interleave(candidate_count, dim=0)
             hidden = self._decoder_hidden_from_encoder(
                 flat_encoder,
                 flat_encoder_mask,
                 flat_decoder_ids,
                 flat_decoder_mask,
+                decoder_prefix_input_ids=flat_prefix_ids,
+                decoder_prefix_attention_mask=flat_prefix_mask,
             )
             cumulative = hidden.new_zeros(batch_size * candidate_count)
             prefixes = []
             flat_codes = candidate_codes.reshape(batch_size * candidate_count, rank_depth)
             for level, head in enumerate(self.code_heads):
-                log_probs = F.log_softmax(head(hidden[:, level, :]), dim=-1)
-                cumulative = cumulative + log_probs.gather(1, flat_codes[:, level : level + 1]).squeeze(1)
+                logits = head(hidden[:, level, :])
+                selected = logits.gather(1, flat_codes[:, level : level + 1]).squeeze(1)
+                cumulative = cumulative + selected
                 prefixes.append(cumulative)
             return torch.stack(prefixes, dim=-1).reshape(batch_size, candidate_count, rank_depth)
+
+        # Kept as a compatibility alias for older callers; the reproduction
+        # path now uses the official conditional-logit score above.
+        def ripor_prefix_log_scores(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_codes,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            return self.ripor_prefix_scores(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                candidate_codes,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
+            )
 
         def ripor_prefix_rank_loss(
             self,
@@ -2661,10 +3726,19 @@ def make_structured_t5_sid_model(
             margin: float,
             temperature: float,
             candidate_teacher_scores=None,
+            candidate_teacher_observed=None,
+            alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
+            prefix_max_length: int | None = None,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
         ):
-            """Align student prefix margins to frozen teacher relevance margins."""
-            if temperature <= 0:
-                raise ValueError(f"RIPOR temperature must be positive, got {temperature}")
+            """Official RIPOR prefix-oriented MarginMSE objective.
+
+            The ``margin`` and ``temperature`` parameters remain accepted for
+            checkpoint/CLI compatibility but are intentionally not used: RIPOR
+            regresses the raw teacher margin with MSE, weighted by the
+            normalized concave prefix coefficient ``alpha_i``.
+            """
             if candidate_teacher_scores is None:
                 candidate_teacher_scores = candidate_positive.to(dtype=torch.float32)
             if candidate_teacher_scores.shape != candidate_valid.shape:
@@ -2672,12 +3746,25 @@ def make_structured_t5_sid_model(
                     "RIPOR teacher scores must have shape [batch, candidates], "
                     f"got {tuple(candidate_teacher_scores.shape)} vs {tuple(candidate_valid.shape)}"
                 )
+            if candidate_teacher_observed is not None and candidate_teacher_observed.shape != candidate_valid.shape:
+                raise ValueError("RIPOR teacher observation mask must match candidate validity shape")
+            full_rank_depth = int(candidate_codes.shape[-1])
             prefix_scores = self.ripor_prefix_log_scores(
                 encoder_hidden_states,
                 encoder_attention_mask,
                 candidate_codes,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
+            if prefix_max_length is not None:
+                prefix_max_length = max(1, min(int(prefix_max_length), prefix_scores.shape[-1]))
+                prefix_scores = prefix_scores[..., :prefix_max_length]
             candidate_teacher_scores = candidate_teacher_scores.to(
+                device=prefix_scores.device,
+                dtype=prefix_scores.dtype,
+            )
+            alpha = torch.tensor(
+                ripor_prefix_alphas(full_rank_depth, alpha_beta)[: prefix_scores.shape[-1]],
                 device=prefix_scores.device,
                 dtype=prefix_scores.dtype,
             )
@@ -2696,23 +3783,12 @@ def make_structured_t5_sid_model(
                 diverged = (positive_codes[:, None, :] != negative_codes[None, :, :]).cumsum(dim=-1) > 0
                 teacher_positive_scores = candidate_teacher_scores[row_index, positive]
                 teacher_negative_scores = candidate_teacher_scores[row_index, negative]
-                teacher_margin_raw = teacher_positive_scores[:, None] - teacher_negative_scores[None, :]
-                # Preserve scored teacher differences.  The CLI margin is only
-                # a fallback target for ties/non-positive weak-teacher pairs;
-                # it is not applied to every pair as a fixed binary objective.
-                teacher_margin = teacher_margin_raw.clamp_min(0.0)
-                if float(margin) > 0:
-                    teacher_margin = torch.where(
-                        teacher_margin_raw <= 0,
-                        teacher_margin.new_full(teacher_margin.shape, float(margin)),
-                        teacher_margin,
-                    )
+                teacher_margin = teacher_positive_scores[:, None] - teacher_negative_scores[None, :]
                 student_margin = positive_scores[:, None, :] - negative_scores[None, :, :]
-                pair_losses = F.smooth_l1_loss(
-                    student_margin / float(temperature),
-                    teacher_margin[:, :, None].expand_as(student_margin) / float(temperature),
-                    reduction="none",
-                ) * float(temperature)
+                pair_losses = (
+                    student_margin
+                    - teacher_margin[:, :, None] * alpha.view(1, 1, -1)
+                ).square()
                 loss_sum = loss_sum + (pair_losses * diverged).sum()
                 pair_count = pair_count + diverged.sum()
             return loss_sum, pair_count, prefix_scores
@@ -2729,9 +3805,22 @@ def make_structured_t5_sid_model(
             ripor_candidate_valid=None,
             ripor_candidate_positive=None,
             ripor_candidate_teacher_scores=None,
+            ripor_candidate_teacher_observed=None,
             ripor_loss_weight: float = 0.0,
             ripor_margin: float = 1.0,
             ripor_temperature: float = 1.0,
+            ripor_alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
+            ripor_prefix_max_length: int | None = None,
+            pag_query_prefix: bool = False,
+            sequential_ce_weight: float = 1.0,
+            pag_set_targets=None,
+            pag_set_candidate_token_ids=None,
+            pag_set_candidate_token_mask=None,
+            pag_set_candidate_valid=None,
+            pag_set_candidate_positive=None,
+            pag_set_candidate_teacher_scores=None,
+            pag_set_loss_weight: float = 0.0,
+            pag_set_sparsity_weight: float = 0.0,
             global_loss_normalization: bool = True,
             return_components: bool = False,
         ):
@@ -2741,6 +3830,8 @@ def make_structured_t5_sid_model(
                 attention_mask,
                 decoder_input_ids,
                 decoder_attention_mask,
+                decoder_prefix_input_ids=input_ids if pag_query_prefix else None,
+                decoder_prefix_attention_mask=attention_mask if pag_query_prefix else None,
             )
             loss_sum = hidden.new_tensor(0.0)
             token_count = hidden.new_tensor(0.0)
@@ -2787,13 +3878,99 @@ def make_structured_t5_sid_model(
                     candidate_teacher_scores=ripor_candidate_teacher_scores,
                     margin=ripor_margin,
                     temperature=ripor_temperature,
+                    alpha_beta=ripor_alpha_beta,
+                    prefix_max_length=ripor_prefix_max_length,
+                    decoder_prefix_input_ids=input_ids if pag_query_prefix else None,
+                    decoder_prefix_attention_mask=attention_mask if pag_query_prefix else None,
                 )
                 ripor_loss = self._normalize_loss(
                     ripor_loss_sum,
                     ripor_pair_count,
                     global_loss_normalization,
                 )
-            loss = ce_loss + float(ripor_loss_weight) * ripor_loss
+            loss = float(sequential_ce_weight) * ce_loss + float(ripor_loss_weight) * ripor_loss
+            pag_set_loss_sum = hidden.new_tensor(0.0)
+            pag_set_count = hidden.new_tensor(0.0)
+            pag_set_loss = hidden.new_tensor(0.0)
+            if float(pag_set_loss_weight) != 0.0:
+                if pag_set_candidate_token_ids is not None:
+                    if (
+                        pag_set_candidate_token_mask is None
+                        or pag_set_candidate_valid is None
+                        or pag_set_candidate_positive is None
+                        or pag_set_candidate_teacher_scores is None
+                    ):
+                        raise ValueError("PAG MarginMSE requires candidate token masks, validity, labels, and teacher scores")
+                    set_logits = self.pag_set_logits_from_encoder(
+                        encoder_hidden_states,
+                        attention_mask,
+                        source_input_ids=input_ids,
+                    )
+                    token_ids = pag_set_candidate_token_ids.clamp_min(0).clamp_max(set_logits.shape[-1] - 1)
+                    token_scores = torch.gather(
+                        set_logits[:, None, :].expand(-1, token_ids.shape[1], -1),
+                        2,
+                        token_ids,
+                    )
+                    candidate_scores = (
+                        token_scores * pag_set_candidate_token_mask.to(dtype=token_scores.dtype)
+                    ).sum(dim=-1)
+                    teacher_scores = pag_set_candidate_teacher_scores.to(
+                        device=candidate_scores.device,
+                        dtype=candidate_scores.dtype,
+                    )
+                    pag_set_loss_sum = hidden.new_tensor(0.0)
+                    pag_set_count = hidden.new_tensor(0.0)
+                    for row_index in range(candidate_scores.shape[0]):
+                        valid = pag_set_candidate_valid[row_index]
+                        positive = valid & pag_set_candidate_positive[row_index]
+                        negative = valid & ~pag_set_candidate_positive[row_index]
+                        if not bool(positive.any()) or not bool(negative.any()):
+                            continue
+                        student_margin = candidate_scores[row_index, positive][:, None] - candidate_scores[row_index, negative][None, :]
+                        teacher_margin = teacher_scores[row_index, positive][:, None] - teacher_scores[row_index, negative][None, :]
+                        pag_set_loss_sum = pag_set_loss_sum + (student_margin - teacher_margin).square().sum()
+                        pag_set_count = pag_set_count + student_margin.numel()
+                    pag_set_loss = self._normalize_loss(
+                        pag_set_loss_sum,
+                        pag_set_count,
+                        global_loss_normalization,
+                    )
+                    if float(pag_set_sparsity_weight) != 0.0:
+                        global_set_logits = all_gather_tensor_with_grad(
+                            set_logits,
+                            self.distributed_context or DistributedContext(0, 0, 1, set_logits.device),
+                        )
+                        pag_set_loss = pag_set_loss + float(pag_set_sparsity_weight) * torch.mean(
+                            torch.abs(global_set_logits), dim=0
+                        ).square().sum()
+                elif pag_set_targets is not None:
+                    # Kept only for an explicitly constructed ablation.  The
+                    # reproduction path supplies teacher-ranked set candidates.
+                    set_logits = self.pag_set_logits_from_encoder(
+                        encoder_hidden_states,
+                        attention_mask,
+                        source_input_ids=input_ids,
+                    )
+                    if set_logits.shape != pag_set_targets.shape:
+                        raise ValueError(
+                            "PAG set targets must match the T5 lexical logits: "
+                            f"{tuple(pag_set_targets.shape)} != {tuple(set_logits.shape)}"
+                        )
+                    pag_set_loss_sum = F.binary_cross_entropy(
+                        torch.sigmoid(set_logits),
+                        pag_set_targets.to(dtype=set_logits.dtype),
+                        reduction="sum",
+                    )
+                    pag_set_count = hidden.new_tensor(float(pag_set_targets.numel()))
+                    pag_set_loss = self._normalize_loss(
+                        pag_set_loss_sum,
+                        pag_set_count,
+                        global_loss_normalization,
+                    )
+                else:
+                    raise ValueError("PAG set loss requires teacher-ranked candidate token ids")
+                loss = loss + float(pag_set_loss_weight) * pag_set_loss
             if return_components:
                 return {
                     "loss": loss,
@@ -2803,12 +3980,31 @@ def make_structured_t5_sid_model(
                     "local_ce_token_count": token_count,
                     "local_ripor_loss_sum": ripor_loss_sum,
                     "local_ripor_pair_count": ripor_pair_count,
+                    "pag_set_loss": pag_set_loss,
+                    "local_pag_set_loss_sum": pag_set_loss_sum,
+                    "local_pag_set_count": pag_set_count,
                 }
             return loss
 
         @torch.no_grad()
-        def logits_for_next_type(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, target_type: int):
-            hidden = self._decoder_hidden(input_ids, attention_mask, decoder_input_ids, decoder_attention_mask)
+        def logits_for_next_type(
+            self,
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            decoder_attention_mask,
+            target_type: int,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            hidden = self._decoder_hidden(
+                input_ids,
+                attention_mask,
+                decoder_input_ids,
+                decoder_attention_mask,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
+            )
             return self.logits_for_hidden_type(hidden, target_type)
 
         @torch.no_grad()
@@ -2819,12 +4015,16 @@ def make_structured_t5_sid_model(
             decoder_input_ids,
             decoder_attention_mask,
             target_type: int,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
         ):
             hidden = self._decoder_hidden_from_encoder(
                 encoder_hidden_states,
                 encoder_attention_mask,
                 decoder_input_ids,
                 decoder_attention_mask,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
             return self.logits_for_hidden_type(hidden, target_type)
 
@@ -2837,6 +4037,51 @@ def make_structured_t5_sid_model(
             if target_type == self.control_type:
                 return self.control_head(last_hidden)
             raise ValueError(f"invalid target type: {target_type}")
+
+        def pag_set_logits_from_encoder(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            source_input_ids=None,
+        ):
+            if source_input_ids is None:
+                decoder_start = self.backbone.config.decoder_start_token_id
+                if decoder_start is None:
+                    decoder_start = self.backbone.config.pad_token_id
+                decoder_input_ids = encoder_hidden_states.new_full(
+                    (encoder_hidden_states.shape[0], 1),
+                    int(decoder_start),
+                    dtype=torch.long,
+                )
+                decoder_attention_mask = torch.ones_like(decoder_input_ids)
+            else:
+                decoder_input_ids = source_input_ids
+                decoder_attention_mask = encoder_attention_mask
+            decoder_outputs = self.backbone.decoder(
+                input_ids=decoder_input_ids,
+                # The official T5-SPLADE collator supplies the query token
+                # sequence as decoder_input_ids and leaves decoder self-attention
+                # unmasked; the encoder attention mask is applied during the
+                # lexical max-pool below.
+                attention_mask=None if source_input_ids is not None else decoder_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            decoder_hidden = decoder_outputs.last_hidden_state
+            if getattr(self.backbone.config, "tie_word_embeddings", False):
+                decoder_hidden = decoder_hidden * (float(self.backbone.config.d_model) ** -0.5)
+            lexical_logits = self.backbone.lm_head(decoder_hidden)
+            lexical_rep = torch.log1p(torch.relu(lexical_logits))
+            if lexical_rep.shape[1] > 1:
+                lexical_rep = lexical_rep * encoder_attention_mask.unsqueeze(-1).to(dtype=lexical_rep.dtype)
+                lexical_rep = lexical_rep.max(dim=1).values
+            else:
+                lexical_rep = lexical_rep[:, 0, :]
+            # Match ``T5Splade.encode``: lexical coordinates are non-negative
+            # log(1+ReLU) activations, which are then summed over a set ID.
+            return lexical_rep
 
     return StructuredT5SIDModel()
 
@@ -2851,6 +4096,8 @@ def structured_sid_batch(
     max_source_length: int,
     device,
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    pag_set_token_ids: dict[str, list[int]] | None = None,
+    pag_set_vocab_size: int = 0,
 ) -> dict[str, Any]:
     import torch
 
@@ -2885,7 +4132,7 @@ def structured_sid_batch(
         target_types.append([*target["types"], *([-100] * pad)])
         labels.append([*target["labels"], *([-100] * pad)])
 
-    return {
+    result = {
         "input_ids": encoded_inputs["input_ids"].to(device),
         "attention_mask": encoded_inputs["attention_mask"].to(device),
         "decoder_input_ids": torch.tensor(decoder_input_ids, dtype=torch.long, device=device),
@@ -2893,6 +4140,29 @@ def structured_sid_batch(
         "target_types": torch.tensor(target_types, dtype=torch.long, device=device),
         "labels": torch.tensor(labels, dtype=torch.long, device=device),
     }
+    if pag_set_token_ids:
+        if pag_set_vocab_size <= 0:
+            raise ValueError("PAG set targets require a positive vocabulary size")
+        target = torch.zeros((len(rows), pag_set_vocab_size), dtype=torch.float32, device=device)
+        for row_index, row in enumerate(rows):
+            selected = [
+                str(sid)
+                for sid in (
+                    row.get("source_selected_skill_ids")
+                    if row.get("source_selected_skill_ids") is not None
+                    else row.get("selected_skill_ids", [])
+                )
+            ]
+            token_ids = {
+                int(token_id)
+                for sid in selected
+                for token_id in pag_set_token_ids.get(sid, [])
+            }
+            if not token_ids:
+                raise ValueError(f"PAG set target is empty for row={row.get('index')}")
+            target[row_index, torch.tensor(sorted(token_ids), dtype=torch.long, device=device)] = 1.0
+        result["pag_set_targets"] = target
+    return result
 
 
 def _structured_global_train_metrics(components: dict[str, Any], context: DistributedContext) -> dict[str, float]:
@@ -2902,10 +4172,14 @@ def _structured_global_train_metrics(components: dict[str, Any], context: Distri
     ripor_sum, ripor_count = reduce_sum_count(
         components["local_ripor_loss_sum"], components["local_ripor_pair_count"], context
     )
+    pag_sum, pag_count = reduce_sum_count(
+        components["local_pag_set_loss_sum"], components["local_pag_set_count"], context
+    )
     return {
         "ce_loss": ce_sum / max(1, ce_count),
         "ripor_loss": ripor_sum / max(1, ripor_count),
         "ripor_pairs": float(ripor_count),
+        "pag_set_loss": pag_sum / max(1, pag_count),
     }
 
 
@@ -2922,6 +4196,7 @@ def _distributed_structured_eval_loss(
     device,
     semantic_id_mode: str,
     context: DistributedContext,
+    pag_query_prefix: bool = False,
 ) -> float:
     """Evaluate CE as a true global token mean without padded examples."""
     import torch
@@ -2946,6 +4221,7 @@ def _distributed_structured_eval_loss(
             )
             components = core_model(
                 **batch,
+                pag_query_prefix=pag_query_prefix,
                 global_loss_normalization=False,
                 return_components=True,
             )
@@ -2977,6 +4253,11 @@ def _run_distributed_structured_training(
     ripor_enabled: bool,
     ripor_hard_negative_map: dict[str, list[str]],
     ripor_teacher_score_map: dict[str, dict[str, float]],
+    pag_set_token_ids: dict[str, list[int]] | None = None,
+    pag_set_vocab_size: int = 0,
+    pag_set_skills: list[dict[str, Any]] | None = None,
+    pag_set_candidate_map: dict[str, list[str]] | None = None,
+    pag_set_teacher_score_map: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Shared DDP-safe structured training loop for single and multi SID modes."""
     import torch
@@ -3051,7 +4332,15 @@ def _run_distributed_structured_training(
                     args.max_source_length,
                     device,
                     semantic_id_mode,
+                    pag_set_token_ids=(
+                        pag_set_token_ids
+                        if pag_set_token_ids and stage_name != "catalog" and not pag_set_candidate_map
+                        else None
+                    ),
+                    pag_set_vocab_size=pag_set_vocab_size,
                 )
+                batch["pag_query_prefix"] = bool(pag_set_token_ids and stage_name != "catalog")
+                batch["sequential_ce_weight"] = float(getattr(args, "sequential_ce_weight", 1.0))
                 if use_ripor:
                     batch.update(
                         build_ripor_candidate_batch(
@@ -3063,6 +4352,7 @@ def _run_distributed_structured_training(
                             teacher_score_map=ripor_teacher_score_map,
                             seed=args.seed + step,
                             device=device,
+                            require_teacher_scores=not args.ripor_allow_weak_teacher,
                         )
                     )
                     batch.update(
@@ -3070,8 +4360,38 @@ def _run_distributed_structured_training(
                             "ripor_loss_weight": args.ripor_loss_weight,
                             "ripor_margin": args.ripor_margin,
                             "ripor_temperature": args.ripor_temperature,
+                            "ripor_alpha_beta": args.ripor_alpha_beta,
+                            "ripor_prefix_max_length": (
+                                max(
+                                    1,
+                                    min(
+                                        depth,
+                                        math.ceil((step + 1) * depth / max(1, total_steps)),
+                                    ),
+                                )
+                                if args.ripor_progressive_prefix
+                                else depth
+                            ),
                         }
                     )
+                if pag_set_token_ids and stage_name != "catalog":
+                    batch["pag_set_loss_weight"] = args.pag_set_loss_weight
+                    batch["pag_set_sparsity_weight"] = args.pag_set_sparsity_weight
+                    if pag_set_candidate_map is not None:
+                        if not pag_set_skills or pag_set_teacher_score_map is None:
+                            raise ValueError("PAG set MarginMSE requires skill documents and teacher scores")
+                        batch.update(
+                            build_pag_set_candidate_batch(
+                                batch_rows,
+                                pag_set_skills,
+                                pag_set_token_ids,
+                                pag_set_candidate_map,
+                                pag_set_teacher_score_map,
+                                max_negatives=args.pag_set_max_negatives,
+                                allow_weak_teacher=args.pag_set_allow_weak_teacher,
+                                device=device,
+                            )
+                        )
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type="cuda",
@@ -3087,9 +4407,12 @@ def _run_distributed_structured_training(
                 should_log = step % args.logging_steps == 0 or step == total_steps
                 if should_log:
                     last_metrics = _structured_global_train_metrics(components, context)
-                    train_loss = last_metrics["ce_loss"] + (
-                        args.ripor_loss_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
-                    )
+                    pag_set_weight = float(getattr(args, "pag_set_loss_weight", 0.0))
+                    ripor_weight = float(getattr(args, "ripor_loss_weight", 0.0))
+                    ce_weight = float(getattr(args, "sequential_ce_weight", 1.0))
+                    train_loss = ce_weight * last_metrics["ce_loss"] + (
+                        ripor_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
+                    ) + pag_set_weight * last_metrics["pag_set_loss"]
                     if context.is_main:
                         print(f"{stage_name}_step={display_step} train_loss={train_loss:.6f}", flush=True)
                         event = {
@@ -3099,8 +4422,10 @@ def _run_distributed_structured_training(
                             "epoch": display_step / steps_per_epoch,
                             "train_loss": train_loss,
                             "ce_loss": last_metrics["ce_loss"],
+                            "sequential_ce_weight": ce_weight,
                             "ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
                             "ripor_pairs": int(last_metrics["ripor_pairs"]) if use_ripor else 0,
+                            "pag_set_loss": last_metrics["pag_set_loss"] if pag_set_token_ids else None,
                             "lr": optimizer.param_groups[0]["lr"],
                         }
                         append_loss_history(loss_history_path, event)
@@ -3119,6 +4444,7 @@ def _run_distributed_structured_training(
                         device,
                         semantic_id_mode,
                         context,
+                        pag_query_prefix=bool(pag_set_token_ids and stage_name != "catalog"),
                     )
                     if context.is_main:
                         print(f"{stage_name}_step={display_step} dev_loss={dev_loss:.6f}", flush=True)
@@ -3149,9 +4475,9 @@ def _run_distributed_structured_training(
             raise RuntimeError("training stage completed without a globally reduced loss event")
         return {
             "steps": step,
-            "last_train_loss": last_metrics["ce_loss"] + (
-                args.ripor_loss_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
-            ),
+            "last_train_loss": float(getattr(args, "sequential_ce_weight", 1.0)) * last_metrics["ce_loss"] + (
+                float(getattr(args, "ripor_loss_weight", 0.0)) * last_metrics["ripor_loss"] if use_ripor else 0.0
+            ) + float(getattr(args, "pag_set_loss_weight", 0.0)) * last_metrics["pag_set_loss"],
             "last_ce_loss": last_metrics["ce_loss"],
             "last_ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
             "best_dev_loss": best_loss,
@@ -3252,13 +4578,249 @@ def _initialize_structured_training_model(
         depth,
         dedup_size,
         semantic_id_mode,
+        pag_set_vocab_size=int(getattr(args, "pag_set_vocab_size", 0) or 0),
+        ripor_codebook_embeddings=getattr(args, "ripor_codebook_embeddings", None),
+        ripor_relevance_checkpoint=getattr(args, "ripor_relevance_checkpoint", None),
     ).to(context.device)
     optimizer = torch.optim.AdamW(core_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loaded_optimizer_state = False
     init_semantic_ids_verified = False
     init_source_length_verified = False
     init_source_text_policy_verified = False
-    if args.init_model_dir:
+    merged_initialization = False
+    relevance_initialization = False
+    sparse_initialization = False
+    if getattr(args, "ripor_relevance_checkpoint", None):
+        if args.init_model_dir or getattr(args, "pag_set_init_model_dir", None) or getattr(args, "pag_seq_init_model_dir", None):
+            raise ValueError(
+                "RIPOR relevance M0 initialization is only applied to a fresh decoder; "
+                "do not combine --ripor-relevance-checkpoint with a decoder checkpoint"
+            )
+        try:
+            relevance_checkpoint = torch.load(
+                args.ripor_relevance_checkpoint,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            relevance_checkpoint = torch.load(args.ripor_relevance_checkpoint, map_location="cpu")
+        relevance_state = relevance_checkpoint.get("state_dict") if isinstance(relevance_checkpoint, dict) else None
+        if not isinstance(relevance_state, dict):
+            raise ValueError("--ripor-relevance-checkpoint must contain a state_dict")
+        if not isinstance(relevance_checkpoint, dict) or relevance_checkpoint.get("artifact_format") != "ripor_m0_relevance_v1":
+            raise ValueError(
+                "--ripor-relevance-checkpoint must be the provenance-bearing M0 artifact "
+                "from train-ripor-relevance-encoder"
+            )
+        m0_config_hash = relevance_checkpoint.get("model_config_sha256")
+        if not m0_config_hash:
+            raise ValueError("M0 relevance checkpoint is missing model_config_sha256 provenance")
+        actual_config_hash = stable_payload_sha256(core_model.backbone.config.to_dict())
+        if str(m0_config_hash) != actual_config_hash:
+            raise ValueError(
+                "M0/GR model configuration mismatch: "
+                f"m0={m0_config_hash}, gr={actual_config_hash}"
+            )
+        expected_state_keys = relevance_checkpoint.get("state_keys")
+        if not isinstance(expected_state_keys, list) or not expected_state_keys:
+            raise ValueError("M0 relevance checkpoint is missing its complete state_keys schema")
+        normalized_expected_keys = {
+            str(key)[len("backbone.") :] if str(key).startswith("backbone.") else str(key)
+            for key in expected_state_keys
+        }
+        actual_m0_state_keys = {
+            str(key)[len("backbone.") :] if str(key).startswith("backbone.") else str(key)
+            for key in relevance_state
+        }
+        canonical_m0_keys = {
+            str(key)
+            for key in core_model.backbone.state_dict()
+            if not str(key).startswith("lm_head.")
+        }
+        if normalized_expected_keys != canonical_m0_keys:
+            raise ValueError(
+                "M0 relevance checkpoint state schema does not match the current T5 architecture: "
+                f"missing={sorted(canonical_m0_keys - normalized_expected_keys)[:5]}, "
+                f"extra={sorted(normalized_expected_keys - canonical_m0_keys)[:5]}"
+            )
+        if actual_m0_state_keys != canonical_m0_keys:
+            raise ValueError(
+                "M0 relevance checkpoint state_dict is not complete or contains unexpected keys: "
+                f"missing={sorted(canonical_m0_keys - actual_m0_state_keys)[:5]}, "
+                f"extra={sorted(actual_m0_state_keys - canonical_m0_keys)[:5]}"
+            )
+        if not relevance_checkpoint.get("decoder_length"):
+            raise ValueError("M0 relevance checkpoint is missing decoder_length provenance")
+        if args.ripor_codebook_embeddings:
+            try:
+                codebook_payload = torch.load(
+                    args.ripor_codebook_embeddings,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                codebook_payload = torch.load(args.ripor_codebook_embeddings, map_location="cpu")
+            if not isinstance(codebook_payload, dict):
+                raise ValueError("RIPOR codebook artifact must be a provenance-bearing dictionary")
+            if str(codebook_payload.get("source_relevance_model")) != str(relevance_checkpoint.get("model")):
+                raise ValueError("RIPOR codebook/M0 model provenance mismatch")
+            if str(codebook_payload.get("source_relevance_model_config_sha256")) != str(m0_config_hash):
+                raise ValueError("RIPOR codebook was built from a different M0 model configuration")
+            if int(codebook_payload.get("source_relevance_decoder_length", -1)) != int(relevance_checkpoint["decoder_length"]):
+                raise ValueError("RIPOR codebook/M0 decoder_length provenance mismatch")
+            codebook_state_keys = {
+                str(key)[len("backbone.") :] if str(key).startswith("backbone.") else str(key)
+                for key in (codebook_payload.get("source_relevance_state_keys") or [])
+            }
+            if codebook_state_keys != normalized_expected_keys:
+                raise ValueError("RIPOR codebook/M0 state schema mismatch")
+        backbone_state = core_model.backbone.state_dict()
+        transferable = {}
+        for key, value in relevance_state.items():
+            normalized_key = key[len("backbone.") :] if key.startswith("backbone.") else key
+            if normalized_key in backbone_state and tuple(value.shape) == tuple(backbone_state[normalized_key].shape):
+                transferable[normalized_key] = value
+        missing_m0_keys = sorted(normalized_expected_keys - set(transferable))
+        if missing_m0_keys:
+            raise ValueError(
+                "RIPOR relevance M0 checkpoint is not fully compatible with GR; "
+                f"missing_or_mismatched={missing_m0_keys[:5]}"
+            )
+        missing_keys, _ = core_model.backbone.load_state_dict(transferable, strict=False)
+        relevance_initialization = True
+    if getattr(args, "pag_sparse_checkpoint", None):
+        if not getattr(args, "pag_set_stage_only", False):
+            raise ValueError("--pag-sparse-checkpoint is only valid for the explicit PAG Msp→Mset stage")
+        if args.init_model_dir or getattr(args, "pag_set_init_model_dir", None) or getattr(args, "pag_seq_init_model_dir", None):
+            raise ValueError("PAG Msp→Mset initialization cannot be combined with decoder checkpoints")
+        try:
+            sparse_checkpoint = torch.load(
+                args.pag_sparse_checkpoint / "pag_sparse_encoder.pt",
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            sparse_checkpoint = torch.load(
+                args.pag_sparse_checkpoint / "pag_sparse_encoder.pt",
+                map_location="cpu",
+            )
+        sparse_state = sparse_checkpoint.get("state_dict") if isinstance(sparse_checkpoint, dict) else None
+        if not isinstance(sparse_state, dict):
+            raise ValueError("--pag-sparse-checkpoint must contain pag_sparse_encoder.pt/state_dict")
+        if int(sparse_checkpoint.get("vocab_size", 0) or 0) != int(getattr(args, "pag_set_vocab_size", 0) or 0):
+            raise ValueError("PAG Msp vocabulary does not match the lexical set manifest vocabulary")
+        backbone_state = core_model.backbone.state_dict()
+        transferable = {
+            key[len("backbone.") :]: value
+            for key, value in sparse_state.items()
+            if key.startswith("backbone.")
+            and key[len("backbone.") :] in backbone_state
+            and tuple(value.shape) == tuple(backbone_state[key[len("backbone.") :]].shape)
+        }
+        if not transferable:
+            raise ValueError("PAG Msp checkpoint has no shape-compatible GR backbone parameters")
+        core_model.backbone.load_state_dict(transferable, strict=False)
+        sparse_initialization = True
+    if getattr(args, "pag_set_init_model_dir", None) or getattr(args, "pag_seq_init_model_dir", None):
+        if not (args.pag_set_init_model_dir and args.pag_seq_init_model_dir) or args.init_model_dir:
+            raise ValueError(
+                "PAG joint reproduction requires both --pag-set-init-model-dir and "
+                "--pag-seq-init-model-dir, without --init-model-dir"
+            )
+        set_checkpoint = torch.load(
+            args.pag_set_init_model_dir / "structured_decoder.pt",
+            map_location=context.device,
+        )
+        seq_checkpoint = torch.load(
+            args.pag_seq_init_model_dir / "structured_decoder.pt",
+            map_location=context.device,
+        )
+        set_role = str(set_checkpoint.get("stage_role") or set_checkpoint.get("pag", {}).get("stage_role") or "")
+        seq_role = str(seq_checkpoint.get("stage_role") or seq_checkpoint.get("pag", {}).get("stage_role") or "")
+        if set_role != "pag_mset" or seq_role != "pag_mseq":
+            raise ValueError(
+                "PAG joint initialization requires provenance-checked Mset/Mseq checkpoints: "
+                f"set_role={set_role!r}, seq_role={seq_role!r}"
+            )
+        if str(set_checkpoint.get("training_formulation")) != "pag_mset_t5_splade_margin_mse":
+            raise ValueError("PAG Mset checkpoint does not carry the Msp→Mset training formulation")
+        if str(seq_checkpoint.get("training_formulation")) != "ripor_mseq_prefix_margin_mse":
+            raise ValueError("PAG Mseq checkpoint does not carry the RIPOR sequential training formulation")
+        set_pag_meta = set_checkpoint.get("pag", {})
+        if not set_pag_meta.get("pag_sparse_initialization"):
+            raise ValueError("PAG Mset checkpoint lacks verified Msp initialization provenance")
+        if not set_pag_meta.get("strict_teacher_scores"):
+            raise ValueError("PAG Mset checkpoint was not trained with frozen numeric teacher scores")
+        if float(set_pag_meta.get("set_loss_weight", 0.0)) <= 0.0:
+            raise ValueError("PAG Mset checkpoint has no positive lexical set loss")
+        if float(set_pag_meta.get("sequential_ce_weight", 1.0)) != 0.0:
+            raise ValueError("PAG Mset checkpoint must disable the sequential CE ablation")
+        seq_ripor = seq_checkpoint.get("ripor", {})
+        if not (seq_ripor.get("initialized_from_relevance_m0") and seq_ripor.get("initialized_from_rq_centroids")):
+            raise ValueError("PAG joint Mseq checkpoint lacks verified RIPOR M0/RQ centroid provenance")
+        if not seq_ripor.get("enabled") or float(seq_ripor.get("loss_weight", 0.0)) <= 0.0:
+            raise ValueError("PAG joint Mseq checkpoint has no positive RIPOR prefix objective")
+        if not seq_ripor.get("strict_teacher_scores"):
+            raise ValueError("PAG joint Mseq checkpoint was not trained with frozen numeric teacher scores")
+        seq_pag_meta = seq_checkpoint.get("pag", {})
+        if float(seq_pag_meta.get("sequential_ce_weight", 1.0)) != 0.0:
+            raise ValueError("PAG joint Mseq checkpoint must disable the sequential CE ablation")
+        for label, checkpoint in (("set", set_checkpoint), ("seq", seq_checkpoint)):
+            expected_config = {
+                "codebook_size": codebook_size,
+                "depth": depth,
+                "dedup_size": dedup_size,
+            }
+            mismatches = {
+                key: (checkpoint.get(key), value)
+                for key, value in expected_config.items()
+                if checkpoint.get(key) is not None and int(checkpoint[key]) != int(value)
+            }
+            checkpoint_pag_vocab = int(checkpoint.get("pag_set_vocab_size", 0) or 0)
+            expected_pag_vocab = int(getattr(args, "pag_set_vocab_size", 0) or 0)
+            if checkpoint_pag_vocab not in (0, expected_pag_vocab):
+                mismatches["pag_set_vocab_size"] = (checkpoint_pag_vocab, expected_pag_vocab)
+            if mismatches:
+                raise ValueError(f"PAG {label} checkpoint configuration mismatch: {mismatches}")
+            validate_checkpoint_semantic_ids(checkpoint, semantic_ids, semantic_id_mode=semantic_id_mode)
+            validate_checkpoint_source_length(
+                checkpoint,
+                args.max_source_length,
+                args.allow_checkpoint_config_mismatch,
+            )
+            validate_checkpoint_source_text_policy(checkpoint, args.allow_checkpoint_config_mismatch)
+        set_state = set_checkpoint["state_dict"]
+        seq_state = seq_checkpoint["state_dict"]
+        merged_state: dict[str, Any] = {}
+        sequential_only_prefixes = ("sid_embedding.", "code_heads.", "dedup_head.", "control_head.")
+        for key, value in core_model.state_dict().items():
+            if key not in set_state or key not in seq_state:
+                continue
+            left = set_state[key].to(device=context.device)
+            right = seq_state[key].to(device=context.device)
+            if key.startswith(sequential_only_prefixes):
+                # Mset trains the lexical T5 backbone; Mseq owns the
+                # position-specific semantic-ID input/output tables.  Averaging
+                # Mset's unused/random semantic heads would destroy the RIPOR
+                # initialization, so keep the sequential branch from Mseq.
+                merged_state[key] = right
+            elif torch.is_floating_point(left):
+                merged_state[key] = (left + right) / 2.0
+            else:
+                merged_state[key] = left
+        missing_keys, unexpected_keys = core_model.load_state_dict(merged_state, strict=False)
+        optional_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+        missing_required = [key for key in missing_keys if not key.startswith(optional_prefixes)]
+        if missing_required or unexpected_keys:
+            raise ValueError(
+                "PAG set/sequence checkpoint merge mismatch: "
+                f"missing={missing_required[:5]}, unexpected={unexpected_keys[:5]}"
+            )
+        merged_initialization = True
+        init_semantic_ids_verified = True
+        init_source_length_verified = True
+        init_source_text_policy_verified = True
+    elif args.init_model_dir:
         init_checkpoint = load_structured_decoder_checkpoint(
             core_model,
             args.init_model_dir,
@@ -3282,21 +4844,45 @@ def _initialize_structured_training_model(
             init_checkpoint,
             args.allow_checkpoint_config_mismatch,
         )
+        if (
+            float(getattr(args, "ripor_loss_weight", 0.0)) > 0
+            and not getattr(args, "ripor_allow_weak_teacher", False)
+        ):
+            ripor_meta = init_checkpoint.get("ripor", {})
+            if not (ripor_meta.get("initialized_from_relevance_m0") and ripor_meta.get("initialized_from_rq_centroids")):
+                raise ValueError(
+                    "strict RIPOR continuation requires an init checkpoint carrying verified M0/RQ centroid provenance"
+                )
     core_model.configure_distributed(context)
     return core_model, optimizer, {
         "loaded_optimizer_state": loaded_optimizer_state,
         "init_semantic_ids_verified": init_semantic_ids_verified,
         "init_source_length_verified": init_source_length_verified,
         "init_source_text_policy_verified": init_source_text_policy_verified,
+        "merged_pag_initialization": merged_initialization,
+        "ripor_relevance_initialization": relevance_initialization,
+        "ripor_codebook_initialization": bool(getattr(args, "ripor_codebook_embeddings", None)),
+        "pag_sparse_initialization": sparse_initialization,
     }
 
 
 def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
-    """Train the single-SID GR with RIPOR prefix ranking and optional DDP."""
+    """Train the single-SID GR with the RIPOR prefix-ranking objective."""
     import torch
     from transformers import AutoTokenizer
 
     context = initialize_distributed(cpu=args.cpu)
+    if args.ripor_loss_weight > 0 and args.ripor_hard_negatives is None and not args.ripor_allow_weak_teacher:
+        raise ValueError(
+            "strict RIPOR reproduction requires --ripor-hard-negatives with frozen teacher scores; "
+            "pass --ripor-allow-weak-teacher only for an explicitly labeled ablation"
+        )
+    if args.ripor_loss_weight > 0 and not args.ripor_allow_weak_teacher and not args.init_model_dir:
+        if not args.ripor_relevance_checkpoint or not args.ripor_codebook_embeddings:
+            raise ValueError(
+                "strict RIPOR reproduction from a fresh decoder requires both "
+                "--ripor-relevance-checkpoint (M0) and --ripor-codebook-embeddings (RQ centroids)"
+            )
     torch.manual_seed(args.seed + context.rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed + context.rank)
@@ -3328,6 +4914,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     random.Random(args.seed).shuffle(catalog_rows)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    args.pag_set_vocab_size = 0
     if context.is_main:
         query_train_length_audit = audit_source_token_lengths(
             "query_train", query_train_rows, tokenizer, args.max_source_length, args.allow_source_truncation
@@ -3361,8 +4948,18 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "hard_negative_predictions": str(args.ripor_hard_negatives) if args.ripor_hard_negatives else None,
         "ranked_levels": int(depth),
         "dedup_suffix_ranked": False,
-        "teacher_objective": "smooth_l1_prefix_margin_alignment",
-        "teacher_score_fallback": "reciprocal_rank_or_positive_negative_anchor",
+        "teacher_objective": "official_prefix_margin_mse_with_concave_alpha",
+        "alpha_beta": float(args.ripor_alpha_beta),
+        "multi_objective_prefix_supervision": True,
+        "progressive_schedule": "linear_prefix_expansion_with_multi_objective_retention"
+        if args.ripor_progressive_prefix
+        else "disabled",
+        "teacher_score_fallback": "explicit_weak_ablation_only",
+        "strict_teacher_scores": not args.ripor_allow_weak_teacher,
+        "relevance_m0_checkpoint": str(args.ripor_relevance_checkpoint) if args.ripor_relevance_checkpoint else None,
+        "rq_codebook_embeddings": str(args.ripor_codebook_embeddings) if args.ripor_codebook_embeddings else None,
+        "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),
+        "initialized_from_rq_centroids": bool(init_info["ripor_codebook_initialization"]),
     }
     if context.is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -3423,7 +5020,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         query_dev_rows=query_dev_rows,
         context=context,
         checkpoint_metadata=checkpoint_metadata,
-        training_formulation="single_sid_catalog_indexing_with_ripor_prefix_ranking",
+        training_formulation="single_sid_catalog_indexing_with_official_ripor_prefix_margin_mse",
         wandb_run=wandb_run,
         ripor_enabled=args.ripor_loss_weight > 0,
         ripor_hard_negative_map=ripor_hard_negative_map,
@@ -3467,6 +5064,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "seed": args.seed,
+                "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
                 **init_info,
                 "load_best_model_at_end": bool(result["query"]["best_checkpoint"] and args.load_best_model_at_end),
             },
@@ -3514,8 +5112,110 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
         if catalog_enabled
         else []
     )
+    pag_set_skills = load_jsonl(args.skills_jsonl) if args.skills_jsonl else []
     random.Random(args.seed).shuffle(catalog_rows)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    pag_set_token_ids, pag_set_vocab_size = load_pag_set_token_ids(args.pag_set_ids)
+    pag_set_candidate_map, pag_set_teacher_score_map = load_ranked_skill_candidates_with_scores(
+        args.pag_set_hard_negatives
+    )
+    ripor_candidate_map, ripor_teacher_score_map = load_ranked_skill_candidates_with_scores(
+        args.ripor_hard_negatives
+    )
+    if args.ripor_loss_weight > 0 and args.ripor_hard_negatives is None and not args.ripor_allow_weak_teacher:
+        raise ValueError(
+            "strict RIPOR sequential reproduction requires --ripor-hard-negatives with frozen teacher scores; "
+            "pass --ripor-allow-weak-teacher only for an explicitly labeled ablation"
+        )
+    if (
+        args.ripor_loss_weight > 0
+        and not args.ripor_allow_weak_teacher
+        and not args.init_model_dir
+        and not args.pag_set_init_model_dir
+        and not args.pag_seq_init_model_dir
+    ):
+        if not args.ripor_relevance_checkpoint or not args.ripor_codebook_embeddings:
+            raise ValueError(
+                "strict RIPOR reproduction from a fresh decoder requires both "
+                "--ripor-relevance-checkpoint (M0) and --ripor-codebook-embeddings (RQ centroids)"
+            )
+    if pag_set_token_ids:
+        if args.pag_stage_role == "pag_mseq":
+            raise ValueError("PAG Mseq is the standalone sequential stage and must omit --pag-set-ids")
+        missing_pag_ids = sorted(set(semantic_ids) - set(pag_set_token_ids))
+        if missing_pag_ids:
+            raise ValueError(
+                f"PAG set manifest is missing {len(missing_pag_ids)} semantic skills; "
+                f"first={missing_pag_ids[:5]}"
+            )
+        args.pag_set_vocab_size = pag_set_vocab_size
+        if args.pag_set_loss_weight <= 0:
+            raise ValueError("--pag-set-ids requires a positive --pag-set-loss-weight")
+        if not pag_set_candidate_map and not args.pag_set_allow_weak_teacher:
+            raise ValueError(
+                "strict PAG reproduction requires --pag-set-hard-negatives with frozen teacher scores; "
+                "pass --pag-set-allow-weak-teacher only for an explicit ablation"
+            )
+        if args.pag_set_stage_only:
+            if not args.pag_sparse_checkpoint:
+                raise ValueError("PAG Msp→Mset stage requires --pag-sparse-checkpoint")
+            if args.pag_set_init_model_dir or args.pag_seq_init_model_dir or args.init_model_dir:
+                raise ValueError("PAG Msp→Mset stage starts from Msp and cannot take decoder checkpoints")
+            if args.ripor_loss_weight != 0.0:
+                raise ValueError("PAG Mset stage has no sequential RIPOR objective; set --ripor-loss-weight 0")
+            if args.sequential_ce_weight != 0.0:
+                raise ValueError("PAG Mset stage is Lset only; set --sequential-ce-weight 0")
+        elif not args.pag_set_allow_weak_teacher:
+            if args.ripor_loss_weight <= 0:
+                raise ValueError(
+                    "strict PAG joint reproduction requires the RIPOR prefix objective; "
+                    "set --ripor-loss-weight > 0"
+                )
+            if not (args.pag_set_init_model_dir and args.pag_seq_init_model_dir):
+                raise ValueError(
+                    "strict PAG joint reproduction requires Mset and Mseq checkpoints; "
+                    "pass --pag-set-init-model-dir and --pag-seq-init-model-dir"
+                )
+            if args.pag_stage_role != "pag_joint":
+                raise ValueError("strict PAG joint reproduction requires --pag-stage-role pag_joint")
+            if args.sequential_ce_weight != 0.0:
+                raise ValueError("strict PAG objective is Lset + Lseq; set --sequential-ce-weight 0")
+            if args.pag_sparse_checkpoint:
+                raise ValueError("strict PAG joint stage consumes Mset/Mseq, not Msp; remove --pag-sparse-checkpoint")
+    else:
+        args.pag_set_vocab_size = 0
+        if args.pag_set_stage_only or args.pag_sparse_checkpoint:
+            raise ValueError("PAG Msp/Mset options require --pag-set-ids")
+        if args.pag_stage_role == "pag_mseq" and args.pag_set_allow_weak_teacher:
+            raise ValueError(
+                "--pag-set-allow-weak-teacher is unrelated to the standalone Mseq stage; "
+                "do not use it to bypass RIPOR provenance checks"
+            )
+        if args.pag_stage_role == "pag_mseq" and args.ripor_allow_weak_teacher:
+            raise ValueError(
+                "a weak RIPOR teacher cannot be labeled pag_mseq; use a baseline/ablation role instead"
+            )
+        if args.pag_stage_role == "pag_mseq":
+            # Mseq is the standalone RIPOR sequential stage.  It must be
+            # produced from the M0/RQ initialization with the prefix
+            # MarginMSE objective; otherwise a CE-only or arbitrary decoder
+            # checkpoint could be mislabeled as the provenance input to the
+            # final PAG joint stage.
+            if args.init_model_dir or args.pag_set_init_model_dir or args.pag_seq_init_model_dir:
+                raise ValueError("strict PAG Mseq stage starts from M0/RQ and cannot take decoder checkpoints")
+            if args.ripor_loss_weight <= 0:
+                raise ValueError("strict PAG Mseq reproduction requires --ripor-loss-weight > 0")
+            if args.sequential_ce_weight != 0.0:
+                raise ValueError("strict PAG Mseq reproduction uses RIPOR prefix MarginMSE; set --sequential-ce-weight 0")
+            if not args.ripor_relevance_checkpoint or not args.ripor_codebook_embeddings:
+                raise ValueError(
+                    "strict PAG Mseq reproduction requires both --ripor-relevance-checkpoint (M0) "
+                    "and --ripor-codebook-embeddings (RQ centroids)"
+                )
+        elif args.pag_stage_role != "baseline":
+            raise ValueError(
+                f"strict structured training without PAG set IDs does not support stage role {args.pag_stage_role!r}"
+            )
     if context.is_main:
         query_train_length_audit = audit_source_token_lengths(
             "query_train", train_rows, tokenizer, args.max_source_length, args.allow_source_truncation
@@ -3541,8 +5241,40 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
     checkpoint_metadata["pag"] = {
-        "training": "planner_only_at_decode",
-        "multi_sid_prefix_ranking": "disabled_due_to_lexicographic_set_serialization",
+        "enabled": bool(pag_set_token_ids),
+        "set_branch": "T5-SPLADE lexical logits over top-m set IDs",
+        "joint_objective": (
+            "lexical_set_margin_mse"
+            if args.pag_set_stage_only
+            else "ripor_prefix_margin_mse + lexical_set_margin_mse"
+        ),
+        "sequential_objective": (
+            "RIPOR prefix MarginMSE" if args.ripor_loss_weight > 0 else "CE baseline"
+        ),
+        "sequential_loss_weight": float(args.ripor_loss_weight),
+        "set_ids": str(args.pag_set_ids) if args.pag_set_ids else None,
+        "set_vocab_size": int(pag_set_vocab_size),
+        "set_loss_weight": float(args.pag_set_loss_weight),
+        "set_sparsity_weight": float(args.pag_set_sparsity_weight),
+        "hard_negative_predictions": str(args.pag_set_hard_negatives) if args.pag_set_hard_negatives else None,
+        "strict_teacher_scores": not args.pag_set_allow_weak_teacher,
+        "external_prediction_scores": False,
+        "merged_set_sequential_initialization": bool(init_info["merged_pag_initialization"]),
+        "stage_role": "pag_mset" if args.pag_set_stage_only else args.pag_stage_role,
+        "sequential_ce_weight": float(args.sequential_ce_weight),
+        "pag_sparse_initialization": bool(init_info["pag_sparse_initialization"]),
+        "merge_policy": "average_t5_backbone_keep_mseq_semantic_heads",
+    }
+    checkpoint_metadata["stage_role"] = "pag_mset" if args.pag_set_stage_only else args.pag_stage_role
+    checkpoint_metadata["ripor"] = {
+        "enabled": bool(args.ripor_loss_weight > 0),
+        "loss_weight": float(args.ripor_loss_weight),
+        "teacher_objective": "official_prefix_margin_mse_raw_conditional_logits",
+        "strict_teacher_scores": not args.ripor_allow_weak_teacher,
+        "relevance_m0_checkpoint": str(args.ripor_relevance_checkpoint) if args.ripor_relevance_checkpoint else None,
+        "rq_codebook_embeddings": str(args.ripor_codebook_embeddings) if args.ripor_codebook_embeddings else None,
+        "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),
+        "initialized_from_rq_centroids": bool(init_info["ripor_codebook_initialization"]),
     }
     if context.is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -3560,6 +5292,7 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
             "train_rows": len(train_rows),
             "dev_rows": len(dev_rows),
             "catalog_rows": len(catalog_rows),
+            "pag": checkpoint_metadata["pag"],
             "catalog_enabled": catalog_enabled,
             "codebook_size": codebook_size,
             "depth": depth,
@@ -3601,11 +5334,23 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
         query_dev_rows=dev_rows,
         context=context,
         checkpoint_metadata=checkpoint_metadata,
-        training_formulation="multi_sid_set_generation",
+        training_formulation=(
+            "pag_mset_t5_splade_margin_mse" if args.pag_set_stage_only
+            else (
+                "ripor_mseq_prefix_margin_mse"
+                if args.pag_stage_role == "pag_mseq"
+                else "multi_sid_pag_lexical_set_ripor_joint"
+            )
+        ),
         wandb_run=wandb_run,
-        ripor_enabled=False,
-        ripor_hard_negative_map={},
-        ripor_teacher_score_map={},
+        ripor_enabled=args.ripor_loss_weight > 0,
+        ripor_hard_negative_map=ripor_candidate_map,
+        ripor_teacher_score_map=ripor_teacher_score_map,
+        pag_set_token_ids=pag_set_token_ids,
+        pag_set_vocab_size=pag_set_vocab_size,
+        pag_set_skills=pag_set_skills,
+        pag_set_candidate_map=pag_set_candidate_map if pag_set_token_ids else None,
+        pag_set_teacher_score_map=pag_set_teacher_score_map if pag_set_token_ids else None,
     )
     if context.is_main:
         write_json(
@@ -3717,9 +5462,11 @@ def advance_structured_beam(
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
     planner_increment: float = 0.0,
     planner_weight: float = 0.0,
+    planner_absolute_score: float | None = None,
 ) -> dict[str, Any]:
     new_prefix = list(beam["current_prefix"])
     new_completed = list(beam["completed"])
+    new_completed_records = list(beam.get("completed_records", []))
     new_stopped = False
     semantic_length = structured_sid_length(depth, semantic_id_mode)
     if target_type < semantic_length:
@@ -3748,14 +5495,30 @@ def advance_structured_beam(
     else:
         raise ValueError(f"invalid target type: {target_type}")
     model_score = float(beam.get("model_score", beam["score"])) + float(log_prob)
-    planner_score = float(beam.get("planner_score", 0.0)) + float(planner_increment)
+    if planner_absolute_score is None:
+        planner_score = float(beam.get("planner_score", 0.0)) + float(planner_increment)
+    else:
+        planner_score = float(planner_absolute_score)
+    combined_score = model_score + float(planner_weight) * planner_score
+    if target_type == semantic_length:
+        completion_decoder_length = len(beam["decoder_input_ids"]) + 1
+        new_completed_records.append(
+            {
+                "semantic_id": tuple(new_completed[-1]),
+                "model_score": model_score,
+                "planner_score": planner_score,
+                "score": combined_score,
+                "decoder_length": completion_decoder_length,
+            }
+        )
     return {
         "decoder_input_ids": [*beam["decoder_input_ids"], next_global_id],
         "current_prefix": new_prefix,
         "completed": new_completed,
+        "completed_records": new_completed_records,
         "model_score": model_score,
         "planner_score": planner_score,
-        "score": model_score + float(planner_weight) * planner_score,
+        "score": combined_score,
         "stopped": new_stopped,
     }
 
@@ -3765,16 +5528,30 @@ def ranked_skill_ids_from_structured_beams(
     sequence_to_skill_id: dict[tuple[int, ...], str],
     max_rank: int,
 ) -> list[str]:
+    # A beam's final score includes tokens generated after an earlier SID was
+    # completed.  Rank multi-SID outputs by each completion snapshot globally,
+    # not by the eventual score of the containing beam.
+    completion_candidates: list[tuple[float, int, int, str]] = []
+    for beam_index, beam in enumerate(beams):
+        records = beam.get("completed_records")
+        if records is None:
+            records = [{"semantic_id": tuple(values), "score": beam["score"]} for values in beam["completed"]]
+        for record_index, record in enumerate(records):
+            sid = sequence_to_skill_id.get(tuple(record["semantic_id"]))
+            if sid is not None:
+                completion_candidates.append(
+                    (float(record.get("score", beam["score"])), beam_index, record_index, sid)
+                )
+    completion_candidates.sort(key=lambda item: item[0], reverse=True)
     ranked: list[str] = []
     seen: set[str] = set()
-    for beam in sorted(beams, key=lambda item: float(item["score"]), reverse=True):
-        for values in beam["completed"]:
-            sid = sequence_to_skill_id.get(tuple(values))
-            if sid is not None and sid not in seen:
-                ranked.append(sid)
-                seen.add(sid)
-                if len(ranked) >= max_rank:
-                    return ranked
+    for _, _, _, sid in completion_candidates:
+        if sid in seen:
+            continue
+        ranked.append(sid)
+        seen.add(sid)
+        if len(ranked) >= max_rank:
+            return ranked
     return ranked
 
 
@@ -3795,10 +5572,17 @@ def ranked_skill_ids_from_marginal_structured_beams(
 ) -> tuple[list[str], dict[str, float]]:
     skill_scores: dict[str, float] = {}
     for beam in beams:
-        score = float(beam["score"])
-        if length_normalize:
-            score = score / max(1, len(beam["decoder_input_ids"]) - 1)
-        for values in set(tuple(values) for values in beam["completed"]):
+        records = beam.get("completed_records")
+        if records is None:
+            records = [{"semantic_id": tuple(values), "score": beam["score"]} for values in beam["completed"]]
+        for record in records:
+            score = float(record.get("score", beam["score"]))
+            if length_normalize:
+                completion_length = int(
+                    record.get("decoder_length", len(beam.get("decoder_input_ids", [])))
+                )
+                score = score / max(1, completion_length - 1)
+            values = tuple(record["semantic_id"])
             sid = sequence_to_skill_id.get(values)
             if sid is None:
                 continue
@@ -3888,19 +5672,43 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     max_rank = max(k_values)
     validate_rank_capacity(args.num_beams, args.max_skills, max_rank)
     trie, sequence_to_skill_id = _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)
-    pag_planner_weight = float(getattr(args, "pag_planner_weight", 0.0))
-    if pag_planner_weight != 0.0 and args.pag_planner_predictions is None:
-        raise ValueError("--pag-planner-predictions is required when --pag-planner-weight is non-zero")
-    pag_planner = (
-        load_pag_planner_scores(args.pag_planner_predictions, args.pag_planner_score_mode)
-        if pag_planner_weight != 0.0
-        else {}
-    )
-    prefix_descendants = (
-        build_semantic_prefix_descendants(semantic_ids, depth)
-        if pag_planner_weight != 0.0
-        else {}
-    )
+    pag_set_weight = float(getattr(args, "pag_set_weight", 0.0))
+    pag_set_token_ids, pag_set_vocab_size = load_pag_set_token_ids(getattr(args, "pag_set_ids", None))
+    checkpoint_pag_vocab_size = int(checkpoint.get("pag_set_vocab_size", 0) or 0)
+    if pag_set_weight != 0.0:
+        if not pag_set_token_ids:
+            raise ValueError("--pag-set-weight requires --pag-set-ids")
+        if args.pag_set_top_n <= 0:
+            raise ValueError(
+                "PAG reproduction requires a fixed top-N lexical candidate domain; "
+                "pass --pag-set-top-n (use --pag-set-weight 0 only for the same-domain baseline)"
+            )
+        missing_pag_ids = sorted(set(semantic_ids) - set(pag_set_token_ids))
+        if missing_pag_ids:
+            raise ValueError(
+                f"PAG set manifest is missing {len(missing_pag_ids)} semantic skills; "
+                f"first={missing_pag_ids[:5]}"
+            )
+        if checkpoint_pag_vocab_size <= 0 or checkpoint_pag_vocab_size != pag_set_vocab_size:
+            raise ValueError(
+                "PAG set manifest/checkpoint vocabulary mismatch: "
+                f"checkpoint={checkpoint_pag_vocab_size}, manifest={pag_set_vocab_size}"
+            )
+    if args.pag_set_top_n > 0:
+        if not pag_set_token_ids or checkpoint_pag_vocab_size <= 0 or checkpoint_pag_vocab_size != pag_set_vocab_size:
+            raise ValueError(
+                "--pag-set-top-n requires a checkpoint/manifest with the trained PAG set branch "
+                "so the candidate domain is identical at weight=0 and weight>0"
+            )
+    # The external dense/BM25 planner is retained only as a separately named
+    # legacy ablation.  It is never used by the PAG reproduction path.
+    legacy_pag_planner_weight = float(getattr(args, "pag_planner_weight", 0.0))
+    if legacy_pag_planner_weight != 0.0:
+        raise ValueError(
+            "external --pag-planner-predictions is not PAG; use --pag-set-ids and "
+            "--pag-set-weight for the trained set branch"
+        )
+    prefix_descendants = build_semantic_prefix_descendants(semantic_ids, depth)
     device = context.device
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     model = make_structured_t5_sid_model(
@@ -3909,8 +5717,17 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         semantic_id_mode,
+        pag_set_vocab_size=checkpoint_pag_vocab_size,
     )
-    model.load_state_dict(checkpoint["state_dict"])
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    optional_missing_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+    missing_required = [key for key in missing_keys if not key.startswith(optional_missing_prefixes)]
+    unexpected_required = [key for key in unexpected_keys if not key.startswith(optional_missing_prefixes)]
+    if missing_required or unexpected_required:
+        raise ValueError(
+            "structured decoder checkpoint parameter mismatch: "
+            f"missing={missing_required[:5]}, unexpected={unexpected_required[:5]}"
+        )
     model.to(device).eval()
 
     rows = load_jsonl(args.rows)
@@ -3935,10 +5752,6 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     max_steps = args.max_skills * steps_per_skill
     for row_index, row in local_indexed_rows:
         row_planner_scores: dict[str, float] = {}
-        if pag_planner_weight != 0.0:
-            for key in retrieval_row_keys(row):
-                for sid, score in pag_planner.get(key, {}).items():
-                    row_planner_scores[sid] = max(row_planner_scores.get(sid, float("-inf")), score)
         encoded = tokenizer(
             [decoder_source_text(row)],
             padding=True,
@@ -3950,11 +5763,43 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         attention_mask = encoded["attention_mask"].to(device)
         with torch.no_grad():
             encoder_hidden_states = model.encode_source(input_ids, attention_mask)
+            if pag_set_weight != 0.0 or args.pag_set_top_n > 0:
+                set_logits = model.pag_set_logits_from_encoder(
+                    encoder_hidden_states,
+                    attention_mask,
+                    source_input_ids=input_ids,
+                )[0]
+                for sid, token_ids in pag_set_token_ids.items():
+                    valid_token_ids = [token_id for token_id in token_ids if token_id < set_logits.numel()]
+                    if valid_token_ids:
+                        row_planner_scores[sid] = float(set_logits[valid_token_ids].sum().cpu())
+        decode_trie = trie
+        planner_candidate_ids = set(semantic_ids)
+        row_prefix_descendants = prefix_descendants
+        if pag_set_token_ids and args.pag_set_top_n > 0:
+            planner_candidate_ids = {
+                sid
+                for sid, _ in sorted(
+                    row_planner_scores.items(), key=lambda item: item[1], reverse=True
+                )[: args.pag_set_top_n]
+                if sid in semantic_ids
+            }
+            if planner_candidate_ids:
+                filtered_semantic_ids = {sid: semantic_ids[sid] for sid in planner_candidate_ids}
+                decode_trie, _ = _semantic_id_trie_from_ids(
+                    filtered_semantic_ids,
+                    semantic_id_mode,
+                )
+                row_prefix_descendants = build_semantic_prefix_descendants(
+                    filtered_semantic_ids,
+                    depth,
+                )
         beams = [
             {
                 "decoder_input_ids": [bos_id],
                 "current_prefix": [],
                 "completed": [],
+                "completed_records": [],
                 "score": 0.0,
                 "model_score": 0.0,
                 "planner_score": 0.0,
@@ -3973,7 +5818,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     beam["current_prefix"],
                     beam["completed"],
                     target_type,
-                    trie,
+                    decode_trie,
                     depth,
                     args.max_skills,
                     semantic_id_mode,
@@ -4000,33 +5845,38 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     decoder_input_ids,
                     decoder_attention_mask,
                     target_type,
+                    decoder_prefix_input_ids=input_ids if pag_set_token_ids else None,
+                    decoder_prefix_attention_mask=attention_mask if pag_set_token_ids else None,
                 )
-                log_probs_batch = F.log_softmax(logits_batch, dim=-1)
-                for (beam, allowed), log_probs in zip(active_items, log_probs_batch):
+                # RIPOR's constrained decoder ranks with the raw conditional
+                # code logits, matching ``ripor_prefix_scores`` and the paper's
+                # position-specific codebook dot products.
+                raw_scores_batch = logits_batch
+                for (beam, allowed), raw_scores in zip(active_items, raw_scores_batch):
                     allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
-                    allowed_scores = log_probs.index_select(0, allowed_tensor)
+                    allowed_scores = raw_scores.index_select(0, allowed_tensor)
                     ranked_with_planner = []
                     for raw_score, value in zip(allowed_scores.detach().cpu().tolist(), allowed):
-                        planner_increment = 0.0
-                        if pag_planner_weight != 0.0 and target_type < semantic_length:
+                        planner_absolute_score = float(beam.get("planner_score", 0.0))
+                        if pag_set_weight != 0.0 and target_type < semantic_length:
                             completed_skill_ids = {
                                 sequence_to_skill_id[tuple(values)]
                                 for values in beam["completed"]
                                 if tuple(values) in sequence_to_skill_id
                             }
-                            planner_increment = pag_prefix_planner_score(
+                            planner_absolute_score = pag_prefix_planner_score(
                                 [*beam["current_prefix"], int(value)],
                                 row_planner_scores,
-                                prefix_descendants,
-                                args.pag_planner_aggregation,
+                                row_prefix_descendants,
+                                args.pag_set_aggregation,
                                 excluded_skill_ids=completed_skill_ids,
                             )
-                        combined_score = float(raw_score) + pag_planner_weight * planner_increment
+                        combined_score = float(raw_score) + pag_set_weight * planner_absolute_score
                         ranked_with_planner.append(
-                            (combined_score, float(raw_score), int(value), planner_increment)
+                            (combined_score, float(raw_score), int(value), planner_absolute_score)
                         )
                     ranked = sorted(ranked_with_planner, reverse=True)[: args.num_beams]
-                    for _, log_prob, value, planner_increment in ranked:
+                    for _, log_prob, value, planner_absolute_score in ranked:
                         candidates.append(
                             advance_structured_beam(
                                 beam,
@@ -4037,8 +5887,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                                 depth,
                                 dedup_size,
                                 semantic_id_mode,
-                                planner_increment=planner_increment,
-                                planner_weight=pag_planner_weight,
+                                planner_absolute_score=planner_absolute_score,
+                                planner_weight=pag_set_weight,
                             )
                         )
             beams = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)[: args.num_beams]
@@ -4070,6 +5920,11 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         pred_set = set(predicted_ids)
         gold_set = set(gold_ids)
         hit_count = len(pred_set & gold_set)
+        candidate_recall = (
+            float(len(gold_set & planner_candidate_ids) / len(gold_set))
+            if pag_set_token_ids and args.pag_set_top_n > 0 and gold_set
+            else None
+        )
         predictions.append(
             {
                 "index": row.get("index"),
@@ -4091,6 +5946,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                 "hit_rate": 1.0 if hit_count > 0 else 0.0,
                 "exact_match": pred_set == gold_set,
                 "count_match": len(pred_set) == len(gold_set),
+                "pag_candidate_recall": candidate_recall,
                 "invalid": bool(unknown_sequences),
                 "unknown_semantic_ids": unknown_sequences,
             }
@@ -4110,6 +5966,11 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         [{"predicted_skill_ids": pred["predicted_skill_ids"], "invalid": pred["invalid"]} for pred in predictions],
     )
     ranked_metrics = compute_at_k_metrics(rows, predictions, k_values)
+    pag_candidate_recalls = [
+        float(prediction["pag_candidate_recall"])
+        for prediction in predictions
+        if prediction.get("pag_candidate_recall") is not None
+    ]
     ranked_lengths = [len(prediction["ranked_skill_ids"]) for prediction in predictions]
     ranked_length_audit = {
         "min_ranked_skills": min(ranked_lengths, default=0),
@@ -4142,10 +6003,15 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "num_beams": args.num_beams,
             "max_skills": args.max_skills,
             "rank_aggregation": args.rank_aggregation,
-            "pag_planner_predictions": str(args.pag_planner_predictions) if args.pag_planner_predictions else None,
-            "pag_planner_weight": pag_planner_weight,
-            "pag_planner_aggregation": args.pag_planner_aggregation,
-            "pag_planner_score_mode": args.pag_planner_score_mode,
+            "pag_set_ids": str(args.pag_set_ids) if args.pag_set_ids else None,
+            "pag_set_weight": pag_set_weight,
+            "pag_set_top_n": args.pag_set_top_n,
+            "pag_set_aggregation": args.pag_set_aggregation,
+            "pag_candidate_recall": "reported below when top_n > 0",
+            "pag_candidate_recall_mean": (
+                sum(pag_candidate_recalls) / len(pag_candidate_recalls)
+                if pag_candidate_recalls else None
+            ),
             "k_values": k_values,
             "max_rank": max_rank,
             "codebook_size": codebook_size,
@@ -4203,6 +6069,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=command_prepare)
 
+    p = sub.add_parser("build-pag-set-ids")
+    p.add_argument("--skills-jsonl", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--model", default="t5-base")
+    p.add_argument("--max-tokens", type=int, default=16)
+    p.add_argument("--sparse-checkpoint", type=Path)
+    p.add_argument("--lexical-fallback", action="store_true")
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--max-length", type=int, default=512)
+    p.set_defaults(func=command_build_pag_set_ids)
+
     p = sub.add_parser("encode-skills")
     p.add_argument("--skills-jsonl", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
@@ -4212,13 +6089,82 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=command_encode)
 
+    p = sub.add_parser("train-ripor-relevance-encoder")
+    p.add_argument("--rows", type=Path, required=True)
+    p.add_argument("--skills-jsonl", type=Path, required=True)
+    p.add_argument(
+        "--hard-negatives",
+        type=Path,
+        required=True,
+        help="frozen teacher-ranked candidate JSONL with scores; required for strict RIPOR reproduction",
+    )
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--model", default="t5-base")
+    p.add_argument("--max-query-length", type=int, default=256)
+    p.add_argument("--max-skill-length", type=int, default=512)
+    p.add_argument("--decoder-length", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--max-steps", type=int, default=-1)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--max-negatives", type=int, default=1)
+    p.add_argument("--allow-weak-teacher", action="store_true")
+    p.add_argument("--logging-steps", type=int, default=50)
+    p.add_argument("--seed", type=int, default=20260803)
+    p.add_argument("--bf16", action="store_true")
+    p.add_argument("--cpu", action="store_true")
+    p.set_defaults(func=command_train_ripor_relevance_encoder)
+
+    p = sub.add_parser("train-pag-sparse-encoder")
+    p.add_argument("--skills-jsonl", type=Path, required=True)
+    p.add_argument("--rows", type=Path, required=True)
+    p.add_argument(
+        "--hard-negatives",
+        type=Path,
+        required=True,
+        help="frozen teacher-ranked candidate JSONL with scores; required for strict PAG SPLADE training",
+    )
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--model", default="t5-base")
+    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--top-k", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--max-steps", type=int, default=-1)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--max-negatives", type=int, default=1)
+    p.add_argument("--allow-weak-teacher", action="store_true")
+    p.add_argument("--query-reg-weight", type=float, default=0.01)
+    p.add_argument("--doc-reg-weight", type=float, default=0.008)
+    p.add_argument("--logging-steps", type=int, default=50)
+    p.add_argument("--seed", type=int, default=20260803)
+    p.add_argument("--bf16", action="store_true")
+    p.add_argument("--cpu", action="store_true")
+    p.set_defaults(func=command_train_pag_sparse_encoder)
+
     p = sub.add_parser("train-rqvae")
     p.add_argument("--embeddings", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--codebook-size", type=int, default=256)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--hidden-dim", type=int, default=512)
-    p.add_argument("--latent-dim", type=int, default=128)
+    p.add_argument(
+        "--latent-dim",
+        type=int,
+        default=None,
+        help="RQ latent width; default keeps the relevance encoder width so RIPOR centroids can initialize GR",
+    )
+    p.add_argument(
+        "--ripor-identity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "quantize M0/T5 relevance embeddings directly so exported centroids are valid RIPOR E_i; "
+            "use --no-ripor-identity only for a legacy learned-bottleneck ablation"
+        ),
+    )
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -4291,6 +6237,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--catalog-input-prefix", default="skill document: ")
     p.add_argument("--catalog-epochs", type=int, default=0)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
+    p.add_argument(
+        "--pag-set-ids",
+        type=Path,
+        help="lexical set-ID manifest produced by build-pag-set-ids; enables the joint PAG set branch",
+    )
+    p.add_argument(
+        "--pag-set-hard-negatives",
+        type=Path,
+        help="frozen teacher-ranked candidate JSONL for the PAG lexical MarginMSE branch",
+    )
+    p.add_argument("--pag-set-max-negatives", type=int, default=1)
+    p.add_argument("--pag-set-allow-weak-teacher", action="store_true")
+    p.add_argument("--pag-set-loss-weight", type=float, default=0.0)
+    p.add_argument("--pag-set-sparsity-weight", type=float, default=0.0)
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
     p.add_argument("--allow-source-truncation", action="store_true")
     p.add_argument("--allow-checkpoint-config-mismatch", action="store_true")
@@ -4305,11 +6265,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-steps", type=int, default=100)
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
+    p.add_argument(
+        "--ripor-relevance-checkpoint",
+        type=Path,
+        help="RIPOR M0 relevance encoder checkpoint (fresh decoder initialization only)",
+    )
+    p.add_argument(
+        "--ripor-codebook-embeddings",
+        type=Path,
+        help="RQ centroid tensor from train-rqvae/codebook_embeddings.pt",
+    )
+    p.add_argument("--pag-set-init-model-dir", type=Path)
+    p.add_argument("--pag-seq-init-model-dir", type=Path)
+    p.add_argument(
+        "--pag-sparse-checkpoint",
+        type=Path,
+        help="PAG Msp pag_sparse_encoder directory for the explicit Msp→Mset stage",
+    )
+    p.add_argument(
+        "--pag-set-stage-only",
+        action="store_true",
+        help="train Mset from Msp using lexical MarginMSE only; emits a role-checked pag_mset checkpoint",
+    )
+    p.add_argument(
+        "--pag-stage-role",
+        choices=["baseline", "pag_mseq", "pag_joint"],
+        default="baseline",
+        help="provenance role written into structured checkpoints",
+    )
+    p.add_argument(
+        "--sequential-ce-weight",
+        type=float,
+        default=1.0,
+        help="explicit CE ablation weight; strict PAG uses 0 and trains Lset+Lseq",
+    )
     p.add_argument("--step-offset", type=int, default=0)
     p.add_argument("--initial-best-dev-loss", type=float)
     p.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--cpu", action="store_true")
+    p.add_argument("--ripor-loss-weight", type=float, default=0.0)
+    p.add_argument("--ripor-max-negatives", type=int, default=16)
+    p.add_argument("--ripor-margin", type=float, default=1.0)
+    p.add_argument("--ripor-temperature", type=float, default=1.0)
+    p.add_argument("--ripor-alpha-beta", type=float, default=DEFAULT_RIPOR_ALPHA_BETA)
+    p.add_argument(
+        "--ripor-progressive-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="expand RIPOR prefix objectives from short to full paths while retaining earlier prefixes",
+    )
+    p.add_argument("--ripor-hard-negatives", type=Path)
+    p.add_argument("--ripor-allow-weak-teacher", action="store_true")
     add_wandb_args(p)
     p.set_defaults(func=command_train_structured_decoder)
 
@@ -4339,6 +6346,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-steps", type=int, default=200)
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
+    p.add_argument(
+        "--ripor-relevance-checkpoint",
+        type=Path,
+        help="RIPOR M0 relevance encoder checkpoint (fresh decoder initialization only)",
+    )
+    p.add_argument(
+        "--ripor-codebook-embeddings",
+        type=Path,
+        help="RQ centroid tensor from train-rqvae/codebook_embeddings.pt",
+    )
     p.add_argument("--step-offset", type=int, default=0)
     p.add_argument("--initial-best-dev-loss", type=float)
     p.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
@@ -4353,6 +6370,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ripor-max-negatives", type=int, default=16)
     p.add_argument("--ripor-margin", type=float, default=1.0)
     p.add_argument("--ripor-temperature", type=float, default=1.0)
+    p.add_argument("--ripor-alpha-beta", type=float, default=DEFAULT_RIPOR_ALPHA_BETA)
+    p.add_argument(
+        "--ripor-progressive-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="expand RIPOR prefix objectives from short to full paths while retaining earlier prefixes",
+    )
+    p.add_argument(
+        "--ripor-allow-weak-teacher",
+        action="store_true",
+        help="allow reciprocal-rank/anchor fallback scores; never use for a strict RIPOR comparison",
+    )
     p.add_argument(
         "--ripor-hard-negatives",
         type=Path,
@@ -4379,10 +6408,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="beam_order",
     )
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--pag-set-ids", type=Path)
+    p.add_argument("--pag-set-weight", type=float, default=0.0)
+    p.add_argument("--pag-set-top-n", type=int, default=DEFAULT_PAG_SET_TOP_N)
+    p.add_argument("--pag-set-aggregation", choices=["max", "logsumexp"], default="max")
     p.add_argument(
         "--pag-planner-predictions",
         type=Path,
-        help="frozen dense/BM25 ranked predictions used by the PAG-style prefix planner",
+        help="deprecated external planner ablation; rejected by the PAG reproduction path",
     )
     p.add_argument("--pag-planner-weight", type=float, default=0.0)
     p.add_argument("--pag-planner-aggregation", choices=["max", "logsumexp"], default="max")
@@ -4408,6 +6441,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="beam_order",
     )
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--pag-set-ids", type=Path)
+    p.add_argument("--pag-set-weight", type=float, default=0.0)
+    p.add_argument("--pag-set-top-n", type=int, default=DEFAULT_PAG_SET_TOP_N)
+    p.add_argument("--pag-set-aggregation", choices=["max", "logsumexp"], default="max")
     p.add_argument("--pag-planner-predictions", type=Path)
     p.add_argument("--pag-planner-weight", type=float, default=0.0)
     p.add_argument("--pag-planner-aggregation", choices=["max", "logsumexp"], default="max")

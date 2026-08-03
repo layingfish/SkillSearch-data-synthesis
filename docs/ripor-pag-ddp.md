@@ -1,24 +1,83 @@
-# RIPOR/PAG 与单节点 8 卡训练
+# RIPOR/PAG 复现接入与单节点 8 卡训练
 
-## 方法接入
+这份说明只把论文核心机制称为复现；旧的 dense/BM25 外挂 planner 已被移出主路径，不能作为 PAG 结果。
 
-当前实现把两篇工作中适合 D4 Structured SID 的部分移植到现有管线，而不是把旧仓库的模型直接替换进来。
+## RIPOR
 
-- RIPOR 位于 `train-single-sid-decoder`。模型对每个候选 SemID 做 teacher-forcing，计算每个语义 code level 的累计 log probability，并仅在正负路径首次分叉之后，将学生 prefix margin 对齐到冻结 teacher relevance margin。`source_selected_skill_ids` 中同一个 query 的全部技能都会被视为正例，避免 multi-skill query 在 single-SID 展开后互相构成 false negative。dedup suffix 只用于唯一化，不参与 relevance ranking。
-- `--ripor-hard-negatives` 接收当前 GR 或 dense teacher 的 `predictions.jsonl`，从 `ranked_skill_ids` 与 `ranked_scores`/`ranked_skill_scores` 读取可刷新 hard-negative pool 和 teacher 分数；没有分数时显式使用 reciprocal-rank，未覆盖的槽位用正负 anchor 分数和确定性随机候选补齐。`--ripor-loss-weight 0` 保持原来的 CE-only 路径。
-- PAG 适配为受限 Trie 内的 planner look-ahead：`eval-structured-decoder` 在每个 allowed child 上聚合冻结 dense/BM25 排名的后代 skill 分数，再与生成模型的 beam score 合并。planner 不读取 gold、不硬过滤 Trie 候选；`--pag-planner-weight 0` 逐 token 保持原 beam 行为。当前 multi-SID 仍使用原有词典序 set serialization，因此没有把 RIPOR 的完整序列排序损失误用于 multi。
+`train-single-sid-decoder` 的 `--ripor-loss-weight > 0` 使用 RIPOR 的 prefix-oriented MarginMSE：
 
-示例：
+- 先用 M0 relevance encoder 训练 query/document MarginMSE，再用 RQ centroids 初始化每个位置的 decoder input/output codebook；对每个候选 SemID teacher-force，计算官方的累计 raw conditional-logit 分数 `S_prefix_i`；dedup suffix 不进入排序。
+- 对同一 query 的全部 ground-truth skill 作为正例，负例排除全部 GT skill；正负路径在首次分叉前不产生 prefix loss。
+- 目标是 `(student_margin_i - alpha_i * teacher_margin)^2`，`alpha_i=(1-beta^i)/(1-beta^L)`，默认 `beta=0.5`（官方 decay=2 的等价写法）、`alpha_L=1`；所有已达到的 prefix objective 同时保留。
+- 严格复现要求 `--ripor-hard-negatives` 提供冻结 teacher 的正负分数。缺分数的样本会直接报错；`--ripor-allow-weak-teacher` 只能用于单独标记的弱 teacher ablation。
+
+RIPOR 的 relevance-based ID initialization 是独立阶段，不把现有 document-only D4/LETTER ID 叫作 RIPOR ID：
 
 ```bash
-python3 scripts/skill_gr_pipeline.py train-single-sid-decoder --rows train.jsonl --dev-rows dev.jsonl --semantic-ids semantic_ids.jsonl --skills-jsonl skills.jsonl --output-dir single-ripor --model t5-base --bf16 --ripor-loss-weight 0.25 --ripor-max-negatives 16 --ripor-hard-negatives dense-or-previous-gr/predictions.jsonl
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-ripor-relevance-encoder \
+  --rows train.jsonl --skills-jsonl skills.jsonl --hard-negatives teacher_ranked.jsonl \
+  --output-dir ripor_relevance --model t5-base --batch-size 16 --bf16
 
-python3 scripts/skill_gr_pipeline.py eval-single-sid-decoder --rows dev.jsonl --model-dir single-ripor/final --semantic-ids semantic_ids.jsonl --output-dir single-pag --pag-planner-predictions dense/predictions.jsonl --pag-planner-weight 0.15 --pag-planner-score-mode reciprocal_rank
+uv run python scripts/skill_gr_pipeline.py train-rqvae \
+  --embeddings ripor_relevance/skill_embeddings.pt --output-dir rqvae \
+  --codebook-size 256 --depth 3 --ripor-identity
 ```
 
-## 8 卡启动
+输出的 `ripor_relevance/skill_embeddings.pt` 才能作为 RQ/LETTER 量化的输入；`train-rqvae --ripor-identity` 直接在 M0/T5 hidden space 做 residual quantization，避免 learned bottleneck 改变 centroid 坐标系。它另外输出 `codebook_embeddings.pt`，训练 decoder 时必须传入 M0 与该 centroid 文件，才是 relevance-based ID initialization，而不是只换一份 SemID。
 
-手写训练循环通过 `torchrun` 自动进入 DDP；普通单进程命令无需额外参数。`--batch-size` 表示每卡 batch，manifest 会同时记录 `global_batch_size = batch_size × WORLD_SIZE`。
+## PAG
+
+PAG 按论文的阶段顺序执行：Msp 用官方 T5-SPLADE（`log(1+ReLU(logits))`、全局 FLOPS 正则、teacher MarginMSE）生成固定 m 个 lexical set ID；Mset 从 Msp 初始化，Mseq 从 RIPOR M0/centroid 初始化，最后逐参数合并两个有 provenance 的 checkpoint，并用 `Lset + Lseq` 联合微调。联合 decoder 的 sequential trajectory 采用 `[query tokens; SID prefix]`，与 set 分支共享 query-token context。
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-pag-sparse-encoder \
+  --skills-jsonl skills.jsonl --rows train.jsonl --hard-negatives teacher_ranked.jsonl \
+  --output-dir pag_sparse --model t5-base --batch-size 32 --bf16
+
+python3 scripts/skill_gr_pipeline.py build-pag-set-ids \
+  --skills-jsonl skills.jsonl --sparse-checkpoint pag_sparse --max-tokens 16 --output pag_set_ids.json
+
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-structured-decoder \
+  --rows multi_train.jsonl --dev-rows multi_dev.jsonl --semantic-ids semantic_ids.jsonl \
+  --skills-jsonl skills.jsonl --pag-set-ids pag_set_ids.json \
+  --pag-set-hard-negatives pag_teacher_ranked.jsonl --pag-set-loss-weight 1.0 \
+  --pag-set-stage-only --pag-sparse-checkpoint pag_sparse --sequential-ce-weight 0 \
+  --output-dir pag_mset --model t5-base --bf16
+
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-structured-decoder \
+  --rows multi_train.jsonl --dev-rows multi_dev.jsonl --semantic-ids semantic_ids.jsonl \
+  --ripor-hard-negatives ripor_teacher_ranked.jsonl --ripor-loss-weight 1.0 \
+  --ripor-relevance-checkpoint ripor_relevance/relevance_encoder.pt \
+  --ripor-codebook-embeddings rqvae/codebook_embeddings.pt --pag-stage-role pag_mseq \
+  --sequential-ce-weight 0 \
+  --output-dir pag_mseq --model t5-base --bf16
+
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-structured-decoder \
+  --rows multi_train.jsonl --dev-rows multi_dev.jsonl --semantic-ids semantic_ids.jsonl \
+  --skills-jsonl skills.jsonl --pag-set-ids pag_set_ids.json \
+  --pag-set-hard-negatives pag_teacher_ranked.jsonl \
+  --pag-set-loss-weight 1.0 --ripor-loss-weight 1.0 \
+  --ripor-hard-negatives ripor_teacher_ranked.jsonl \
+  --pag-set-init-model-dir pag_mset \
+  --pag-seq-init-model-dir pag_mseq --pag-stage-role pag_joint \
+  --sequential-ce-weight 0 --pag-set-top-n 100 \
+  --output-dir pag_joint --model t5-base --bf16
+```
+
+严格 PAG 复现要求先得到 Msp→Mset 与 Mseq 两份带角色标记的 checkpoint，再按官方流程逐参数平均初始化联合模型；任意普通 checkpoint 不能冒充 Mset/Mseq。缺少任一阶段、teacher numeric score、M0 或 RQ centroid 时命令会直接失败；`--pag-set-allow-weak-teacher` 只允许显式标记的弱监督消融。严格联合目标将 CE 权重设为 0，CE 只能通过显式非零参数作为消融。
+
+解码时，先从 lexical set branch 取固定的 top-N 候选域 `D`（示例为 100），再对每个 sequential prefix 使用
+`S'(prefix)=S_seq(prefix)+weight*max_{skill descendant} S_set(query,skill)`，planner 分数按当前 prefix 重新计算，绝不沿 token 重复累加。`--pag-set-top-n` 非零时会剪枝到 set branch 的 top-N 候选，并在 `eval_manifest.json` 记录 gold candidate recall。`--pag-set-weight 0` 是同一 checkpoint 的 sequential baseline；不再接受外部 dense/BM25 分数作为 PAG 复现路径。
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py eval-structured-decoder \
+  --rows multi_dev.jsonl --model-dir pag_joint/final --semantic-ids semantic_ids.jsonl \
+  --pag-set-ids pag_set_ids.json --pag-set-top-n 100 --pag-set-weight 1.0 --output-dir pag_eval
+```
+
+## 8 卡
+
+手写训练循环通过 `torchrun` 自动进入 DDP；`--batch-size` 是每卡 batch，manifest 记录全局 batch。structured decoder 的 CE、RIPOR pair 和 PAG set loss 都使用全局 sum/count 归一化；日志、W&B、checkpoint 只由 rank 0 写入。检索评测使用无 padding 分片并按原始行号合并。
 
 ```bash
 torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-single-sid-decoder ... --batch-size 16 --bf16
@@ -26,14 +85,4 @@ torchrun --standalone --nproc_per_node=8 scripts/skill_gr_pipeline.py train-stru
 torchrun --standalone --nproc_per_node=8 scripts/skillrouter_embedding_train.py train ... --training-mode standard --batch-size 8 --bf16
 ```
 
-Structured decoder 使用全局 token-count 归一化，避免不同卡上 multi-SID target 长度不同造成 local-mean 偏差；日志、W&B、manifest、checkpoint 只由 rank 0 写入。SkillRouter standard 模式使用跨 rank differentiable all-gather，保留全局 in-batch negatives。`gradcache` 依赖手工重算梯度，仍保持单进程语义。
-
-`train-decoder` 使用 Hugging Face `Seq2SeqTrainer`，以 `torchrun` 启动即可由 Trainer 原生使用 DDP，保存动作已保护为 world-process-zero。
-
-PAG 的 `raw` planner 分数会按 query 平移到非负区间，使没有 teacher 记录的候选使用零基线，不会因为原始分数为负而反向获益。
-
-## 有意不做普通 DDP 的阶段
-
-`train-rqvae`、LETTER `train_letter_rqvae_official.py` 和 LightGCN 不做简单 DDP 包装：前两者含 k-means/Sinkhorn/EMA 码本与全局 collision assignment，跨卡复制会产生不一致 SemID；LightGCN 每个 BPR step 都重算完整图传播，复制 full graph 到 8 卡没有正向加速。它们应先保持单进程，后续若要并行需要专门的全局码本或图切分协议。
-
-`encode-skills` 和 structured decoder eval 支持 `torchrun` 的无 padding 分片；rank 0 按原始行号合并输出，避免评测重复样本。
+`train-rqvae`、LETTER 码本和 LightGCN 不做简单 DDP 包装：它们的码本/图传播需要专门的全局协议，复制到 8 卡会改变语义而不是单纯加速。
