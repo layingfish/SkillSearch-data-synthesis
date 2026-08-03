@@ -102,6 +102,8 @@
   应使用该 curriculum，但从完整 Mseq 初始化的 RIPOR-only / RIPOR+PAG final 应始终监督全部 prefix。
   启动器现已显式区分 `progressive` 与 `full`，checkpoint provenance 同步记录；正在运行的
   `tide-chenyufei03-10245-pcgrm` 标记为 audit-only，完成后隔离并重跑，不进入结果。
+- 为避免等待无效 run 白白占用关键路径，launcher 允许仅覆盖 `SKILLGR_RIPOR_ONLY_DIR`；corrected
+  full-prefix final 将写入独立目录并与 audit-only job 并行，完成后再原子切换 canonical 结果目录。
 
 ## 错误与处理
 
