@@ -9,7 +9,7 @@
 
 ## 2026-08-04：计划获批并恢复执行
 
-- **当前状态：** Phase 6 最小验证；独立审查后提交 teacher 与 8 卡 preflight。
+- **当前状态：** Phase 7 正式训练；刷新后的 8 卡 preflight 已通过。
 - 用户确认按 `task_plan.md` 继续，并授权在 rudder-r2 按需使用 4–5 个节点。
 - 调度原则已写回计划：每个任务必须完整利用节点的 8×A800；共享依赖完成后并行三组训练与四组评测。
 - 已重新读取 `task_plan.md`、`findings.md`、`progress.md`，session catchup 未报告遗漏上下文。
@@ -35,6 +35,7 @@
 | focused `tests.test_skill_gr_pipeline` | 通过 | 53 passed，7 个 optional-dependency skips |
 | 锁定 stage launcher `bash -n` | 通过 | 每个 GPU stage 固定 `torchrun --nproc_per_node=8` |
 | 8-rank DDP objective invariant | 通过 | `max_gradient_error=5.96e-08`，global count=20 |
+| 刷新后的全链路 8 卡 preflight | 通过 | 56 tests；所有两步训练、planning/weight0 解码成功；dev 8 条、gold 8 条 |
 
 ## 2026-08-04：实现按计划收敛
 
@@ -79,6 +80,11 @@
   dev 原始 schema 使用 `generated.query/selected_skill_ids`，而 expansion/source 只读 top-level，导致
   smoke eval 输入 1 token、gold=0。现统一兼容 raw 与 prepared schema，并增加 nested query/labels 回归测试；
   需刷新 preflight，确认 dev rows/gold 非零后才启动正式训练。
+- 刷新 preflight `tide-chenyufei03-10238-lsltr` 已成功：K8S `Succeeded`，56 个镜像内 focused tests、
+  8-rank DDP invariant、Msp/Mset/RIPOR/PAG/联合两步训练以及 planning/weight0 两次解码均通过；
+  dev 8 条 query 的长度为 110--341 tokens，gold mentions=8、missing=0。正式门禁已解除。
+- 第一波共享正式任务已并发提交：PAG Msp/Mset 为 `tide-chenyufei03-10239-gwkec`，RIPOR Mseq
+  为 `tide-chenyufei03-10240-hrdvg`；两者均为 rudder-r2 上完整 8×A800 单节点任务。
 
 ## 错误与处理
 
@@ -90,17 +96,17 @@
 
 ## 下一步
 
-1. 清理失败 preflight 的临时子集并用官方 Msp 长度重新提交 8 卡 preflight。
-2. preflight 通过后并发提交 `pag_shared` 与 `ripor_mseq`。
-3. 共享 checkpoint 完成后并发提交三组 final，并运行 baseline/三组统一评测。
+1. 持续监控 `pag_shared` 与 `ripor_mseq` 的 8 卡训练、loss、checkpoint 和异常退出。
+2. 共享 checkpoint 完成后并发提交三组 final。
+3. 三组 final 完成后并发运行 baseline/三组统一评测。
 4. 持续回填 job ID、日志、checkpoint 和 metrics。
 
 ## 5 问恢复检查
 
 | 问题 | 答案 |
 |---|---|
-| 当前在哪？ | Phase 6 最小验证与 cross-review |
-| 接下来去哪？ | teacher → preflight → 正式 stage DAG |
+| 当前在哪？ | Phase 7，共享 PAG 与 RIPOR Mseq 正式训练 |
+| 接下来去哪？ | 三组 final → baseline/三组统一评测 → 归因表 |
 | 目标是什么？ | 固定 LETTER，测量 RIPOR、PAG 和联合方法在 single/multi subsets 上的贡献 |
 | 已学到什么？ | 见 `findings.md` |
 | 已做什么？ | 见本文件此前工作和测试记录 |

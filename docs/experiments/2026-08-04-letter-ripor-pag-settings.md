@@ -48,14 +48,16 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/logs/`
 
-Metrics: `${SKILLGR_OUTPUT_ROOT}/{ripor_only,pag_only,ripor_pag}/eval/ranked_metrics.json`
+Metrics: `${SKILLGR_OUTPUT_ROOT}/baseline_eval/ranked_metrics.json`、
+`${SKILLGR_OUTPUT_ROOT}/ripor_only/eval/ranked_metrics.json`，以及 PAG 两组各自
+`eval/{planning,weight0_diagnostic}/ranked_metrics.json`。
 
 ## Verification
 
 - [x] Minimal local syntax/config check
-- [ ] LETTER manifest/SID fingerprint invariant
-- [ ] PAG merge preserves Mseq SID embedding/code/control heads bitwise
-- [x] Focused loss-setting tests (53 passed, 7 dependency-gated skipped)
+- [x] LETTER manifest/SID fingerprint invariant
+- [x] PAG merge preserves Mseq SID embedding/code/control heads bitwise
+- [x] Focused loss-setting tests (56 passed in the training image)
 - [x] DDP global sum/count invariant on 8 ranks (`max_gradient_error=5.96e-08`)
 - [x] Reviewer required? yes — independent plan review completed; CRITICAL/HIGH items incorporated or explicitly resolved
 
@@ -106,3 +108,10 @@ gold because the locked dev split stores query/labels under `generated.*`, while
 decoder source extraction only read prepared top-level fields. Both paths now accept the canonical raw
 schema as well as prepared rows, with a regression test covering nested query and two nested labels.
 Formal training/evaluation remains gated on a refreshed preflight with non-zero dev rows and gold.
+
+Refreshed preflight `tide-chenyufei03-10238-lsltr` succeeded. All 56 focused tests, the 8-rank DDP
+objective invariant, every two-step real-model training stage, planning-ahead decoding, and the weight=0
+diagnostic completed. The raw dev audit now reports eight non-empty queries (110--341 tokens) and eight
+gold skill mentions with zero missing mentions, so the earlier schema defect is closed. The formal
+shared stages were then submitted concurrently: PAG Msp/Mset as `tide-chenyufei03-10239-gwkec` and
+RIPOR Mseq as `tide-chenyufei03-10240-hrdvg`, each on one complete 8xA800 node in `rudder-r2`.

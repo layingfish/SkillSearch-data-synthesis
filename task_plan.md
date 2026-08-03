@@ -17,7 +17,7 @@
 
 ## 2. 当前阶段与执行门禁
 
-- **当前阶段：Phase 6 最小验证；通过后进入 Phase 7 集群执行。**
+- **当前阶段：Phase 7 正式集群执行；刷新后的 8 卡 preflight 已通过。**
 - **状态：用户已于 2026-08-04 确认按本计划继续执行。**
 - 开发和最小验证通过后可直接提交 GPU 任务。
 - 后续每次改变方法定义、数据单位、初始化、loss、解码公式或主指标，都必须先更新本计划并向用户说明；不得在执行中静默改变。
@@ -114,9 +114,9 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 
 - [x] 固化三组 `method_setting` 的 fail-closed 参数契约。
 - [x] 校验 LETTER manifest、Semantic ID logical hash、LightGCN provenance。
-- [ ] 记录 train/dev/test、catalog、base decoder、teacher checkpoint 的路径和 SHA-256。
+- [x] 记录 train/dev、catalog、base decoder、teacher panel、LETTER 与 T5 资产的路径和 SHA-256。
 - [x] 确认三组使用 single-SID target mode。
-- **Status：in_progress（待 teacher stage 写入 input SHA-256）**
+- **Status：done（`setting_contract.json` 已由 teacher stage 写入并通过启动器复核）**
 
 ### Phase 2：single-SID 多 GT 语义修正
 
@@ -144,7 +144,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] 合并后验证 sequential SID embedding/code/control heads bitwise 等于对应 Mseq。
 - [x] 联合阶段启用 query decoder prefix，同时训练 `Lset + CE` 或 `Lset + Lseq`。
 - [x] 实现 top-N Set candidate domain 和 planning-ahead constrained beam。
-- **Status：implemented，待 8 卡 preflight**
+- **Status：implemented，8 卡 preflight 已通过**
 
 ### Phase 5：8 卡 DDP 与启动器
 
@@ -154,30 +154,35 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] checkpoint、manifest、W&B、最终 JSONL 只由 rank 0 写入。
 - [x] Set ID 构建和评测使用 8 卡无 padding shard。
 - [x] 单一 stage 启动器生成三组目录和不可变 `setting_contract.json`；独立 stage 可并发使用 4–5 个节点。
-- **Status：implemented，待 8 卡 preflight**
+- **Status：implemented，8 卡 preflight 已通过**
 
 ### Phase 6：最小正确性验证
 
 只做会显著影响实验正确性或整批任务成功率的检查，不建立大规模测试流程：
 
-- [ ] Python compile 和 shell syntax。
-- [ ] 三组方法契约测试，错误组合必须 fail closed。
-- [ ] LETTER SID hash 与 base/Mseq/Mset/final checkpoint 一致。
-- [ ] single-SID sibling exclusion 与无 `K²` weighting 的小样本 invariant。
-- [ ] PAG merge 后 sequential heads bitwise invariant。
-- [ ] PAG planning prior 不随 token 重复累加的 beam invariant。
-- [ ] DDP global loss 与单进程 global batch loss 的数值/梯度等价小样本检查。
-- [ ] 8 卡 1–2 step preflight，确认 NCCL、显存、checkpoint 写入和数据路径；通过后直接进入正式训练。
-- **Status：pending**
+- [x] Python compile 和 shell syntax。
+- [x] 三组方法契约测试，错误组合必须 fail closed。
+- [x] LETTER SID hash 与 base/Mseq/Mset/final checkpoint 一致。
+- [x] single-SID sibling exclusion 与无 `K²` weighting 的小样本 invariant。
+- [x] PAG merge 后 sequential heads bitwise invariant。
+- [x] PAG planning prior 不随 token 重复累加的 beam invariant。
+- [x] DDP global loss 与单进程 global batch loss 的数值/梯度等价小样本检查。
+- [x] 8 卡 1–2 step preflight，确认 NCCL、显存、checkpoint 写入、raw dev schema 和数据路径。
+- **Status：done（`tide-chenyufei03-10238-lsltr` Succeeded；56 tests、8-rank DDP、所有训练/解码 smoke 通过）**
 
 ### Phase 7：正式训练、评测和归因报告
 
-- [ ] 在 rudder-r2 按依赖关系申请最多 4–5 个节点；每个节点均使用完整 8×A800。
+- [x] 在 rudder-r2 按依赖关系申请节点；每个节点均使用完整 8×A800。
 - [ ] teacher 完成后并行运行 PAG Msp/Mset 路径与 RIPOR Mseq；共享 checkpoint 完成后并行运行三组 final training；评测按 baseline/ripor/pag/ripor_pag 拆到最多 4 个 8 卡节点。
 - [ ] 持续监控 pod、日志、checkpoint 和异常退出。
 - [ ] 输出三组统一指标表和相对 `B` 的差值。
 - [ ] 输出 RIPOR、PAG 的边际贡献与交互项，不用单个 overall 指标替代 subset 分析。
-- **Status：pending**
+- **Status：in_progress（共享 PAG 与 RIPOR Mseq 已并行提交）**
+
+当前活动任务：
+
+- PAG `Msp → Mset`：`tide-chenyufei03-10239-gwkec`。
+- RIPOR `Mseq`：`tide-chenyufei03-10240-hrdvg`。
 
 ## 8. 训练协议
 
@@ -252,6 +257,6 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 | 错误/风险 | 状态 | 处理规则 |
 |---|---|---|
 | 曾尝试递归扫描整个 CFS 寻找 T5 config，扫描过慢并被中止 | 已停止 | 后续只检查明确的资产路径，不再做宽泛递归 CFS 扫描 |
-| 当前已有部分未提交实现早于本计划产生 | 待审查 | 恢复开发时逐项按本计划审计；不符合的代码修改或移除 |
+| 当前已有部分未提交实现早于本计划产生 | 已审查 | 已逐项按本计划收敛，并通过独立计划审查、focused invariants 与 8 卡 preflight |
 | single-SID 展开后若每行把全部 GT 再作为 positive，会造成 `K²` 权重 | 已修正并有 invariant test | 当前 target 是唯一 positive，全部 sibling 只做 negative exclusion |
 | 联合组若直接从 CE base 开始会遗漏 RIPOR Mseq 阶段 | 已修正并 fail closed | `ripor_pag` 强制使用与 `ripor` 共享的 RIPOR Mseq |
