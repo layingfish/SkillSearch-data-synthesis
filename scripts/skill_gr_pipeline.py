@@ -49,6 +49,7 @@ SKILLROUTER_QUERY_MAX_CHARS = 1500
 DEFAULT_GR_MAX_SOURCE_LENGTH = 2048
 DEFAULT_GR_MAX_SKILLS = 4
 DEFAULT_GR_NUM_BEAMS = 50
+DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH = 64
 GR_SOURCE_TEXT_POLICY = "skillrouter_query_1500_chars_with_instruction_v1"
 SEMANTIC_ID_MODE_DEDUP = "rq_codes_with_dedup"
 SEMANTIC_ID_MODE_LEARNED = "learned_codes"
@@ -1269,6 +1270,13 @@ def ripor_prefix_alphas(depth: int, beta: float = DEFAULT_RIPOR_ALPHA_BETA) -> l
         raise ValueError(f"RIPOR alpha beta must be in (0, 1), got {beta}")
     normalizer = 1.0 - beta**depth
     return [(1.0 - beta**length) / normalizer for length in range(1, depth + 1)]
+
+
+def truncate_pag_query_prefix(input_ids, attention_mask, max_length: int):
+    """Use PAG's official 64-token query budget on the decoder branch only."""
+    if max_length <= 0:
+        raise ValueError(f"PAG decoder query-prefix length must be positive, got {max_length}")
+    return input_ids[:, :max_length], attention_mask[:, :max_length]
 
 
 def build_pag_set_token_ids(
@@ -4061,6 +4069,7 @@ def make_structured_t5_sid_model(
             ripor_alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
             ripor_prefix_max_length: int | None = None,
             pag_query_prefix: bool = False,
+            pag_query_prefix_max_length: int = DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
             sequential_ce_weight: float = 1.0,
             pag_set_targets=None,
             pag_set_candidate_token_ids=None,
@@ -4074,13 +4083,20 @@ def make_structured_t5_sid_model(
             return_components: bool = False,
         ):
             encoder_hidden_states = self.encode_source(input_ids, attention_mask)
+            pag_prefix_ids = pag_prefix_mask = None
+            if pag_query_prefix:
+                pag_prefix_ids, pag_prefix_mask = truncate_pag_query_prefix(
+                    input_ids,
+                    attention_mask,
+                    pag_query_prefix_max_length,
+                )
             hidden = self._decoder_hidden_from_encoder(
                 encoder_hidden_states,
                 attention_mask,
                 decoder_input_ids,
                 decoder_attention_mask,
-                decoder_prefix_input_ids=input_ids if pag_query_prefix else None,
-                decoder_prefix_attention_mask=attention_mask if pag_query_prefix else None,
+                decoder_prefix_input_ids=pag_prefix_ids,
+                decoder_prefix_attention_mask=pag_prefix_mask,
             )
             loss_sum = hidden.new_tensor(0.0)
             token_count = hidden.new_tensor(0.0)
@@ -4129,8 +4145,8 @@ def make_structured_t5_sid_model(
                     temperature=ripor_temperature,
                     alpha_beta=ripor_alpha_beta,
                     prefix_max_length=ripor_prefix_max_length,
-                    decoder_prefix_input_ids=input_ids if pag_query_prefix else None,
-                    decoder_prefix_attention_mask=attention_mask if pag_query_prefix else None,
+                    decoder_prefix_input_ids=pag_prefix_ids,
+                    decoder_prefix_attention_mask=pag_prefix_mask,
                 )
                 ripor_loss = self._normalize_loss(
                     ripor_loss_sum,
@@ -4153,7 +4169,8 @@ def make_structured_t5_sid_model(
                     set_logits = self.pag_set_logits_from_encoder(
                         encoder_hidden_states,
                         attention_mask,
-                        source_input_ids=input_ids,
+                        source_input_ids=pag_prefix_ids,
+                        source_attention_mask=pag_prefix_mask,
                     )
                     token_ids = pag_set_candidate_token_ids.clamp_min(0).clamp_max(set_logits.shape[-1] - 1)
                     token_scores = torch.gather(
@@ -4199,7 +4216,8 @@ def make_structured_t5_sid_model(
                     set_logits = self.pag_set_logits_from_encoder(
                         encoder_hidden_states,
                         attention_mask,
-                        source_input_ids=input_ids,
+                        source_input_ids=pag_prefix_ids,
+                        source_attention_mask=pag_prefix_mask,
                     )
                     if set_logits.shape != pag_set_targets.shape:
                         raise ValueError(
@@ -4292,6 +4310,7 @@ def make_structured_t5_sid_model(
             encoder_hidden_states,
             encoder_attention_mask,
             source_input_ids=None,
+            source_attention_mask=None,
         ):
             if source_input_ids is None:
                 decoder_start = self.backbone.config.decoder_start_token_id
@@ -4305,7 +4324,11 @@ def make_structured_t5_sid_model(
                 decoder_attention_mask = torch.ones_like(decoder_input_ids)
             else:
                 decoder_input_ids = source_input_ids
-                decoder_attention_mask = encoder_attention_mask
+                decoder_attention_mask = (
+                    source_attention_mask
+                    if source_attention_mask is not None
+                    else torch.ones_like(source_input_ids)
+                )
             decoder_outputs = self.backbone.decoder(
                 input_ids=decoder_input_ids,
                 # The official T5-SPLADE collator supplies the query token
@@ -4324,7 +4347,7 @@ def make_structured_t5_sid_model(
             lexical_logits = self.backbone.lm_head(decoder_hidden)
             lexical_rep = torch.log1p(torch.relu(lexical_logits))
             if lexical_rep.shape[1] > 1:
-                lexical_rep = lexical_rep * encoder_attention_mask.unsqueeze(-1).to(dtype=lexical_rep.dtype)
+                lexical_rep = lexical_rep * decoder_attention_mask.unsqueeze(-1).to(dtype=lexical_rep.dtype)
                 lexical_rep = lexical_rep.max(dim=1).values
             else:
                 lexical_rep = lexical_rep[:, 0, :]
@@ -4446,6 +4469,7 @@ def _distributed_structured_eval_loss(
     semantic_id_mode: str,
     context: DistributedContext,
     pag_query_prefix: bool = False,
+    pag_query_prefix_max_length: int = DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
 ) -> float:
     """Evaluate CE as a true global token mean without padded examples."""
     import torch
@@ -4471,6 +4495,7 @@ def _distributed_structured_eval_loss(
             components = core_model(
                 **batch,
                 pag_query_prefix=pag_query_prefix,
+                pag_query_prefix_max_length=pag_query_prefix_max_length,
                 global_loss_normalization=False,
                 return_components=True,
             )
@@ -4616,6 +4641,9 @@ def _run_distributed_structured_training(
                     pag_set_vocab_size=pag_set_vocab_size,
                 )
                 batch["pag_query_prefix"] = bool(pag_set_token_ids and stage_name != "catalog")
+                batch["pag_query_prefix_max_length"] = int(
+                    getattr(args, "pag_query_prefix_max_length", DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH)
+                )
                 batch["sequential_ce_weight"] = float(getattr(args, "sequential_ce_weight", 1.0))
                 if use_ripor:
                     batch.update(
@@ -4722,6 +4750,9 @@ def _run_distributed_structured_training(
                         semantic_id_mode,
                         context,
                         pag_query_prefix=bool(pag_set_token_ids and stage_name != "catalog"),
+                        pag_query_prefix_max_length=int(
+                            getattr(args, "pag_query_prefix_max_length", DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH)
+                        ),
                     )
                     if context.is_main:
                         print(f"{stage_name}_step={display_step} dev_loss={dev_loss:.6f}", flush=True)
@@ -5701,6 +5732,9 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
         "sequential_ce_weight": float(args.sequential_ce_weight),
         "pag_sparse_initialization": bool(init_info["pag_sparse_initialization"]),
         "merge_policy": "average_t5_backbone_keep_mseq_semantic_heads",
+        "query_prefix_max_length": (
+            int(args.pag_query_prefix_max_length) if pag_set_token_ids else None
+        ),
     }
     checkpoint_metadata["stage_role"] = stage_role
     checkpoint_metadata["ripor"] = {
@@ -6144,6 +6178,10 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     pag_set_token_ids, pag_set_vocab_size = load_pag_set_token_ids(getattr(args, "pag_set_ids", None))
     checkpoint_pag_vocab_size = int(checkpoint.get("pag_set_vocab_size", 0) or 0)
     pag_method_checkpoint = checkpoint_method_setting in (METHOD_SETTING_PAG, METHOD_SETTING_RIPOR_PAG)
+    checkpoint_pag = checkpoint.get("pag") or {}
+    pag_query_prefix_max_length = int(checkpoint_pag.get("query_prefix_max_length") or 0)
+    if pag_method_checkpoint and pag_query_prefix_max_length <= 0:
+        raise ValueError("PAG checkpoint is missing a positive decoder query-prefix length")
     pag_weight_zero_diagnostic = bool(getattr(args, "allow_pag_weight_zero_diagnostic", False))
     if pag_weight_zero_diagnostic and not pag_method_checkpoint:
         raise ValueError("--allow-pag-weight-zero-diagnostic is valid only for PAG method checkpoints")
@@ -6247,13 +6285,21 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         )
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded["attention_mask"].to(device)
+        pag_prefix_ids = pag_prefix_mask = None
+        if pag_method_checkpoint:
+            pag_prefix_ids, pag_prefix_mask = truncate_pag_query_prefix(
+                input_ids,
+                attention_mask,
+                pag_query_prefix_max_length,
+            )
         with torch.no_grad():
             encoder_hidden_states = model.encode_source(input_ids, attention_mask)
             if pag_set_weight != 0.0 or args.pag_set_top_n > 0:
                 set_logits = model.pag_set_logits_from_encoder(
                     encoder_hidden_states,
                     attention_mask,
-                    source_input_ids=input_ids,
+                    source_input_ids=pag_prefix_ids,
+                    source_attention_mask=pag_prefix_mask,
                 )[0]
                 for sid, token_ids in pag_set_token_ids.items():
                     valid_token_ids = [token_id for token_id in token_ids if token_id < set_logits.numel()]
@@ -6331,8 +6377,12 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     decoder_input_ids,
                     decoder_attention_mask,
                     target_type,
-                    decoder_prefix_input_ids=input_ids if pag_method_checkpoint else None,
-                    decoder_prefix_attention_mask=attention_mask if pag_method_checkpoint else None,
+                    decoder_prefix_input_ids=(
+                        pag_prefix_ids.repeat(batch_size, 1) if pag_prefix_ids is not None else None
+                    ),
+                    decoder_prefix_attention_mask=(
+                        pag_prefix_mask.repeat(batch_size, 1) if pag_prefix_mask is not None else None
+                    ),
                 )
                 # RIPOR's constrained decoder ranks with the raw conditional
                 # code logits, matching ``ripor_prefix_scores`` and the paper's
@@ -6749,6 +6799,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pag-set-loss-weight", type=float, default=0.0)
     p.add_argument("--pag-set-sparsity-weight", type=float, default=0.0)
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
+    p.add_argument(
+        "--pag-query-prefix-max-length",
+        type=int,
+        default=DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
+        help="PAG query tokens fed to the decoder; official PAG training uses max_length=64",
+    )
     p.add_argument("--allow-source-truncation", action="store_true")
     p.add_argument("--allow-checkpoint-config-mismatch", action="store_true")
     p.add_argument("--batch-size", type=int, default=8)

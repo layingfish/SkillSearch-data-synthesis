@@ -71,6 +71,10 @@
 - 第三个 preflight `tide-chenyufei03-10235-xfeut` 通过 checkpoint 严格加载后，在 RIPOR progressive
   prefix loss 发现 active prefix=2 与 divergence mask depth=4 的轴不一致。现将 divergence mask
   投影到同一 active-prefix 轴，并用 depth=4/active=2 的精确 loss 与 pair-count 单测锁定语义。
+- 第四个 preflight `tide-chenyufei03-10236-kjmnb` 已通过 Msp、Mset、RIPOR Mseq、RIPOR-only 和
+  PAG-only；RIPOR+PAG 因将最长 2048 的完整 encoder source 为每个 candidate 重复到 decoder prefix
+  而 OOM。PAG 官方 unified 脚本固定 `max_length=64`，因此现在只把 PAG decoder query prefix 限为
+  64 token，encoder 仍完整保留 2048；训练、推理、setting contract 和 checkpoint provenance 同步。
 
 ## 错误与处理
 

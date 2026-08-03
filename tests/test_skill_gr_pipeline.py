@@ -20,6 +20,7 @@ from skill_gr_pipeline import (  # noqa: E402
     DEFAULT_GR_MAX_SKILLS,
     DEFAULT_GR_MAX_SOURCE_LENGTH,
     DEFAULT_GR_NUM_BEAMS,
+    DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
     METHOD_SETTING_PAG,
     METHOD_SETTING_RIPOR,
     METHOD_SETTING_RIPOR_PAG,
@@ -70,6 +71,7 @@ from skill_gr_pipeline import (  # noqa: E402
     stratified_split_rows,
     structured_allowed_values,
     summarize_source_token_lengths,
+    truncate_pag_query_prefix,
     validate_checkpoint_semantic_ids,
     validate_letter_tokenizer_manifest,
     validate_method_setting_contract,
@@ -916,6 +918,23 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertTrue(all(left < right for left, right in zip(values, values[1:])))
         increments = [right - left for left, right in zip(values, values[1:])]
         self.assertTrue(all(left >= right for left, right in zip(increments, increments[1:])))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_pag_decoder_query_prefix_uses_official_length_without_truncating_encoder(self) -> None:
+        import torch
+
+        input_ids = torch.arange(160).reshape(2, 80)
+        attention_mask = torch.ones_like(input_ids)
+        prefix_ids, prefix_mask = truncate_pag_query_prefix(
+            input_ids,
+            attention_mask,
+            DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
+        )
+
+        self.assertEqual(tuple(prefix_ids.shape), (2, 64))
+        self.assertEqual(tuple(prefix_mask.shape), (2, 64))
+        self.assertTrue(torch.equal(prefix_ids, input_ids[:, :64]))
+        self.assertEqual(tuple(input_ids.shape), (2, 80))
 
     def test_native_semantic_id_text_uses_base_vocab_words_and_digits(self) -> None:
         self.assertEqual(

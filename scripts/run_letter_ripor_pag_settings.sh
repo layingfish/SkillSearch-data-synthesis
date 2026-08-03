@@ -28,6 +28,7 @@ required_vars=(
   SKILLGR_MODEL SKILLGR_OUTPUT_ROOT SKILLGR_MSP_STEPS SKILLGR_MSET_STEPS
   SKILLGR_RIPOR_STAGE_STEPS SKILLGR_FINAL_STAGE_STEPS
   SKILLGR_PAG_SPARSE_MAX_LENGTH
+  SKILLGR_PAG_QUERY_PREFIX_MAX_LENGTH
 )
 for variable_name in "${required_vars[@]}"; do
   if [[ -z "${!variable_name:-}" ]]; then
@@ -70,6 +71,7 @@ MODEL="${SKILLGR_MODEL}"
 PER_DEVICE_BATCH="${SKILLGR_PER_DEVICE_BATCH:-8}"
 MAX_SOURCE_LENGTH="${SKILLGR_MAX_SOURCE_LENGTH:-2048}"
 PAG_SPARSE_MAX_LENGTH="${SKILLGR_PAG_SPARSE_MAX_LENGTH:-128}"
+PAG_QUERY_PREFIX_MAX_LENGTH="${SKILLGR_PAG_QUERY_PREFIX_MAX_LENGTH:-64}"
 SEED="${SKILLGR_SEED:-20260626}"
 LR="${SKILLGR_LR:-0.0005}"
 WEIGHT_DECAY="${SKILLGR_WEIGHT_DECAY:-0.0}"
@@ -161,6 +163,7 @@ expected_scalars = {
     "warmup_ratio": float(os.environ["SKILLGR_WARMUP_RATIO"]),
     "max_source_length": int(os.environ["SKILLGR_MAX_SOURCE_LENGTH"]),
     "pag_sparse_max_length": int(os.environ["SKILLGR_PAG_SPARSE_MAX_LENGTH"]),
+    "pag_query_prefix_max_length": int(os.environ["SKILLGR_PAG_QUERY_PREFIX_MAX_LENGTH"]),
     "teacher_query_max_chars": int(os.environ["SKILLGR_TEACHER_QUERY_MAX_CHARS"]),
     "teacher_desc_max": int(os.environ["SKILLGR_TEACHER_DESC_MAX"]),
     "teacher_body_max": int(os.environ["SKILLGR_TEACHER_BODY_MAX"]),
@@ -242,6 +245,7 @@ payload = {
     "warmup_ratio": float(os.environ["SKILLGR_WARMUP_RATIO"]),
     "max_source_length": int(os.environ["SKILLGR_MAX_SOURCE_LENGTH"]),
     "pag_sparse_max_length": int(os.environ["SKILLGR_PAG_SPARSE_MAX_LENGTH"]),
+    "pag_query_prefix_max_length": int(os.environ["SKILLGR_PAG_QUERY_PREFIX_MAX_LENGTH"]),
     "teacher_query_max_chars": int(os.environ["SKILLGR_TEACHER_QUERY_MAX_CHARS"]),
     "teacher_desc_max": int(os.environ["SKILLGR_TEACHER_DESC_MAX"]),
     "teacher_body_max": int(os.environ["SKILLGR_TEACHER_BODY_MAX"]),
@@ -304,6 +308,7 @@ train_mset() {
     --output-dir "${output}" \
     --model "${MODEL}" \
     --max-source-length "${MAX_SOURCE_LENGTH}" \
+    --pag-query-prefix-max-length "${PAG_QUERY_PREFIX_MAX_LENGTH}" \
     --batch-size "${PER_DEVICE_BATCH}" \
     --lr "${LR}" \
     --weight-decay "${WEIGHT_DECAY}" \
@@ -379,6 +384,7 @@ train_pag_joint() {
     --output-dir "${output}" \
     --model "${MODEL}" \
     --max-source-length "${MAX_SOURCE_LENGTH}" \
+    --pag-query-prefix-max-length "${PAG_QUERY_PREFIX_MAX_LENGTH}" \
     --batch-size "${PER_DEVICE_BATCH}" \
     --lr "${LR}" \
     --weight-decay "${WEIGHT_DECAY}" \

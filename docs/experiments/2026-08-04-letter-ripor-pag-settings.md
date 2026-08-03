@@ -31,7 +31,8 @@ The launcher sources `configs/letter_ripor_pag_20260804.env`. The execution DAG 
 stages are submitted as one-node 8-GPU jobs. The teacher stage writes `setting_contract.json` with
 input SHA-256 hashes before method training.
 
-Locked protocol: Msp 4700 steps with the official PAG sparse-encoder `max_length=128`, Mset 5000,
+Locked protocol: Msp 4700 steps with the official PAG sparse-encoder `max_length=128`, PAG decoder
+query-prefix `max_length=64`, Mset 5000,
 shared RIPOR Mseq 5000, each final stage 5000; per-device
 batch 8 (global 64), AdamW with zero weight decay, LR 5e-4, 4.5% linear warmup followed by linear
 decay, BF16, seed 20260626, PAG m=64/top-N=1000/weight=1, and beam=50.
@@ -90,3 +91,11 @@ progressive-prefix tensor-axis bug: loss values were truncated to the active pre
 positive/negative divergence mask retained the full SID depth. The mask is now sliced to the identical
 prefix axis, so a pair contributes exactly for active prefixes at or after its first differing code; a
 numeric unit test fixes the expected pair count and loss for a depth-4/active-depth-2 example.
+
+Preflight `tide-chenyufei03-10236-kjmnb` passed Msp, Mset, RIPOR Mseq, RIPOR-only continuation, and
+PAG-only joint training. RIPOR+PAG then OOMed because the implementation repeated the full (up to 2048)
+encoder source as a decoder query prefix for every ranking candidate. The official PAG unified-training
+script uses `max_length=64`. The locked implementation now keeps the existing 2048-token encoder input
+unchanged but limits only PAG's decoder query prefix to the first 64 tokens in Mset, joint training, and
+inference. Inference also repeats this bounded prefix to the active beam batch explicitly. The limit is
+stored in the setting contract and checkpoint provenance and is verified by a focused tensor test.

@@ -58,6 +58,7 @@
 
 - `Msp`：T5-SPLADE lexical representation，MarginMSE + FLOPS regularization。
 - `Msp` 输入长度固定为原始 PAG 官方训练脚本的 `max_length=128`；GR decoder 的 `max_source_length=2048` 只用于 Mset/RIPOR/joint，不与稀疏编码器混用。
+- PAG Mset/joint 的 decoder query prefix 固定为官方 unified-training 脚本的 `max_length=64`；encoder 仍读取既有 `max_source_length=2048`，不削弱原 GR 语义输入。
 - 从每个 skill document 的 `Msp` 表示选择固定 `m` 个 lexical Set ID。
 - `Mset`：在固定 Set ID 上训练 simultaneous document score。
 - `Mseq`：single-SID sequential decoder。
