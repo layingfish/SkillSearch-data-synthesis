@@ -466,6 +466,51 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(model.sid_embedding.num_embeddings, 1027)
         self.assertFalse(any(name.startswith("dedup_head") for name in model.state_dict()))
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_ripor_progressive_prefix_slices_divergence_mask_and_count(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        prefix_scores = torch.tensor([[[1.0, 4.0, 5.0, 6.0], [1.0, 2.0, 3.0, 4.0]]])
+        model.ripor_prefix_log_scores = lambda *_args, **_kwargs: prefix_scores
+        candidate_codes = torch.tensor([[[1, 2, 3, 4], [1, 9, 3, 4]]])
+        loss_sum, pair_count, used_scores = model.ripor_prefix_rank_loss(
+            torch.zeros(1, 1, 8),
+            torch.ones(1, 1, dtype=torch.long),
+            candidate_codes,
+            torch.tensor([[True, True]]),
+            torch.tensor([[True, False]]),
+            margin=1.0,
+            temperature=1.0,
+            candidate_teacher_scores=torch.tensor([[3.0, 1.0]]),
+            prefix_max_length=2,
+        )
+
+        alpha_at_two = ripor_prefix_alphas(4)[1]
+        self.assertEqual(tuple(used_scores.shape), (1, 2, 2))
+        self.assertEqual(float(pair_count), 1.0)
+        self.assertAlmostEqual(float(loss_sum), (2.0 - 2.0 * alpha_at_two) ** 2, places=6)
+
     def test_advance_structured_beam_appends_codes_and_control_tokens(self) -> None:
         beam = {
             "decoder_input_ids": [772, 1, 259, 517],

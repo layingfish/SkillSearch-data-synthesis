@@ -4020,6 +4020,11 @@ def make_structured_t5_sid_model(
                 positive_codes = candidate_codes[row_index, positive]
                 negative_codes = candidate_codes[row_index, negative]
                 diverged = (positive_codes[:, None, :] != negative_codes[None, :, :]).cumsum(dim=-1) > 0
+                # Progressive RIPOR may optimize only the first N prefixes.
+                # Project the divergence mask onto that same prefix axis: a
+                # positive/negative pair contributes only after its first
+                # differing code and only for prefixes trained in this step.
+                diverged = diverged[..., : prefix_scores.shape[-1]]
                 teacher_positive_scores = candidate_teacher_scores[row_index, positive]
                 teacher_negative_scores = candidate_teacher_scores[row_index, negative]
                 teacher_margin = teacher_positive_scores[:, None] - teacher_negative_scores[None, :]
@@ -4028,6 +4033,11 @@ def make_structured_t5_sid_model(
                     student_margin
                     - teacher_margin[:, :, None] * alpha.view(1, 1, -1)
                 ).square()
+                if pair_losses.shape != diverged.shape:
+                    raise RuntimeError(
+                        "RIPOR prefix loss/mask shape mismatch: "
+                        f"loss={tuple(pair_losses.shape)}, mask={tuple(diverged.shape)}"
+                    )
                 loss_sum = loss_sum + (pair_losses * diverged).sum()
                 pair_count = pair_count + diverged.sum()
             return loss_sum, pair_count, prefix_scores

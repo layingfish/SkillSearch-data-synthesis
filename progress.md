@@ -68,6 +68,9 @@
 - 第二个 preflight `tide-chenyufei03-10234-qtunc` 已通过 Msp 与 Mset，随后在加载原 CE+LETTER
   checkpoint 时发现 4 个 `code_heads.*.bias` 与当前 bias-free 构造不兼容。固定 LETTER 要求完整保留
   基线参数，因此恢复 position heads 的 bias 并继续严格加载；RIPOR 只调整 prefix ranking objective。
+- 第三个 preflight `tide-chenyufei03-10235-xfeut` 通过 checkpoint 严格加载后，在 RIPOR progressive
+  prefix loss 发现 active prefix=2 与 divergence mask depth=4 的轴不一致。现将 divergence mask
+  投影到同一 active-prefix 轴，并用 depth=4/active=2 的精确 loss 与 pair-count 单测锁定语义。
 
 ## 错误与处理
 

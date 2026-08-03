@@ -84,3 +84,9 @@ code heads from the established biased LETTER parameterization to bias-free head
 requires fixed LETTER initialization, so the model now retains and strictly loads the baseline head
 biases; RIPOR modifies the prefix-ranking objective only. A focused model invariant asserts all four
 LETTER code-head biases exist.
+
+Preflight retry `tide-chenyufei03-10235-xfeut` passed strict checkpoint loading, then exposed a RIPOR
+progressive-prefix tensor-axis bug: loss values were truncated to the active prefix count while the
+positive/negative divergence mask retained the full SID depth. The mask is now sliced to the identical
+prefix axis, so a pair contributes exactly for active prefixes at or after its first differing code; a
+numeric unit test fixes the expected pair count and loss for a depth-4/active-depth-2 example.
