@@ -65,6 +65,9 @@
   真实 PAG Msp 烟测因错误复用 GR `max_source_length=2048` 而 OOM。已按 PAG 官方
   `t5_splade_train.sh` 将 Msp 独立固定为 `max_length=128`，并同步锁定配置和 setting contract；
   Mset/RIPOR/joint 仍保持 2048。
+- 第二个 preflight `tide-chenyufei03-10234-qtunc` 已通过 Msp 与 Mset，随后在加载原 CE+LETTER
+  checkpoint 时发现 4 个 `code_heads.*.bias` 与当前 bias-free 构造不兼容。固定 LETTER 要求完整保留
+  基线参数，因此恢复 position heads 的 bias 并继续严格加载；RIPOR 只调整 prefix ranking objective。
 
 ## 错误与处理
 

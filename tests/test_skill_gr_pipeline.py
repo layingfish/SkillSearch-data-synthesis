@@ -460,6 +460,7 @@ class SkillGRPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual(len(model.code_heads), 4)
+        self.assertTrue(all(head.bias is not None for head in model.code_heads))
         self.assertIsNone(model.dedup_head)
         self.assertEqual(model.control_type, 4)
         self.assertEqual(model.sid_embedding.num_embeddings, 1027)

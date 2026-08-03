@@ -3769,10 +3769,11 @@ def make_structured_t5_sid_model(
                 structured_sid_vocab_size(self.codebook_size, self.depth, self.dedup_size),
                 d_model,
             )
-            # RIPOR's position-specific output tables are dot products with RQ
-            # centroids; they do not carry a per-token bias term.
+            # Keep the established fixed-LETTER decoder parameterization.  Its
+            # position-specific heads include learned biases, and RIPOR changes
+            # the ranking objective rather than replacing those heads.
             self.code_heads = nn.ModuleList(
-                nn.Linear(d_model, self.codebook_size, bias=False) for _ in range(self.depth)
+                nn.Linear(d_model, self.codebook_size, bias=True) for _ in range(self.depth)
             )
             self.dedup_head = (
                 nn.Linear(d_model, self.dedup_size)

@@ -77,3 +77,10 @@ failed in real-model PAG Msp with CUDA OOM. Root cause: the launcher incorrectly
 `max_source_length=2048` for T5-SPLADE. The official PAG `t5_splade_train.sh` fixes sparse-encoder
 `max_length=128`; the locked config, setting contract, and launcher now use 128 for Msp while retaining
 2048 for Mset/RIPOR/joint stages. A fresh preflight is required before formal training.
+
+Preflight retry `tide-chenyufei03-10234-qtunc` passed Msp and Mset, then failed while loading the
+existing CE+LETTER base into RIPOR because commit `605da31` had changed the four position-specific
+code heads from the established biased LETTER parameterization to bias-free heads. The experiment
+requires fixed LETTER initialization, so the model now retains and strictly loads the baseline head
+biases; RIPOR modifies the prefix-ranking objective only. A focused model invariant asserts all four
+LETTER code-head biases exist.
