@@ -98,6 +98,10 @@
 - canonical RIPOR Mseq `tide-chenyufei03-10241-trolo` 已成功完成 5000 steps，末步 loss=0.042466，
   共享 checkpoint 已写出；RIPOR-only 对齐更新量的第二段 5000-step final 已提交为
   `tide-chenyufei03-10245-pcgrm`。
+- 语义自检发现 structured trainer 每次调用默认重启 progressive prefix curriculum。shared Mseq
+  应使用该 curriculum，但从完整 Mseq 初始化的 RIPOR-only / RIPOR+PAG final 应始终监督全部 prefix。
+  启动器现已显式区分 `progressive` 与 `full`，checkpoint provenance 同步记录；正在运行的
+  `tide-chenyufei03-10245-pcgrm` 标记为 audit-only，完成后隔离并重跑，不进入结果。
 
 ## 错误与处理
 

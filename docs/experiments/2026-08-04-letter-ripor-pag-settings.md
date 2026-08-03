@@ -136,3 +136,10 @@ PAG shared path was resubmitted from Msp as `tide-chenyufei03-10242-tmick` under
 Canonical RIPOR Mseq job `tide-chenyufei03-10241-trolo` succeeded after 5,000 steps with final logged
 loss 0.042466 and wrote the shared checkpoint at `ripor_mseq/final/structured_decoder.pt`. The matched
 second 5,000-step RIPOR-only final continuation was submitted as `tide-chenyufei03-10245-pcgrm`.
+
+A semantic self-review then found that the structured trainer defaults to restarting progressive prefix
+expansion on every invocation. That is correct for the shared Mseq stage, but not for either final stage:
+both already initialize from a full-depth Mseq and must train the full multi-prefix objective throughout.
+The launcher now makes the schedule explicit (`progressive` for shared Mseq, `full` for RIPOR-only and
+RIPOR+PAG final), and checkpoints record it. The currently running `tide-chenyufei03-10245-pcgrm` is
+therefore an audit-only invalid run; its output will be quarantined and the final stage rerun.

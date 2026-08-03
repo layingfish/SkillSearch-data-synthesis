@@ -141,6 +141,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] 使用 position-specific code heads 计算 raw conditional logits。
 - [x] 实现 prefix cumulative score、prefix divergence mask、`alpha_i` 和 MarginMSE。
 - [x] teacher score、hard negative、prefix objective 写入 checkpoint provenance。
+- shared RIPOR Mseq 的 5000 steps 使用 progressive prefix expansion；后续 `ripor` continuation 与
+  `ripor_pag` joint 已经从完整 Mseq 初始化，必须固定监督全部 prefix，禁止重新启动 curriculum。
 - [x] 生成可供 `ripor` 和 `ripor_pag` 共享的 RIPOR Mseq checkpoint。
 - **Status：done（`tide-chenyufei03-10241-trolo` Succeeded）**
 
@@ -271,3 +273,4 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 | single-SID 展开后若每行把全部 GT 再作为 positive，会造成 `K²` 权重 | 已修正并有 invariant test | 当前 target 是唯一 positive，全部 sibling 只做 negative exclusion |
 | 联合组若直接从 CE base 开始会遗漏 RIPOR Mseq 阶段 | 已修正并 fail closed | `ripor_pag` 强制使用与 `ripor` 共享的 RIPOR Mseq |
 | 首次正式启动误用了 alias 归一化前的 raw dev，含 80 个不在固定 LETTER pool 的 GT mentions | 已定位，正式结果无效 | 改回既有 canonical dev/private-test，并把 Official core75 单列为主评测；重新生成 SHA-bound contract 后重启共享阶段 |
+| final 阶段若沿用 parser 默认值会从短 prefix 重新启动 curriculum | 已定位 | shared Mseq 保留 progressive schedule；`ripor` continuation 和 `ripor_pag` joint 显式 `--no-ripor-progressive-prefix`，监督完整四层；旧 final 产物禁止用于结果 |

@@ -5763,6 +5763,9 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
             else "official_prefix_margin_mse_raw_conditional_logits"
         ),
         "strict_teacher_scores": not args.ripor_allow_weak_teacher,
+        "progressive_schedule": "linear_prefix_expansion_with_multi_objective_retention"
+        if args.ripor_progressive_prefix
+        else "disabled_full_prefix_supervision",
         "relevance_m0_checkpoint": str(args.ripor_relevance_checkpoint) if args.ripor_relevance_checkpoint else None,
         "rq_codebook_embeddings": str(args.ripor_codebook_embeddings) if args.ripor_codebook_embeddings else None,
         "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),

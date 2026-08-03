@@ -328,7 +328,20 @@ train_mset() {
 }
 
 train_ripor_stage() {
-  local rows="$1" dev_rows="$2" init_dir="$3" output="$4" steps="$5" step_offset="$6"
+  local rows="$1" dev_rows="$2" init_dir="$3" output="$4" steps="$5" step_offset="$6" schedule="$7"
+  local prefix_args=()
+  case "${schedule}" in
+    progressive)
+      prefix_args=(--ripor-progressive-prefix)
+      ;;
+    full)
+      prefix_args=(--no-ripor-progressive-prefix)
+      ;;
+    *)
+      echo "invalid RIPOR prefix schedule: ${schedule}" >&2
+      exit 2
+      ;;
+  esac
   ensure_fresh_dir "${output}"
   run_torch scripts/skill_gr_pipeline.py train-structured-decoder \
     --method-setting ripor \
@@ -342,6 +355,7 @@ train_ripor_stage() {
     --reset-optimizer \
     --ripor-hard-negatives "${TEACHER_PANEL}" \
     --ripor-loss-weight 1 \
+    "${prefix_args[@]}" \
     --sequential-ce-weight 0 \
     --catalog-epochs 0 \
     --max-steps "${steps}" \
@@ -385,6 +399,7 @@ train_pag_joint() {
     --reset-optimizer \
     --ripor-hard-negatives "${TEACHER_PANEL}" \
     --ripor-loss-weight "${ripor_weight}" \
+    --no-ripor-progressive-prefix \
     --sequential-ce-weight "${ce_weight}" \
     --catalog-epochs 0 \
     --max-steps "${steps}" \
@@ -475,8 +490,8 @@ PY
   local mseq="${PREFLIGHT_DIR}/ripor_mseq"
   train_msp "${train_rows}" "${msp}" 2
   train_mset "${train_rows}" "${dev_rows}" "${set_ids}" "${msp}" "${mset}" 2
-  train_ripor_stage "${train_rows}" "${dev_rows}" "${SKILLGR_BASE_DECODER}" "${mseq}" 2 0
-  train_ripor_stage "${train_rows}" "${dev_rows}" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_only" 2 2
+  train_ripor_stage "${train_rows}" "${dev_rows}" "${SKILLGR_BASE_DECODER}" "${mseq}" 2 0 progressive
+  train_ripor_stage "${train_rows}" "${dev_rows}" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_only" 2 2 full
   train_pag_joint pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${SKILLGR_BASE_DECODER}" "${PREFLIGHT_DIR}/pag_only" 2
   train_pag_joint ripor_pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_pag" 2
   eval_pag "${dev_rows}" "${PREFLIGHT_DIR}/ripor_pag/final" "${PREFLIGHT_DIR}/eval_ripor_pag" ripor_pag "${set_ids}"
@@ -506,11 +521,11 @@ run_stage() {
     ripor_mseq)
       require_file "${PREFLIGHT_DIR}/PASSED"
       require_file "${TEACHER_PANEL}"
-      train_ripor_stage "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SKILLGR_BASE_DECODER}" "${RIPOR_MSEQ_DIR}" "${SKILLGR_RIPOR_STAGE_STEPS}" 0
+      train_ripor_stage "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SKILLGR_BASE_DECODER}" "${RIPOR_MSEQ_DIR}" "${SKILLGR_RIPOR_STAGE_STEPS}" 0 progressive
       ;;
     final_ripor)
       require_file "${RIPOR_MSEQ_DIR}/final/structured_decoder.pt"
-      train_ripor_stage "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${RIPOR_MSEQ_DIR}/final" "${RIPOR_ONLY_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}" "${SKILLGR_RIPOR_STAGE_STEPS}"
+      train_ripor_stage "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${RIPOR_MSEQ_DIR}/final" "${RIPOR_ONLY_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}" "${SKILLGR_RIPOR_STAGE_STEPS}" full
       ;;
     final_pag)
       require_file "${MSET_DIR}/final/structured_decoder.pt"
