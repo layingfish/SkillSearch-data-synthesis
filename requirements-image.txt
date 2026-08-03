@@ -1,0 +1,9 @@
+# Dependencies used by SkillSearch scripts that are not part of the pinned
+# CUDA/torch base runtime.  Do not add torch or transformers here.
+scipy
+scikit-learn
+k-means-constrained
+vector-quantize-pytorch
+tqdm
+wandb
+tensorboardX

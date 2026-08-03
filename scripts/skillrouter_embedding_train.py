@@ -29,6 +29,7 @@ from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from skill_gr_pipeline import compute_at_k_metrics, load_jsonl, write_json, write_jsonl  # noqa: E402
 from distributed_utils import (
+    all_gather_object,
     all_gather_tensor,
     all_gather_tensor_with_grad,
     barrier,
@@ -928,19 +929,45 @@ def command_train(args: argparse.Namespace) -> None:
 
 
 def command_eval(args: argparse.Namespace) -> None:
+    context = initialize_distributed(cpu=args.cpu)
     rows = load_jsonl(args.rows)
     skills_raw = load_jsonl(args.skills_jsonl)
     skills = [{"skill_id": skill_id(row), "text": skill_text(row, args.desc_max, args.body_max)} for row in skills_raw]
     skills = [row for row in skills if row["skill_id"]]
     k_values = sorted({int(part) for part in args.k_values.split(",") if part.strip()})
     max_rank = max(k_values)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = context.device
     tokenizer, model = load_qwen_encoder(args.model, device, args.bf16, gradient_checkpointing=False)
-    skill_embeddings = encode_texts_eval(
-        [row["text"] for row in skills], tokenizer, model, device, args.max_skill_length, args.batch_size, "skills"
+    local_skill_indices = list(range(context.rank, len(skills), context.world_size))
+    local_skill_embeddings = encode_texts_eval(
+        [skills[index]["text"] for index in local_skill_indices],
+        tokenizer,
+        model,
+        device,
+        args.max_skill_length,
+        args.batch_size,
+        f"skills-rank-{context.rank}",
     )
+    gathered_skill_parts = all_gather_object(
+        (local_skill_indices, local_skill_embeddings.cpu()),
+        context,
+    )
+    embedding_dim = int(gathered_skill_parts[0][1].shape[-1])
+    skill_embeddings = torch.empty(
+        (len(skills), embedding_dim),
+        dtype=gathered_skill_parts[0][1].dtype,
+    )
+    for part_indices, part_embeddings in gathered_skill_parts:
+        skill_embeddings.index_copy_(
+            0,
+            torch.tensor(part_indices, dtype=torch.long),
+            part_embeddings,
+        )
+    skill_embeddings = skill_embeddings.to(device)
+    local_indices = list(range(context.rank, len(rows), context.world_size))
+    local_rows = [rows[index] for index in local_indices]
     query_embeddings = encode_texts_eval(
-        [query_text(row, args.query_max_chars) for row in rows],
+        [query_text(row, args.query_max_chars) for row in local_rows],
         tokenizer,
         model,
         device,
@@ -951,8 +978,17 @@ def command_eval(args: argparse.Namespace) -> None:
     scores = query_embeddings @ skill_embeddings.T
     top_scores, top_indices = torch.topk(scores, k=min(max_rank, len(skills)), dim=1)
     predictions = []
-    for row_index, row in enumerate(rows):
-        ranked = [skills[int(index)]["skill_id"] for index in top_indices[row_index].tolist()]
+    skill_index = {row["skill_id"]: index for index, row in enumerate(skills)}
+    for local_row_index, (row_index, row) in enumerate(zip(local_indices, local_rows)):
+        ranked = [skills[int(index)]["skill_id"] for index in top_indices[local_row_index].tolist()]
+        ranked_scores = [float(score) for score in top_scores[local_row_index].tolist()]
+        ranked_set = set(ranked)
+        for gold_sid in [str(sid) for sid in row.get("selected_skill_ids", [])]:
+            if gold_sid in ranked_set or gold_sid not in skill_index:
+                continue
+            ranked.append(gold_sid)
+            ranked_scores.append(float(scores[local_row_index, skill_index[gold_sid]].item()))
+            ranked_set.add(gold_sid)
         predictions.append(
             {
                 "index": row.get("index"),
@@ -961,34 +997,51 @@ def command_eval(args: argparse.Namespace) -> None:
                 "query": row.get("query"),
                 "gold_skill_ids": [str(sid) for sid in row.get("selected_skill_ids", [])],
                 "ranked_skill_ids": ranked,
-                "ranked_scores": [float(score) for score in top_scores[row_index].tolist()],
+                "ranked_scores": ranked_scores,
+                "_row_position": row_index,
                 "invalid": False,
             }
         )
-    metrics = compute_at_k_metrics(rows, predictions, k_values)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_jsonl(args.output_dir / "predictions.jsonl", predictions)
-    write_json(args.output_dir / "ranked_metrics.json", metrics)
-    write_json(
-        args.output_dir / "eval_manifest.json",
-        {
-            "baseline": "skillrouter_embedding_repro",
-            "model": str(args.model),
-            "rows": str(args.rows),
-            "skills_jsonl": str(args.skills_jsonl),
-            "candidate_skills": len(skills),
-            "split": args.split_name,
-            "k_values": k_values,
-            "pooling": "last_token_pool",
-            "normalize": True,
-            "query_max_chars": args.query_max_chars,
-            "desc_max": args.desc_max,
-            "body_max": args.body_max,
-            "max_query_length": args.max_query_length,
-            "max_skill_length": args.max_skill_length,
-        },
-    )
-    print(json.dumps(metrics["overall"], ensure_ascii=False, sort_keys=True))
+    shard_dir = args.output_dir / ".eval_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(shard_dir / f"rank-{context.rank:04d}.jsonl", predictions)
+    barrier(context)
+    if context.is_main:
+        predictions = []
+        for rank in range(context.world_size):
+            predictions.extend(load_jsonl(shard_dir / f"rank-{rank:04d}.jsonl"))
+        predictions.sort(key=lambda row: int(row["_row_position"]))
+        for prediction in predictions:
+            prediction.pop("_row_position", None)
+        metrics = compute_at_k_metrics(rows, predictions, k_values)
+        write_jsonl(args.output_dir / "predictions.jsonl", predictions)
+        write_json(args.output_dir / "ranked_metrics.json", metrics)
+        write_json(
+            args.output_dir / "eval_manifest.json",
+            {
+                "baseline": "skillrouter_embedding_repro",
+                "model": str(args.model),
+                "rows": str(args.rows),
+                "skills_jsonl": str(args.skills_jsonl),
+                "candidate_skills": len(skills),
+                "split": args.split_name,
+                "k_values": k_values,
+                "pooling": "last_token_pool",
+                "normalize": True,
+                "teacher_panel_gold_scores_included": True,
+                "skill_encoding_distributed": True,
+                "distributed_world_size": context.world_size,
+                "query_max_chars": args.query_max_chars,
+                "desc_max": args.desc_max,
+                "body_max": args.body_max,
+                "max_query_length": args.max_query_length,
+                "max_skill_length": args.max_skill_length,
+            },
+        )
+        print(json.dumps(metrics["overall"], ensure_ascii=False, sort_keys=True))
+    barrier(context)
+    destroy_distributed(context)
 
 
 def build_parser() -> argparse.ArgumentParser:

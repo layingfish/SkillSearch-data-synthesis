@@ -1,0 +1,31 @@
+.git
+.gitignore
+.dockerignore
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local outputs and potentially large/model-sensitive assets are mounted at run
+# time; they are never copied into the development image.
+outputs
+outputs/
+profiles
+profiles/
+raw_responses/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.parquet
+
+# Secrets and local editor configuration.
+.env
+.env.*
+.vscode/
+.idea/

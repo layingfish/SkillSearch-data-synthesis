@@ -20,6 +20,9 @@ from skill_gr_pipeline import (  # noqa: E402
     DEFAULT_GR_MAX_SKILLS,
     DEFAULT_GR_MAX_SOURCE_LENGTH,
     DEFAULT_GR_NUM_BEAMS,
+    METHOD_SETTING_PAG,
+    METHOD_SETTING_RIPOR,
+    METHOD_SETTING_RIPOR_PAG,
     SKILLROUTER_QUERY_MAX_CHARS,
     SEMANTIC_ID_MODE_DEDUP,
     SEMANTIC_ID_MODE_LEARNED,
@@ -49,6 +52,7 @@ from skill_gr_pipeline import (  # noqa: E402
     load_semantic_ids_with_mode,
     load_structured_decoder_checkpoint,
     make_structured_t5_sid_model,
+    merge_pag_set_sequence_states,
     load_ranked_skill_candidates_with_scores,
     load_pag_set_token_ids,
     native_semantic_id_text,
@@ -61,11 +65,14 @@ from skill_gr_pipeline import (  # noqa: E402
     resolve_eval_max_source_length,
     save_structured_decoder_checkpoint,
     semantic_ids_sha256,
+    setting_contract_provenance,
     split_and_expand_single_sid_query_rows,
     stratified_split_rows,
     structured_allowed_values,
     summarize_source_token_lengths,
     validate_checkpoint_semantic_ids,
+    validate_letter_tokenizer_manifest,
+    validate_method_setting_contract,
     validate_rank_capacity,
 )
 from train_letter_rqvae_official import (  # noqa: E402
@@ -497,7 +504,7 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(stopped_beam["score"], -2.75)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
-    def test_ripor_candidate_batch_keeps_sibling_positives_and_teacher_scores(self) -> None:
+    def test_ripor_candidate_batch_uses_current_positive_and_excludes_siblings(self) -> None:
         import torch
 
         semantic_ids = {"skill/a": [1, 2], "skill/b": [1, 3], "skill/c": [4, 5]}
@@ -507,8 +514,8 @@ class SkillGRPipelineTest(unittest.TestCase):
                 json.dumps(
                     {
                         "index": "query-1",
-                        "ranked_skill_ids": ["skill/c", "skill/a"],
-                        "ranked_skill_scores": {"skill/c": 0.2, "skill/a": 0.8},
+                        "ranked_skill_ids": ["skill/b", "skill/c", "skill/a"],
+                        "ranked_skill_scores": {"skill/b": 0.7, "skill/c": 0.2, "skill/a": 0.8},
                     }
                 )
                 + "\n",
@@ -533,9 +540,170 @@ class SkillGRPipelineTest(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        self.assertEqual(batch["ripor_candidate_positive"].tolist()[0][:2], [True, True])
+        self.assertEqual(batch["ripor_candidate_positive"].tolist()[0], [True, False])
         self.assertAlmostEqual(float(batch["ripor_candidate_teacher_scores"][0, 0]), 0.8, places=5)
-        self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 3, 2))
+        self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 2, 2))
+
+    def test_letter_tokenizer_manifest_pins_external_lightgcn_semantic_ids(self) -> None:
+        semantic_ids = {"a": [1, 2], "b": [3, 4]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            semantic_path = root / "semantic_ids.jsonl"
+            semantic_path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "skill_id": skill_id,
+                            "semantic_id": values,
+                            "semantic_id_mode": SEMANTIC_ID_MODE_LEARNED,
+                        }
+                    )
+                    for skill_id, values in semantic_ids.items()
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path = root / "rqvae_manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "method": "official_letter_rqvae_adapter",
+                        "semantic_id_mode": SEMANTIC_ID_MODE_LEARNED,
+                        "skills": 2,
+                        "num_emb_list": [256, 256],
+                        "external_cf_embeddings": "/models/lightgcn.pt",
+                        "cf_source": "/models/lightgcn.pt",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            provenance = validate_letter_tokenizer_manifest(
+                manifest_path,
+                semantic_path,
+                semantic_ids,
+                SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        self.assertTrue(provenance["frozen"])
+        self.assertEqual(provenance["skill_count"], 2)
+        self.assertEqual(provenance["lightgcn_embeddings"], "/models/lightgcn.pt")
+
+    def test_three_method_setting_contracts_keep_letter_ids_and_isolate_losses(self) -> None:
+        common = {
+            "letter_tokenizer_manifest": Path("rqvae_manifest.json"),
+            "setting_contract": Path("setting_contract.json"),
+            "ripor_relevance_checkpoint": None,
+            "ripor_codebook_embeddings": None,
+            "ripor_allow_weak_teacher": False,
+            "pag_set_allow_weak_teacher": False,
+            "reset_optimizer": True,
+            "query_target_mode": "single_sid",
+            "pag_set_stage_only": False,
+            "pag_sparse_checkpoint": None,
+            "catalog_epochs": 0,
+            "eval_steps": 0,
+            "load_best_model_at_end": False,
+            "pag_set_loss_weight": 0.0,
+            "pag_set_init_model_dir": None,
+            "pag_seq_init_model_dir": None,
+            "init_model_dir": Path("base"),
+            "ripor_loss_weight": 1.0,
+            "sequential_ce_weight": 0.0,
+        }
+        ripor_args = argparse.Namespace(method_setting=METHOD_SETTING_RIPOR, **common)
+        self.assertEqual(
+            validate_method_setting_contract(ripor_args, pag_set_enabled=False),
+            METHOD_SETTING_RIPOR,
+        )
+
+        pag_values = {
+            **common,
+            "pag_set_loss_weight": 1.0,
+            "pag_set_init_model_dir": Path("mset"),
+            "pag_seq_init_model_dir": Path("base"),
+            "init_model_dir": None,
+            "ripor_loss_weight": 0.0,
+            "sequential_ce_weight": 1.0,
+        }
+        pag_args = argparse.Namespace(method_setting=METHOD_SETTING_PAG, **pag_values)
+        self.assertEqual(
+            validate_method_setting_contract(pag_args, pag_set_enabled=True),
+            METHOD_SETTING_PAG,
+        )
+
+        both_values = {**pag_values, "ripor_loss_weight": 1.0, "sequential_ce_weight": 0.0}
+        both_args = argparse.Namespace(method_setting=METHOD_SETTING_RIPOR_PAG, **both_values)
+        self.assertEqual(
+            validate_method_setting_contract(both_args, pag_set_enabled=True),
+            METHOD_SETTING_RIPOR_PAG,
+        )
+
+        ripor_args.ripor_relevance_checkpoint = Path("m0.pt")
+        with self.assertRaisesRegex(ValueError, "cannot take RIPOR M0/RQ"):
+            validate_method_setting_contract(ripor_args, pag_set_enabled=False)
+
+        ripor_args.ripor_relevance_checkpoint = None
+        ripor_args.query_target_mode = "structured"
+        with self.assertRaisesRegex(ValueError, "require --query-target-mode single_sid"):
+            validate_method_setting_contract(ripor_args, pag_set_enabled=False)
+
+        ripor_args.query_target_mode = "single_sid"
+        ripor_args.setting_contract = None
+        with self.assertRaisesRegex(ValueError, "requires --setting-contract"):
+            validate_method_setting_contract(ripor_args, pag_set_enabled=False)
+
+        ripor_args.setting_contract = Path("setting_contract.json")
+        ripor_args.ripor_allow_weak_teacher = True
+        with self.assertRaisesRegex(ValueError, "forbids --ripor-allow-weak-teacher"):
+            validate_method_setting_contract(ripor_args, pag_set_enabled=False)
+
+        both_args.pag_set_allow_weak_teacher = True
+        with self.assertRaisesRegex(ValueError, "forbids --pag-set-allow-weak-teacher"):
+            validate_method_setting_contract(both_args, pag_set_enabled=True)
+
+    def test_setting_contract_provenance_binds_checkpoint_to_contract_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "setting_contract.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "fixed_letter_semantic_ids": True,
+                        "query_target_mode": "single_sid",
+                        "settings": ["ripor", "pag", "ripor_pag"],
+                        "input_files": {"rows": {"sha256": "abc"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            provenance = setting_contract_provenance(path)
+
+        self.assertEqual(provenance["settings"], ["ripor", "pag", "ripor_pag"])
+        self.assertEqual(provenance["input_sha256"], {"rows": "abc"})
+        self.assertEqual(len(provenance["sha256"]), 64)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_pag_merge_preserves_letter_sequential_heads_bitwise(self) -> None:
+        import torch
+
+        set_state = {
+            "backbone.weight": torch.tensor([2.0, 4.0]),
+            "sid_embedding.weight": torch.tensor([99.0, 99.0]),
+            "code_heads.0.weight": torch.tensor([88.0]),
+            "control_head.weight": torch.tensor([77.0]),
+        }
+        seq_state = {
+            "backbone.weight": torch.tensor([4.0, 8.0]),
+            "sid_embedding.weight": torch.tensor([1.0, 2.0]),
+            "code_heads.0.weight": torch.tensor([3.0]),
+            "control_head.weight": torch.tensor([4.0]),
+        }
+        merged = merge_pag_set_sequence_states(set_state, seq_state, seq_state)
+
+        self.assertTrue(torch.equal(merged["backbone.weight"], torch.tensor([3.0, 6.0])))
+        self.assertTrue(torch.equal(merged["sid_embedding.weight"], seq_state["sid_embedding.weight"]))
+        self.assertTrue(torch.equal(merged["code_heads.0.weight"], seq_state["code_heads.0.weight"]))
+        self.assertTrue(torch.equal(merged["control_head.weight"], seq_state["control_head.weight"]))
 
     def test_scoreless_ranked_candidates_are_not_silent_teacher_scores(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -560,6 +728,31 @@ class SkillGRPipelineTest(unittest.TestCase):
                 max_negatives=1,
                 allow_weak_teacher=False,
             )
+
+    def test_teacher_rank_examples_do_not_repeat_single_sid_sibling_positives(self) -> None:
+        examples = build_teacher_rank_examples(
+            [
+                {
+                    "index": "q",
+                    "query": "query",
+                    "selected_skill_ids": ["skill/a"],
+                    "source_selected_skill_ids": ["skill/a", "skill/b"],
+                }
+            ],
+            [
+                {"skill_id": "skill/a", "skillrouter_text": "a"},
+                {"skill_id": "skill/b", "skillrouter_text": "b"},
+                {"skill_id": "skill/c", "skillrouter_text": "c"},
+            ],
+            {"index:q": ["skill/b", "skill/c"]},
+            {"index:q": {"skill/a": 0.9, "skill/b": 0.8, "skill/c": 0.1}},
+            max_negatives=1,
+            allow_weak_teacher=False,
+        )
+
+        self.assertEqual(len(examples), 1)
+        self.assertEqual(examples[0]["positive_skill_id"], "skill/a")
+        self.assertEqual(examples[0]["negative_skill_id"], "skill/c")
 
     def test_pag_set_manifest_requires_fixed_m_when_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
