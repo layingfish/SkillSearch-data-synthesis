@@ -6,7 +6,7 @@ set -euo pipefail
 
 STAGE="${1:-}"
 if [[ -z "${STAGE}" ]]; then
-  echo "usage: $0 {teacher|preflight|pag_shared|ripor_mseq|final_ripor|final_pag|final_ripor_pag|eval_baseline|eval_ripor|eval_pag|eval_ripor_pag|all}" >&2
+  echo "usage: $0 {teacher|contract|preflight|pag_shared|ripor_mseq|final_ripor|final_pag|final_ripor_pag|eval_baseline|eval_ripor|eval_pag|eval_ripor_pag|all}" >&2
   exit 2
 fi
 
@@ -23,7 +23,8 @@ source "${CONFIG_PATH}"
 set +a
 
 required_vars=(
-  SKILLGR_ROWS SKILLGR_DEV_ROWS SKILLGR_SKILLS SKILLGR_SEMANTIC_IDS
+  SKILLGR_ROWS SKILLGR_DEV_ROWS SKILLGR_PRIVATE_TEST_ROWS SKILLGR_EVAL_ROWS
+  SKILLGR_SKILLS SKILLGR_SEMANTIC_IDS
   SKILLGR_LETTER_MANIFEST SKILLGR_BASE_DECODER SKILLGR_TEACHER_MODEL
   SKILLGR_MODEL SKILLGR_OUTPUT_ROOT SKILLGR_MSP_STEPS SKILLGR_MSET_STEPS
   SKILLGR_RIPOR_STAGE_STEPS SKILLGR_FINAL_STAGE_STEPS
@@ -51,6 +52,8 @@ exec > >(tee "${SKILLGR_OUTPUT_ROOT}/logs/${JOB_LABEL}.log") 2>&1
 for input_path in \
   "${SKILLGR_ROWS}" \
   "${SKILLGR_DEV_ROWS}" \
+  "${SKILLGR_PRIVATE_TEST_ROWS}" \
+  "${SKILLGR_EVAL_ROWS}" \
   "${SKILLGR_SKILLS}" \
   "${SKILLGR_SEMANTIC_IDS}" \
   "${SKILLGR_LETTER_MANIFEST}" \
@@ -137,6 +140,8 @@ payload = json.loads(contract_path.read_text(encoding="utf-8"))
 expected_paths = {
     "rows": os.environ["SKILLGR_ROWS"],
     "dev_rows": os.environ["SKILLGR_DEV_ROWS"],
+    "private_test_rows": os.environ["SKILLGR_PRIVATE_TEST_ROWS"],
+    "eval_rows": os.environ["SKILLGR_EVAL_ROWS"],
     "skills": os.environ["SKILLGR_SKILLS"],
     "semantic_ids": os.environ["SKILLGR_SEMANTIC_IDS"],
     "letter_manifest": os.environ["SKILLGR_LETTER_MANIFEST"],
@@ -184,21 +189,23 @@ PY
 }
 
 stage_teacher() {
-  ensure_fresh_dir "${TEACHER_DIR}"
-  run_torch scripts/skillrouter_embedding_train.py eval \
-    --rows "${SKILLGR_ROWS}" \
-    --skills-jsonl "${SKILLGR_SKILLS}" \
-    --model "${SKILLGR_TEACHER_MODEL}" \
-    --output-dir "${TEACHER_DIR}" \
-    --split-name train_teacher \
-    --k-values 1,50 \
-    --max-query-length "${MAX_SOURCE_LENGTH}" \
-    --max-skill-length "${MAX_SOURCE_LENGTH}" \
-    --query-max-chars "${TEACHER_QUERY_MAX_CHARS}" \
-    --desc-max "${TEACHER_DESC_MAX}" \
-    --body-max "${TEACHER_BODY_MAX}" \
-    --batch-size "${PER_DEVICE_BATCH}" \
-    --bf16
+  if [[ "${SKILLGR_REUSE_TEACHER_PANEL:-0}" != 1 ]]; then
+    ensure_fresh_dir "${TEACHER_DIR}"
+    run_torch scripts/skillrouter_embedding_train.py eval \
+      --rows "${SKILLGR_ROWS}" \
+      --skills-jsonl "${SKILLGR_SKILLS}" \
+      --model "${SKILLGR_TEACHER_MODEL}" \
+      --output-dir "${TEACHER_DIR}" \
+      --split-name train_teacher \
+      --k-values 1,50 \
+      --max-query-length "${MAX_SOURCE_LENGTH}" \
+      --max-skill-length "${MAX_SOURCE_LENGTH}" \
+      --query-max-chars "${TEACHER_QUERY_MAX_CHARS}" \
+      --desc-max "${TEACHER_DESC_MAX}" \
+      --body-max "${TEACHER_BODY_MAX}" \
+      --batch-size "${PER_DEVICE_BATCH}" \
+      --bf16
+  fi
   require_file "${TEACHER_PANEL}"
   python3 - "${SETTING_CONTRACT}" <<'PY'
 import hashlib
@@ -218,6 +225,8 @@ root = Path(os.environ["SKILLGR_OUTPUT_ROOT"])
 paths = {
     "rows": os.environ["SKILLGR_ROWS"],
     "dev_rows": os.environ["SKILLGR_DEV_ROWS"],
+    "private_test_rows": os.environ["SKILLGR_PRIVATE_TEST_ROWS"],
+    "eval_rows": os.environ["SKILLGR_EVAL_ROWS"],
     "skills": os.environ["SKILLGR_SKILLS"],
     "semantic_ids": os.environ["SKILLGR_SEMANTIC_IDS"],
     "letter_manifest": os.environ["SKILLGR_LETTER_MANIFEST"],
@@ -475,12 +484,15 @@ PY
 }
 
 run_stage() {
-  if [[ "$1" != teacher ]]; then
+  if [[ "$1" != teacher && "$1" != contract ]]; then
     verify_setting_contract
   fi
   case "$1" in
     teacher)
       stage_teacher
+      ;;
+    contract)
+      SKILLGR_REUSE_TEACHER_PANEL=1 stage_teacher
       ;;
     preflight)
       stage_preflight
@@ -512,21 +524,25 @@ run_stage() {
       train_pag_joint ripor_pag "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSET_DIR}/final" "${RIPOR_MSEQ_DIR}/final" "${RIPOR_PAG_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}"
       ;;
     eval_baseline)
-      eval_plain "${SKILLGR_DEV_ROWS}" "${SKILLGR_BASE_DECODER}" "${SKILLGR_OUTPUT_ROOT}/baseline_eval" custom
+      eval_plain "${SKILLGR_EVAL_ROWS}" "${SKILLGR_BASE_DECODER}" "${SKILLGR_OUTPUT_ROOT}/baseline_eval/official_core75" custom
+      eval_plain "${SKILLGR_PRIVATE_TEST_ROWS}" "${SKILLGR_BASE_DECODER}" "${SKILLGR_OUTPUT_ROOT}/baseline_eval/private_test" custom
       ;;
     eval_ripor)
       require_file "${RIPOR_ONLY_DIR}/final/structured_decoder.pt"
-      eval_plain "${SKILLGR_DEV_ROWS}" "${RIPOR_ONLY_DIR}/final" "${RIPOR_ONLY_DIR}/eval" ripor
+      eval_plain "${SKILLGR_EVAL_ROWS}" "${RIPOR_ONLY_DIR}/final" "${RIPOR_ONLY_DIR}/eval/official_core75" ripor
+      eval_plain "${SKILLGR_PRIVATE_TEST_ROWS}" "${RIPOR_ONLY_DIR}/final" "${RIPOR_ONLY_DIR}/eval/private_test" ripor
       ;;
     eval_pag)
       require_file "${PAG_ONLY_DIR}/final/structured_decoder.pt"
       require_file "${SET_IDS}"
-      eval_pag "${SKILLGR_DEV_ROWS}" "${PAG_ONLY_DIR}/final" "${PAG_ONLY_DIR}/eval" pag "${SET_IDS}"
+      eval_pag "${SKILLGR_EVAL_ROWS}" "${PAG_ONLY_DIR}/final" "${PAG_ONLY_DIR}/eval/official_core75" pag "${SET_IDS}"
+      eval_pag "${SKILLGR_PRIVATE_TEST_ROWS}" "${PAG_ONLY_DIR}/final" "${PAG_ONLY_DIR}/eval/private_test" pag "${SET_IDS}"
       ;;
     eval_ripor_pag)
       require_file "${RIPOR_PAG_DIR}/final/structured_decoder.pt"
       require_file "${SET_IDS}"
-      eval_pag "${SKILLGR_DEV_ROWS}" "${RIPOR_PAG_DIR}/final" "${RIPOR_PAG_DIR}/eval" ripor_pag "${SET_IDS}"
+      eval_pag "${SKILLGR_EVAL_ROWS}" "${RIPOR_PAG_DIR}/final" "${RIPOR_PAG_DIR}/eval/official_core75" ripor_pag "${SET_IDS}"
+      eval_pag "${SKILLGR_PRIVATE_TEST_ROWS}" "${RIPOR_PAG_DIR}/final" "${RIPOR_PAG_DIR}/eval/private_test" ripor_pag "${SET_IDS}"
       ;;
     *)
       echo "unknown stage: $1" >&2

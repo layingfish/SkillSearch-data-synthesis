@@ -85,6 +85,13 @@
   dev 8 条 query 的长度为 110--341 tokens，gold mentions=8、missing=0。正式门禁已解除。
 - 第一波共享正式任务已并发提交：PAG Msp/Mset 为 `tide-chenyufei03-10239-gwkec`，RIPOR Mseq
   为 `tide-chenyufei03-10240-hrdvg`；两者均为 rudder-r2 上完整 8×A800 单节点任务。
+- 首个 RIPOR 正式任务在 optimizer step 之前发现协议资产错误：配置误指向 alias 归一化前的 raw dev，
+  其中 78/1000 rows 含 80 个固定 LETTER pool 外的 GT mentions。既有 canonical dev/test 都是
+  1000 rows、missing=0；Official core75 为 75 rows（single 24 / multi 51）、200 GT、missing=0。
+  已把固定协议改为 canonical dev + Official core75 主评测 + canonical private test 辅助评测；旧
+  setting contract 下的共享产物不得进入 final，需刷新 contract 后重新启动。
+- canonical split 与 teacher panel 的 SHA-bound contract 已刷新；RIPOR Mseq 已重提为
+  `tide-chenyufei03-10241-trolo`。旧 PAG 任务等待 contract mismatch 门禁退出后从 Msp 重跑。
 
 ## 错误与处理
 

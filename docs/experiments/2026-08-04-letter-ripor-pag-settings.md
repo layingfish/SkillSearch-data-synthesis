@@ -11,7 +11,8 @@ Qwen + LightGCN + LETTER Semantic IDs immutable. The three requested final setti
 2. `pag`: fixed LETTER SID CE baseline + PAG set loss/planning-ahead.
 3. `ripor_pag`: fixed LETTER SID + prefix-oriented MarginMSE + PAG set loss/planning-ahead.
 
-All settings use the same single-SID target expansion, train/dev rows, canonical catalog, LETTER SID
+All settings use the same single-SID target expansion, canonical train/dev/private-test rows, Official
+core75 main-eval rows, canonical catalog, LETTER SID
 hash, CE+LETTER base decoder, numeric teacher panel, seed, per-device batch, 8-GPU world size, source
 policy, and final-stage step budget. PAG Msp/Mset and RIPOR Mseq are each trained once and shared.
 PAG-only merges Mset with the untouched CE+LETTER base; RIPOR+PAG merges the same Mset with the shared
@@ -48,9 +49,8 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/logs/`
 
-Metrics: `${SKILLGR_OUTPUT_ROOT}/baseline_eval/ranked_metrics.json`、
-`${SKILLGR_OUTPUT_ROOT}/ripor_only/eval/ranked_metrics.json`，以及 PAG 两组各自
-`eval/{planning,weight0_diagnostic}/ranked_metrics.json`。
+Metrics: each setting writes `official_core75` (main) and `private_test` (secondary) subdirectories.
+PAG settings additionally write `{planning,weight0_diagnostic}/ranked_metrics.json` inside each split.
 
 ## Verification
 
@@ -115,3 +115,15 @@ diagnostic completed. The raw dev audit now reports eight non-empty queries (110
 gold skill mentions with zero missing mentions, so the earlier schema defect is closed. The formal
 shared stages were then submitted concurrently: PAG Msp/Mset as `tide-chenyufei03-10239-gwkec` and
 RIPOR Mseq as `tide-chenyufei03-10240-hrdvg`, each on one complete 8xA800 node in `rudder-r2`.
+
+The first formal RIPOR job exposed a protocol asset error before any optimizer step: the config pointed
+at the pre-alias raw dev split, which contains 80 gold mentions outside the frozen 14,551-skill LETTER
+pool (78 affected rows). The established canonical assets already solve this without runtime filtering:
+canonical dev and private test each contain 1,000 rows with zero missing labels, while Official core75
+contains 75 rows (24 single/51 multi, 200 gold mentions) with zero missing labels. The locked protocol
+now uses canonical dev for the non-selecting training-stage audit, Official core75 as the main evaluation,
+and canonical private test as secondary evaluation. The setting contract must be regenerated before the
+shared stages are restarted; artifacts produced under the old contract are not eligible for final arms.
+The corrected SHA-bound contract was generated from the existing unchanged teacher panel, and RIPOR Mseq
+was resubmitted as `tide-chenyufei03-10241-trolo`. The old PAG process is allowed to terminate through
+the contract-hash guard; it will be resubmitted from Msp under the corrected contract.

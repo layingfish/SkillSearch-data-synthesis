@@ -31,7 +31,7 @@
 - LETTER tokenizer、LETTER codebook 和已经生成的 `semantic_ids.jsonl`。
 - Semantic ID 深度、每层 codebook 范围、skill 到 SID 的映射。
 - 基础 single-SID decoder checkpoint。
-- train/dev/test 原始 query、canonical skill catalog、source text policy。
+- canonical train/dev/private-test query、Official core75 主评测 query、canonical skill catalog、source text policy。
 - teacher 模型、teacher candidate panel、随机种子、最终阶段更新步数、每卡 batch 和 8 卡 world size。
 - 评测 query、beam size、K 值和指标实现。
 
@@ -93,6 +93,15 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 `B` 复用现有 checkpoint 和已有/重新统一跑出的评测结果，不新增第四组训练。
 
 ## 6. 数据与多 ground-truth 语义
+
+### 6.0 固定 split
+
+- 训练：`decoder_rows.base_plus_task5_gt2.plus_isolated_mode3.jsonl`（100,078 raw query rows）。
+- 训练期 dev 资产：canonical `rows_001.decoder_rows.base.jsonl`（1,000 rows；训练阶段 `eval_steps=0`，不用于选 checkpoint）。
+- 辅助 private test：canonical `rows_002.decoder_rows.base.jsonl`（1,000 rows；single 104 / multi 896）。
+- 主评测：`rows_003.skillsbench_core75.rows.jsonl`（75 Official rows；single 24 / multi 51）。
+- 三个评测相关 split 的所有 labels 都必须在固定的 14,551-skill LETTER pool 内；不允许运行时静默过滤或伪造 SID。
+- `outputs/eval/.../dev.jsonl` 是 alias 归一化前的 raw split，不得直接传入固定 LETTER 训练或主评测。
 
 ### 6.1 single-SID 训练单位
 
@@ -181,8 +190,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 
 当前活动任务：
 
-- PAG `Msp → Mset`：`tide-chenyufei03-10239-gwkec`。
-- RIPOR `Mseq`：`tide-chenyufei03-10240-hrdvg`。
+- 旧 contract PAG `Msp → Mset`：`tide-chenyufei03-10239-gwkec`（产物禁止进入 final，等待 fail-closed 退出）。
+- canonical contract RIPOR `Mseq`：`tide-chenyufei03-10241-trolo`。
 
 ## 8. 训练协议
 
@@ -209,7 +218,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 
 ### 9.1 数据切分
 
-- 评测输入使用原始未展开 query，避免一个 multi-skill query 被重复计分。
+- 评测输入使用未展开的 canonical query，避免一个 multi-skill query 被重复计分。
+- Official core75 是主结果；canonical private test 是同 checkpoint 的辅助泛化结果，不能替代主结果。
 - 固定报告 `overall`、`single-skill subset (|GT|=1)`、`multi-skill subset (|GT|>1)`。
 - 同时保留按 `target_skill_count=1/2/3/...` 的细分结果。
 
@@ -260,3 +270,4 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 | 当前已有部分未提交实现早于本计划产生 | 已审查 | 已逐项按本计划收敛，并通过独立计划审查、focused invariants 与 8 卡 preflight |
 | single-SID 展开后若每行把全部 GT 再作为 positive，会造成 `K²` 权重 | 已修正并有 invariant test | 当前 target 是唯一 positive，全部 sibling 只做 negative exclusion |
 | 联合组若直接从 CE base 开始会遗漏 RIPOR Mseq 阶段 | 已修正并 fail closed | `ripor_pag` 强制使用与 `ripor` 共享的 RIPOR Mseq |
+| 首次正式启动误用了 alias 归一化前的 raw dev，含 80 个不在固定 LETTER pool 的 GT mentions | 已定位，正式结果无效 | 改回既有 canonical dev/private-test，并把 Official core75 单列为主评测；重新生成 SHA-bound contract 后重启共享阶段 |
