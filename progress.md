@@ -50,6 +50,11 @@
   queries；14551 个 semantic IDs 与 14551 个 canonical skills 完全对齐，无 missing/empty GT。
 - Tier 3 独立 cross-review 未发现剩余 CRITICAL/HIGH；审查提出的 weak-teacher、contract SHA、
   Msp max-length 和跨 artifact contract 绑定问题均已补强。
+- 代码已提交为 `f6ebacf`（`feat: add fixed-LETTER RIPOR PAG experiment DAG`）。
+- teacher 8 卡任务已提交：`tide-chenyufei03-10230-hlrjf`；日志固定写入
+  `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/logs/teacher-0804a.log`。
+- 首个 teacher job 在训练前失败：launcher 调用 alias helper 时未传 `--with-dataset-rw`，因此
+  `/dataset_rw` 未创建，输入检查以 exit code 1 结束；该问题已定位并修复，日志初始化也前移到输入检查之前。
 
 ## 错误与处理
 

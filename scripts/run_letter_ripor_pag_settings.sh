@@ -40,7 +40,11 @@ if [[ "${SKILLGR_OUTPUT_ROOT}" != /models_rw/* ]]; then
 fi
 
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
-bash "${ALIAS_HELPER}" || exit 1
+bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
+
+mkdir -p "${SKILLGR_OUTPUT_ROOT}/logs"
+JOB_LABEL="${SKILLGR_JOB_NAME:-${STAGE}}"
+exec > >(tee "${SKILLGR_OUTPUT_ROOT}/logs/${JOB_LABEL}.log") 2>&1
 
 for input_path in \
   "${SKILLGR_ROWS}" \
@@ -57,10 +61,6 @@ for input_path in \
     exit 2
   fi
 done
-
-mkdir -p "${SKILLGR_OUTPUT_ROOT}/logs"
-JOB_LABEL="${SKILLGR_JOB_NAME:-${STAGE}}"
-exec > >(tee "${SKILLGR_OUTPUT_ROOT}/logs/${JOB_LABEL}.log") 2>&1
 cd "${REPO_ROOT}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TOKENIZERS_PARALLELISM=false

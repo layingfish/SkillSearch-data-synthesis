@@ -1,5 +1,5 @@
 # Experiment: Fixed-LETTER RIPOR/PAG component settings
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -44,7 +44,7 @@ settings use the same lexical set manifest, planning weight, top-N candidate dom
 
 Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/{ripor_only,pag_only,ripor_pag}/final`
 
-Log: supplied by the Tianzhi wrapper under `/models_rw`; update this note before submission.
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/logs/teacher-0804a.log`
 
 Metrics: `${SKILLGR_OUTPUT_ROOT}/{ripor_only,pag_only,ripor_pag}/eval/ranked_metrics.json`
 
@@ -61,5 +61,7 @@ Metrics: `${SKILLGR_OUTPUT_ROOT}/{ripor_only,pag_only,ripor_pag}/eval/ranked_met
 
 No job has been submitted yet. Formal train/dev/catalog, fixed LETTER, base single-SID decoder,
 SkillRouter teacher, and pinned T5-base assets are resolved on CFS. Independent cross-review found no
-remaining CRITICAL/HIGH findings. The stage launcher and locked config are ready; the next action is
-teacher followed by the mandatory 8-GPU preflight job.
+remaining CRITICAL/HIGH findings. Teacher job `tide-chenyufei03-10230-hlrjf` was submitted to rudder-r2
+as one 8×A800 node but failed before training because `/dataset_rw` was not initialized by the alias
+helper. The launcher now passes `--with-dataset-rw` and starts CFS logging before input validation; a
+new teacher job will be submitted. Mandatory preflight remains gated on teacher success.
