@@ -65,3 +65,7 @@ remaining CRITICAL/HIGH findings. Teacher job `tide-chenyufei03-10230-hlrjf` was
 as one 8×A800 node but failed before training because `/dataset_rw` was not initialized by the alias
 helper. The launcher now passes `--with-dataset-rw` and starts CFS logging before input validation; a
 new teacher job will be submitted. Mandatory preflight remains gated on teacher success.
+
+Retry `tide-chenyufei03-10231-rshfg` completed distributed encoding but failed before scoring because
+query embeddings were on CPU while the gathered catalog matrix was on each rank's GPU. The query
+matrix is now moved to the local rank device immediately before matmul; this is a device-only fix.

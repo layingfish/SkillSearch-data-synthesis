@@ -55,6 +55,9 @@
   `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1/logs/teacher-0804a.log`。
 - 首个 teacher job 在训练前失败：launcher 调用 alias helper 时未传 `--with-dataset-rw`，因此
   `/dataset_rw` 未创建，输入检查以 exit code 1 结束；该问题已定位并修复，日志初始化也前移到输入检查之前。
+- 第二个 teacher job `tide-chenyufei03-10231-rshfg` 完成了 8 卡 skill/query encoding，但在相似度
+  矩阵乘法处失败：query embeddings 留在 CPU、catalog embeddings 已在各 rank GPU。已在 matmul 前
+  显式把 query embeddings 搬到当前 rank device；不改变分数或分片语义。
 
 ## 错误与处理
 

@@ -975,6 +975,7 @@ def command_eval(args: argparse.Namespace) -> None:
         args.batch_size,
         args.split_name,
     )
+    query_embeddings = query_embeddings.to(device)
     scores = query_embeddings @ skill_embeddings.T
     top_scores, top_indices = torch.topk(scores, k=min(max_rank, len(skills)), dim=1)
     predictions = []
