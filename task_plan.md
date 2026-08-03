@@ -190,7 +190,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 
 当前活动任务：
 
-- 旧 contract PAG `Msp → Mset`：`tide-chenyufei03-10239-gwkec`（产物禁止进入 final，等待 fail-closed 退出）。
+- canonical contract PAG `Msp → Mset`：`tide-chenyufei03-10242-tmick`。
 - canonical contract RIPOR `Mseq`：`tide-chenyufei03-10241-trolo`。
 
 ## 8. 训练协议

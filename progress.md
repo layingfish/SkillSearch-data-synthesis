@@ -92,6 +92,9 @@
   setting contract 下的共享产物不得进入 final，需刷新 contract 后重新启动。
 - canonical split 与 teacher panel 的 SHA-bound contract 已刷新；RIPOR Mseq 已重提为
   `tide-chenyufei03-10241-trolo`。旧 PAG 任务等待 contract mismatch 门禁退出后从 Msp 重跑。
+- 旧 PAG `tide-chenyufei03-10239-gwkec` 在完成 Msp 4700 步后、进入 Mset optimizer 前因 raw dev
+  label 越界失败；旧 Msp/Mset 目录已原样移动到 `invalid_raw_dev_contract/`，可恢复但禁止进入 final。
+  canonical PAG 共享路径已从 Msp 重提为 `tide-chenyufei03-10242-tmick`。
 
 ## 错误与处理
 

@@ -125,5 +125,10 @@ now uses canonical dev for the non-selecting training-stage audit, Official core
 and canonical private test as secondary evaluation. The setting contract must be regenerated before the
 shared stages are restarted; artifacts produced under the old contract are not eligible for final arms.
 The corrected SHA-bound contract was generated from the existing unchanged teacher panel, and RIPOR Mseq
-was resubmitted as `tide-chenyufei03-10241-trolo`. The old PAG process is allowed to terminate through
-the contract-hash guard; it will be resubmitted from Msp under the corrected contract.
+was resubmitted as `tide-chenyufei03-10241-trolo`. The old PAG process was allowed to terminate through
+its fail-closed dev/contract checks and could not produce an eligible Mset checkpoint.
+
+Old-contract PAG job `tide-chenyufei03-10239-gwkec` finished all 4,700 Msp steps and then failed before
+Mset optimization while expanding the pre-alias dev labels. Its Msp/Mset directories were moved intact
+to `${SKILLGR_OUTPUT_ROOT}/invalid_raw_dev_contract/` and are ineligible for downstream use. The complete
+PAG shared path was resubmitted from Msp as `tide-chenyufei03-10242-tmick` under the canonical contract.
