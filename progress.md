@@ -34,6 +34,7 @@
 | 三组 method contract / LETTER manifest / scoreless teacher focused tests | 通过 | tensor merge test 因本地无 torch 跳过 |
 | focused `tests.test_skill_gr_pipeline` | 通过 | 53 passed，7 个 optional-dependency skips |
 | 锁定 stage launcher `bash -n` | 通过 | 每个 GPU stage 固定 `torchrun --nproc_per_node=8` |
+| 8-rank DDP objective invariant | 通过 | `max_gradient_error=5.96e-08`，global count=20 |
 
 ## 2026-08-04：实现按计划收敛
 
@@ -58,6 +59,12 @@
 - 第二个 teacher job `tide-chenyufei03-10231-rshfg` 完成了 8 卡 skill/query encoding，但在相似度
   矩阵乘法处失败：query embeddings 留在 CPU、catalog embeddings 已在各 rank GPU。已在 matmul 前
   显式把 query embeddings 搬到当前 rank device；不改变分数或分片语义。
+- 第三个 teacher job `tide-chenyufei03-10232-nrekv` 成功，生成 100078 行 teacher panel 和 SHA-bound
+  `setting_contract.json`；teacher Hit@1=0.83119167，Hit@50=0.99351506。
+- 首个 preflight `tide-chenyufei03-10233-hsqmj` 的 53 个镜像内单测和 8-rank DDP invariant 均通过，
+  真实 PAG Msp 烟测因错误复用 GR `max_source_length=2048` 而 OOM。已按 PAG 官方
+  `t5_splade_train.sh` 将 Msp 独立固定为 `max_length=128`，并同步锁定配置和 setting contract；
+  Mset/RIPOR/joint 仍保持 2048。
 
 ## 错误与处理
 
@@ -69,11 +76,10 @@
 
 ## 下一步
 
-1. 完成独立代码 cross-review，修复 CRITICAL/HIGH findings。
-2. 提交 teacher 8 卡 job 并监控至成功，生成 `setting_contract.json`。
-3. 提交 8 卡 preflight；通过后并发提交 `pag_shared` 与 `ripor_mseq`。
-4. 共享 checkpoint 完成后并发提交三组 final，并运行 baseline/三组统一评测。
-5. 持续回填 job ID、日志、checkpoint 和 metrics。
+1. 清理失败 preflight 的临时子集并用官方 Msp 长度重新提交 8 卡 preflight。
+2. preflight 通过后并发提交 `pag_shared` 与 `ripor_mseq`。
+3. 共享 checkpoint 完成后并发提交三组 final，并运行 baseline/三组统一评测。
+4. 持续回填 job ID、日志、checkpoint 和 metrics。
 
 ## 5 问恢复检查
 

@@ -57,6 +57,7 @@
 本轮实现 PAG 的以下核心机制：
 
 - `Msp`：T5-SPLADE lexical representation，MarginMSE + FLOPS regularization。
+- `Msp` 输入长度固定为原始 PAG 官方训练脚本的 `max_length=128`；GR decoder 的 `max_source_length=2048` 只用于 Mset/RIPOR/joint，不与稀疏编码器混用。
 - 从每个 skill document 的 `Msp` 表示选择固定 `m` 个 lexical Set ID。
 - `Mset`：在固定 Set ID 上训练 simultaneous document score。
 - `Mseq`：single-SID sequential decoder。
