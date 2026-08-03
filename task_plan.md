@@ -193,8 +193,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 当前活动任务：
 
 - canonical contract PAG `Msp → Mset`：`tide-chenyufei03-10242-tmick`。
-- RIPOR-only final continuation：`tide-chenyufei03-10245-pcgrm`。
-- corrected full-prefix RIPOR-only final 使用独立输出目录并行重跑，成功后再替换 canonical result path；
+- audit-only restarted-curriculum RIPOR final：`tide-chenyufei03-10245-pcgrm`（禁止进入结果）。
+- corrected full-prefix RIPOR-only final：`tide-chenyufei03-10247-ctwhg`，使用独立输出目录；成功后再替换 canonical result path；
   audit-only job 的目录在写盘期间不得移动或复用。
 
 ## 8. 训练协议

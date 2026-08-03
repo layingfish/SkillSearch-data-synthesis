@@ -104,6 +104,8 @@
   `tide-chenyufei03-10245-pcgrm` 标记为 audit-only，完成后隔离并重跑，不进入结果。
 - 为避免等待无效 run 白白占用关键路径，launcher 允许仅覆盖 `SKILLGR_RIPOR_ONLY_DIR`；corrected
   full-prefix final 将写入独立目录并与 audit-only job 并行，完成后再原子切换 canonical 结果目录。
+- corrected run 已提交为 `tide-chenyufei03-10247-ctwhg`；同一 local step 的首批 loss 约 0.048，
+  audit-only restarted-curriculum run 约 0.018，证实二者实际监督的 prefix 集不同。
 
 ## 错误与处理
 

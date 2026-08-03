@@ -143,3 +143,8 @@ both already initialize from a full-depth Mseq and must train the full multi-pre
 The launcher now makes the schedule explicit (`progressive` for shared Mseq, `full` for RIPOR-only and
 RIPOR+PAG final), and checkpoints record it. The currently running `tide-chenyufei03-10245-pcgrm` is
 therefore an audit-only invalid run; its output will be quarantined and the final stage rerun.
+
+The corrected full-prefix final was launched concurrently as `tide-chenyufei03-10247-ctwhg` into the
+isolated `ripor_only_fullprefix` directory. At the same local training position, its first logged loss was
+about 0.048 versus about 0.018 for the restarted-curriculum run, confirming that the two invocations were
+supervising different active prefix sets rather than merely carrying different provenance labels.
