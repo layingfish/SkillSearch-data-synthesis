@@ -95,6 +95,9 @@
 - 旧 PAG `tide-chenyufei03-10239-gwkec` 在完成 Msp 4700 步后、进入 Mset optimizer 前因 raw dev
   label 越界失败；旧 Msp/Mset 目录已原样移动到 `invalid_raw_dev_contract/`，可恢复但禁止进入 final。
   canonical PAG 共享路径已从 Msp 重提为 `tide-chenyufei03-10242-tmick`。
+- canonical RIPOR Mseq `tide-chenyufei03-10241-trolo` 已成功完成 5000 steps，末步 loss=0.042466，
+  共享 checkpoint 已写出；RIPOR-only 对齐更新量的第二段 5000-step final 已提交为
+  `tide-chenyufei03-10245-pcgrm`。
 
 ## 错误与处理
 

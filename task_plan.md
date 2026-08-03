@@ -141,8 +141,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] 使用 position-specific code heads 计算 raw conditional logits。
 - [x] 实现 prefix cumulative score、prefix divergence mask、`alpha_i` 和 MarginMSE。
 - [x] teacher score、hard negative、prefix objective 写入 checkpoint provenance。
-- [ ] 生成可供 `ripor` 和 `ripor_pag` 共享的 RIPOR Mseq checkpoint。
-- **Status：implemented，待正式 GPU stage 生成共享 checkpoint**
+- [x] 生成可供 `ripor` 和 `ripor_pag` 共享的 RIPOR Mseq checkpoint。
+- **Status：done（`tide-chenyufei03-10241-trolo` Succeeded）**
 
 ### Phase 4：PAG set 分支和联合模型
 
@@ -191,7 +191,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 当前活动任务：
 
 - canonical contract PAG `Msp → Mset`：`tide-chenyufei03-10242-tmick`。
-- canonical contract RIPOR `Mseq`：`tide-chenyufei03-10241-trolo`。
+- RIPOR-only final continuation：`tide-chenyufei03-10245-pcgrm`。
 
 ## 8. 训练协议
 

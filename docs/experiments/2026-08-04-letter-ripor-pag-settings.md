@@ -132,3 +132,7 @@ Old-contract PAG job `tide-chenyufei03-10239-gwkec` finished all 4,700 Msp steps
 Mset optimization while expanding the pre-alias dev labels. Its Msp/Mset directories were moved intact
 to `${SKILLGR_OUTPUT_ROOT}/invalid_raw_dev_contract/` and are ineligible for downstream use. The complete
 PAG shared path was resubmitted from Msp as `tide-chenyufei03-10242-tmick` under the canonical contract.
+
+Canonical RIPOR Mseq job `tide-chenyufei03-10241-trolo` succeeded after 5,000 steps with final logged
+loss 0.042466 and wrote the shared checkpoint at `ripor_mseq/final/structured_decoder.pt`. The matched
+second 5,000-step RIPOR-only final continuation was submitted as `tide-chenyufei03-10245-pcgrm`.
