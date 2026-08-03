@@ -75,6 +75,10 @@
   PAG-only；RIPOR+PAG 因将最长 2048 的完整 encoder source 为每个 candidate 重复到 decoder prefix
   而 OOM。PAG 官方 unified 脚本固定 `max_length=64`，因此现在只把 PAG decoder query prefix 限为
   64 token，encoder 仍完整保留 2048；训练、推理、setting contract 和 checkpoint provenance 同步。
+- 第五个 preflight `tide-chenyufei03-10237-dajit` 已成功并写出 `preflight/PASSED`，但 eval audit 暴露
+  dev 原始 schema 使用 `generated.query/selected_skill_ids`，而 expansion/source 只读 top-level，导致
+  smoke eval 输入 1 token、gold=0。现统一兼容 raw 与 prepared schema，并增加 nested query/labels 回归测试；
+  需刷新 preflight，确认 dev rows/gold 非零后才启动正式训练。
 
 ## 错误与处理
 

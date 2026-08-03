@@ -464,6 +464,14 @@ def prepared_selected_skill_ids(row: dict[str, Any]) -> list[str]:
     return [str(sid) for sid in ids if sid]
 
 
+def prepared_target_skill_count(row: dict[str, Any]) -> int:
+    generated = row.get("generated") or {}
+    value = row.get("target_skill_count")
+    if value is None:
+        value = generated.get("target_skill_count")
+    return int(value if value is not None else len(prepared_selected_skill_ids(row)))
+
+
 def collect_selected_ids(rows: list[dict[str, Any]]) -> list[str]:
     ids: set[str] = set()
     for row in rows:
@@ -883,7 +891,7 @@ def compute_retrieval_metrics(rows: list[dict[str, Any]], predictions: list[dict
 
     grouped: dict[str, list[dict[str, float]]] = {"overall": []}
     for row, pred in zip(rows, predictions):
-        gold_ids = set(str(sid) for sid in row.get("selected_skill_ids", []))
+        gold_ids = set(prepared_selected_skill_ids(row))
         pred_ids = _unique_preserving_order([str(sid) for sid in pred.get("predicted_skill_ids", [])])
         pred_set = set(pred_ids)
         hit_count = len(gold_ids & pred_set)
@@ -902,7 +910,7 @@ def compute_retrieval_metrics(rows: list[dict[str, Any]], predictions: list[dict
             "duplicate_predictions": float(max(0, len(pred.get("predicted_skill_ids", [])) - pred_count)),
         }
         grouped["overall"].append(item)
-        grouped.setdefault(str(row.get("target_skill_count", gold_count)), []).append(item)
+        grouped.setdefault(str(prepared_target_skill_count(row)), []).append(item)
 
     def summarize(items: list[dict[str, float]]) -> dict[str, Any]:
         rows_n = len(items)
@@ -950,7 +958,7 @@ def compute_at_k_metrics(
 
     grouped: dict[str, list[dict[str, Any]]] = {"overall": []}
     for row, pred in zip(rows, predictions):
-        gold_ids = set(str(sid) for sid in row.get("selected_skill_ids", []))
+        gold_ids = set(prepared_selected_skill_ids(row))
         ranked_ids = _unique_preserving_order(
             [str(sid) for sid in pred.get("ranked_skill_ids") or pred.get("predicted_skill_ids", [])]
         )
@@ -960,7 +968,7 @@ def compute_at_k_metrics(
             "invalid": bool(pred.get("invalid")),
         }
         grouped["overall"].append(item)
-        grouped.setdefault(str(row.get("target_skill_count", len(gold_ids))), []).append(item)
+        grouped.setdefault(str(prepared_target_skill_count(row)), []).append(item)
 
     def summarize(items: list[dict[str, Any]]) -> dict[str, Any]:
         rows_n = len(items)
@@ -1037,14 +1045,23 @@ def command_rescore_ranked(args: argparse.Namespace) -> None:
 
 
 def row_query_text(row: dict[str, Any]) -> str:
-    return str(row.get("query") or row.get("decoder_input") or row.get("query_text") or "")
+    generated = row.get("generated") or {}
+    return str(
+        row.get("query")
+        or row.get("decoder_input")
+        or row.get("query_text")
+        or generated.get("query")
+        or ""
+    )
 
 
 def decoder_source_text(row: dict[str, Any]) -> str:
     if row.get("decoder_input"):
         return str(row["decoder_input"])
-    if row.get("query"):
-        raw_query = str(row["query"])
+    generated = row.get("generated") or {}
+    raw_query = row.get("query") or generated.get("query")
+    if raw_query:
+        raw_query = str(raw_query)
         if raw_query.startswith(SKILLROUTER_QUERY_INSTRUCTION):
             query = raw_query[len(SKILLROUTER_QUERY_INSTRUCTION) :]
             return format_skillrouter_query(query)
@@ -1158,7 +1175,7 @@ def expand_single_sid_query_rows(
 ) -> list[dict[str, Any]]:
     expanded: list[dict[str, Any]] = []
     for row in rows:
-        gold_ids = sorted(_unique_preserving_order([str(sid) for sid in row.get("selected_skill_ids", [])]))
+        gold_ids = sorted(_unique_preserving_order(prepared_selected_skill_ids(row)))
         for sid in gold_ids:
             if sid not in semantic_ids:
                 raise KeyError(f"missing semantic id for selected skill: {sid}")
@@ -3552,7 +3569,7 @@ def command_eval_bm25(args: argparse.Namespace) -> None:
                 score += idf.get(term, 0.0) * (freq * (args.k1 + 1.0)) / denom
             scores.append((score, skill["skill_id"]))
         ranked = [sid for _, sid in sorted(scores, key=lambda item: (-item[0], item[1]))[:max_rank]]
-        gold_ids = [str(sid) for sid in row.get("selected_skill_ids", [])]
+        gold_ids = prepared_selected_skill_ids(row)
         predictions.append(
             {
                 "index": row.get("index"),
@@ -6093,7 +6110,7 @@ def summarize_eval_gold_coverage(
     rows_with_missing = 0
     target_counts: list[int] = []
     for row in rows:
-        gold_ids = [str(sid) for sid in row.get("selected_skill_ids", [])]
+        gold_ids = prepared_selected_skill_ids(row)
         target_counts.append(len(set(gold_ids)))
         missing = [sid for sid in gold_ids if sid not in known]
         if missing:
@@ -6452,7 +6469,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             raise ValueError(f"unknown rank aggregation: {args.rank_aggregation}")
         predicted_ids = [sequence_to_skill_id[tuple(values)] for values in best["completed"] if tuple(values) in sequence_to_skill_id]
         unknown_sequences = [list(values) for values in best["completed"] if tuple(values) not in sequence_to_skill_id]
-        gold_ids = [str(sid) for sid in row.get("selected_skill_ids", [])]
+        gold_ids = prepared_selected_skill_ids(row)
         pred_set = set(predicted_ids)
         gold_set = set(gold_ids)
         hit_count = len(pred_set & gold_set)
@@ -6465,8 +6482,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             {
                 "index": row.get("index"),
                 "source_index": row.get("source_index"),
-                "target_skill_count": row.get("target_skill_count"),
-                "query": row.get("query"),
+                "target_skill_count": prepared_target_skill_count(row),
+                "query": row_query_text(row),
                 "gold_skill_ids": gold_ids,
                 "predicted_skill_ids": predicted_ids,
                 "ranked_skill_ids": ranked_skill_ids,

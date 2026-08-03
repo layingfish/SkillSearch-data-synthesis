@@ -1130,6 +1130,23 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(expanded[0]["decoder_input"], "skill routing query: do the thing")
         self.assertEqual(expanded[0]["source_target_skill_count"], 2)
 
+    def test_single_sid_expansion_and_source_support_raw_generated_schema(self) -> None:
+        row = {
+            "index": 7,
+            "generated": {
+                "query": "find the best audio extraction tool",
+                "selected_skill_ids": ["skill/b", "skill/a"],
+                "target_skill_count": 2,
+            },
+        }
+        semantic_ids = {"skill/a": [1, 2, 3, 0], "skill/b": [4, 5, 6, 0]}
+
+        expanded = expand_single_sid_query_rows([row], semantic_ids)
+
+        self.assertEqual([item["positive_skill_id"] for item in expanded], ["skill/a", "skill/b"])
+        self.assertTrue(decoder_source_text(expanded[0]).endswith("find the best audio extraction tool"))
+        self.assertEqual(expanded[0]["source_selected_skill_ids"], ["skill/a", "skill/b"])
+
     def test_single_sid_fallback_split_keeps_each_source_query_in_one_split(self) -> None:
         rows = [
             {

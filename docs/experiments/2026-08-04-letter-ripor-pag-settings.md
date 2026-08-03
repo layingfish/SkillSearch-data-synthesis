@@ -99,3 +99,10 @@ script uses `max_length=64`. The locked implementation now keeps the existing 20
 unchanged but limits only PAG's decoder query prefix to the first 64 tokens in Mset, joint training, and
 inference. Inference also repeats this bounded prefix to the active beam batch explicitly. The limit is
 stored in the setting contract and checkpoint provenance and is verified by a focused tensor test.
+
+Preflight `tide-chenyufei03-10237-dajit` succeeded and wrote `preflight/PASSED`; all training and both
+PAG decoding diagnostics executed. Its eval audit nevertheless showed one-token empty sources and zero
+gold because the locked dev split stores query/labels under `generated.*`, while single-SID expansion and
+decoder source extraction only read prepared top-level fields. Both paths now accept the canonical raw
+schema as well as prepared rows, with a regression test covering nested query and two nested labels.
+Formal training/evaluation remains gated on a refreshed preflight with non-zero dev rows and gold.
