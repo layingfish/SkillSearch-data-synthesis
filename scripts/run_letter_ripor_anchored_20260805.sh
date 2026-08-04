@@ -472,8 +472,10 @@ stage_preflight() {
     --ripor-prefix-max-length 4 --no-ripor-progressive-prefix \
     --eval-steps 0 --no-load-best-model-at-end --logging-steps 1 --save-steps 0 \
     --seed "${SKILLGR_SEED}" --bf16
-  # Supported custom catalog→RIPOR path: catalog CE must use the code heads
-  # while the later ranking heads remain graph-connected under strict DDP.
+  # Exercise the exact fixed-LETTER RIPOR arm used by M2: catalog CE must use
+  # the code heads while the later ranking heads remain graph-connected under
+  # strict DDP.  The historical LETTER checkpoint is the intentional shared
+  # initialization, not an official M0/RQ continuation checkpoint.
   run_torch scripts/skill_gr_pipeline.py train-single-sid-decoder \
     --rows "${PREFLIGHT}/train32.jsonl" \
     --dev-rows "${PREFLIGHT}/dev8.jsonl" \
@@ -482,7 +484,8 @@ stage_preflight() {
     --output-dir "${PREFLIGHT}/catalog_then_ripor_ddp_smoke" \
     --model "${SKILLGR_MODEL}" \
     --init-model-dir "${SKILLGR_BASE_DECODER}" \
-    --method-setting custom \
+    --method-setting ripor \
+    --letter-tokenizer-manifest "${SKILLGR_LETTER_MANIFEST}" \
     --setting-contract "${CONTRACT}" \
     --reset-optimizer \
     --catalog-epochs 1 --catalog-max-steps 1 --max-steps 1 \
