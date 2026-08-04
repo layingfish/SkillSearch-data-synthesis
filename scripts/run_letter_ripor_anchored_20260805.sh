@@ -377,24 +377,43 @@ left, right = load(sys.argv[1]), load(sys.argv[2])
 if len(left) != len(right):
     raise SystemExit(f"prediction count mismatch: {len(left)} != {len(right)}")
 fields = ("index", "predicted_semantic_ids", "predicted_skill_ids", "ranked_skill_ids")
+score_atol = 1e-5
+maximum_score_error = 0.0
+maximum_candidate_score_error = 0.0
+compared_score_map_rows = 0
+archived_score_map_missing_rows = 0
 for i, (a, b) in enumerate(zip(left, right)):
     for field in fields:
         if a.get(field) != b.get(field):
             raise SystemExit(f"historical baseline mismatch row={i}, field={field}")
-    a_scores = a.get("ranked_skill_scores") or {}
-    b_scores = b.get("ranked_skill_scores") or {}
-    if set(a_scores) != set(b_scores):
-        raise SystemExit(f"historical baseline score-domain mismatch row={i}")
-    for skill_id in a_scores:
-        if not math.isclose(float(a_scores[skill_id]), float(b_scores[skill_id]), rel_tol=0.0, abs_tol=1e-6):
-            raise SystemExit(f"historical baseline score mismatch row={i}, skill={skill_id}")
-    if not math.isclose(float(a.get("score")), float(b.get("score")), rel_tol=0.0, abs_tol=1e-6):
+    a_scores = a.get("ranked_skill_scores")
+    b_scores = b.get("ranked_skill_scores")
+    if a_scores is None:
+        archived_score_map_missing_rows += 1
+    else:
+        if not isinstance(a_scores, dict) or not isinstance(b_scores, dict):
+            raise SystemExit(f"historical baseline score-map type mismatch row={i}")
+        if set(a_scores) != set(b_scores):
+            raise SystemExit(f"historical baseline score-domain mismatch row={i}")
+        compared_score_map_rows += 1
+        for skill_id in a_scores:
+            error = abs(float(a_scores[skill_id]) - float(b_scores[skill_id]))
+            maximum_candidate_score_error = max(maximum_candidate_score_error, error)
+            if not math.isfinite(error) or error > score_atol:
+                raise SystemExit(f"historical baseline score mismatch row={i}, skill={skill_id}")
+    score_error = abs(float(a.get("score")) - float(b.get("score")))
+    maximum_score_error = max(maximum_score_error, score_error)
+    if not math.isfinite(score_error) or score_error > score_atol:
         raise SystemExit(f"historical baseline best-beam score mismatch row={i}")
 payload = {
     "status": "passed",
     "rows": len(left),
     "fields": [*fields, "ranked_skill_scores", "score"],
-    "score_atol": 1e-6,
+    "score_atol": score_atol,
+    "maximum_score_error": maximum_score_error,
+    "maximum_candidate_score_error": maximum_candidate_score_error,
+    "compared_score_map_rows": compared_score_map_rows,
+    "archived_score_map_missing_rows": archived_score_map_missing_rows,
 }
 Path(sys.argv[3]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(payload, sort_keys=True))

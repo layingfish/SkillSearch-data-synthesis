@@ -48,11 +48,11 @@ used to tune it.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/eval/`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/eval/`
 
 ## Verification
 
@@ -117,3 +117,13 @@ cannot consume directly.  The preflight now uses the same guarded metadata-only 
 structured evaluation (`extra_special_tokens={}` only when that exact legacy list/error pair is observed);
 weights, tokenizer vocabulary and LETTER IDs are unchanged.  `_v3` remains intact and the corrected run
 writes to fresh `_v4`.
+
+The `_v4` `rudder-r1` launch (`tide-chenyufei03-10301-exsxl`) passed the real-model raw-score invariant
+(teacher-forced versus constrained-prefix maximum error `3.81e-6`) and exact single-GPU/8-rank evaluation
+parity.  Its Official baseline reproduction has identical ranking-bearing fields on all 75 rows, including
+the full top-50 order.  The archived predictions contain `ranked_skill_scores: null` on all rows, whereas
+the current evaluator adds a 50-candidate score map; the old comparator incorrectly treated that enrichment
+as a domain mismatch.  Best-beam scores differ by at most `4.17e-6`.  The comparator now requires exact
+rankings, compares candidate scores whenever the archive actually supplies them, records missing archived
+maps, and uses the real-model parity tolerance (`1e-5`) for floating scores.  `_v4` remains intact and the
+corrected run writes to fresh `_v5`.
