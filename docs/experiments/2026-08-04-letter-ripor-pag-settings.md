@@ -250,3 +250,25 @@ job continued past the save boundary with zero Pod restarts. The dependency cont
 read-only one-node/8-GPU audit as `tide-chenyufei03-10272-wwfru` and advanced to waiting for step 100,000.
 Both the step-50,000 and step-75,000 audits are currently Pending for whole-node capacity; neither blocks
 or changes the locked 200,000-step training protocol.
+
+At the user's request, the formal 200,000-step Msp job was cancelled after its last logged step 85,600;
+Tianzhi removed Pod `tide-chenyufei03-10262-acfvr-worker-0` with zero restarts. This is a pause
+implemented through job cancellation because Tianzhi has no suspend/resume primitive. The atomic
+step-25,000/50,000/75,000
+training states remain on CFS and can be resumed without changing their recorded optimizer, scheduler,
+data position, or per-rank RNG states.
+
+The released node allowed the read-only step-50,000 audit `tide-chenyufei03-10270-uruvn` to complete.
+On the fixed 512-skill panel, every ReLU lexical representation is still all zero:
+`lexical_positive_coordinates=0`, `lexical_max=0`, `lexical_sum=0`, `unique_top1_ids=1`, and
+`unique_unordered_top_sets=1`. The raw-logit maximum mean moved from -18.022705 at step 25,000 to
+-22.290771 at step 50,000 (range -24.75 to -16.875), so the checkpoint is moving farther below the ReLU
+activation boundary rather than approaching lexical recovery. The scale-matched 50,000-step Msp is
+therefore unusable for Set-ID construction under the current implementation/protocol. The step-75,000
+audit is an additional non-selecting diagnostic and does not restart training.
+
+The step-75,000 audit `tide-chenyufei03-10272-wwfru` subsequently completed with the same collapse:
+all lexical statistics are zero, `unique_top1_ids=1`, and `unique_unordered_top_sets=1`. Its raw-logit
+maximum mean is -22.645508 (range -25.125 to -18.25), farther below zero than both step 25,000 and
+step 50,000. More optimization under this unchanged recipe is therefore not supported as a lexical
+recovery mechanism.
