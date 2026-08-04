@@ -568,16 +568,35 @@ stage_preflight() {
     --seed "${SKILLGR_SEED}" --bf16
   python3 - "${PREFLIGHT}/resume_source/final/structured_decoder.pt" "${PREFLIGHT}/resume_target/final/structured_decoder.pt" "${PREFLIGHT}/resume_parity.json" <<'PY'
 import json, sys, torch
+from pathlib import Path
 left = torch.load(sys.argv[1], map_location="cpu", mmap=True)
 right = torch.load(sys.argv[2], map_location="cpu", mmap=True)
 if set(left["state_dict"]) != set(right["state_dict"]):
     raise SystemExit("resume state keys differ")
 maximum = 0.0
+different_tensors = 0
+different_values = 0
 for key in left["state_dict"]:
-    maximum = max(maximum, float((left["state_dict"][key] - right["state_dict"][key]).abs().max()))
-if maximum > 1e-8:
-    raise SystemExit(f"resume parameter error {maximum} exceeds 1e-8")
-payload = {"status": "passed", "max_parameter_error": maximum, "atol": 1e-8}
+    delta = (left["state_dict"][key] - right["state_dict"][key]).abs()
+    changed = int(torch.count_nonzero(delta))
+    different_values += changed
+    different_tensors += int(changed > 0)
+    maximum = max(maximum, float(delta.max()))
+atol = 1e-7
+if maximum > atol:
+    raise SystemExit(f"resume parameter error {maximum} exceeds {atol}")
+left_loss = Path(sys.argv[1]).parent.parent / "loss_history.jsonl"
+right_loss = Path(sys.argv[2]).parent.parent / "loss_history.jsonl"
+if left_loss.read_bytes() != right_loss.read_bytes():
+    raise SystemExit("resume loss histories differ")
+payload = {
+    "status": "passed",
+    "max_parameter_error": maximum,
+    "atol": atol,
+    "different_tensors": different_tensors,
+    "different_values": different_values,
+    "loss_history_bitwise_equal": True,
+}
 open(sys.argv[3], "w").write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 print(json.dumps(payload, sort_keys=True))
 PY

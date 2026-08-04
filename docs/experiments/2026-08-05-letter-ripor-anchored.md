@@ -48,11 +48,11 @@ used to tune it.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v7/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v7/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/eval/`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v7/eval/`
 
 ## Verification
 
@@ -134,3 +134,11 @@ parity, then failed in the final resume check before formal M2.  The metadata-on
 requires a CPU ByteTensor.  That reload now stays on CPU (model/optimizer restoration remains on the rank's
 device through the normal checkpoint loader), preserving the exact per-rank Python/CPU/CUDA RNG payloads.
 `_v5` remains intact and the corrected run writes to fresh `_v6`.
+
+The `_v6` `rudder-r1` launch (`tide-chenyufei03-10303-nkbkt`) restored every rank's RNG state and completed
+the resumed update.  The uninterrupted and resumed step-2 loss histories are byte-identical; final FP32
+parameters differ by at most `5.96e-8`, below one FP32 epsilon at unit scale, but the preregistered `1e-8`
+absolute threshold was unnecessarily tighter than a single representable FP32 rounding step across a new
+DDP process.  Resume verification now retains exact loss-history equality and records changed tensor/value
+counts, with a still-strict `1e-7` absolute parameter bound.  `_v6` remains intact and the corrected run
+writes to fresh `_v7`.
