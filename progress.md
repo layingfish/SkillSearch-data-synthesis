@@ -140,6 +140,11 @@
 - 首个 resume 门禁 `tide-chenyufei03-10260-reiih` 证明每卡 batch32 无 OOM，连续与 2→4-step
   恢复路径末步 loss 相同，最大参数误差仅 `9.313225746154785e-10`；原 bitwise-zero 判据过严，
   已按 Tier-3 数值等价标准显式锁为 `allclose(atol=1e-8)`，需用新作业名复核成功退出。
+- 复核门禁 `tide-chenyufei03-10261-akccc` 已成功：8 卡、每卡 batch32，连续/恢复路径
+  `max_parameter_error=9.313225746154785e-10 < 1e-8`，Pod Completed。
+- 正式官方尺度 `Msp(200000) → Set ID audit → Mset(5000)` 已提交为
+  `tide-chenyufei03-10262-acfvr`，日志 `logs/pag-shared-official200k-0804a.log`；前 100 步无
+  OOM/NaN，实测约 0.6 秒/step，首个 checkpoint 为 step 25000。
 
 ## 错误与处理
 
@@ -151,8 +156,8 @@
 
 ## 下一步
 
-1. 用新作业名复核官方 batch32 显存和 2→4 step `allclose(atol=1e-8)` resume invariant。
-2. 门禁通过后启动 200000-step 正式 Msp，并在每个 25000-step checkpoint 监控表示状态。
+1. 持续监控 `tide-chenyufei03-10262-acfvr`，并在每个 25000-step checkpoint 审计表示状态。
+2. Msp 全量 Set ID 门禁通过后，同一作业继续 Mset 5000 steps。
 3. 有效 Mset 完成后并发运行 PAG-only 与 RIPOR+PAG final，再并发统一评测。
 4. 汇总已完成 B/RIPOR 与待完成 PAG 两组的 subset 指标、delta 和交互项。
 

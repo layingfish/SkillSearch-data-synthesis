@@ -212,3 +212,9 @@ maximum parameter difference of only `9.313225746154785e-10`. It failed solely b
 required bitwise zero across separate CUDA/NCCL process launches. The invariant is now explicitly the
 Tier-3 numerical-equivalence criterion `max_parameter_error <= 1e-8`; the method, data order, RNG restore
 and all formal hyperparameters are unchanged, and a fresh job name is required for the successful rerun.
+
+Fresh gate `tide-chenyufei03-10261-akccc` completed successfully with per-device batch 32 and
+`max_parameter_error=9.313225746154785e-10 < 1e-8`. The formal amended chain was then submitted as
+`tide-chenyufei03-10262-acfvr`; its CFS log is `logs/pag-shared-official200k-0804a.log`. The first 100
+steps ran without OOM or NaN at roughly 0.6 seconds/step. The first recoverable checkpoint is due at step
+25,000; after step 200,000 the full-catalog Set-ID audit remains a hard gate before Mset starts.

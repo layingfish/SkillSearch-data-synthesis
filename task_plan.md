@@ -200,7 +200,8 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
   Mset 前失败：`unique_set_count=1/14551`、最大 token DF ratio=1.0；产物已可恢复隔离。
 - 官方 200k Msp 的 scoped protocol SHA 为
   `0ef4ed4b0060b6b366377357b4bb9278b02ab5f2f5636711004937776a1fa1db`；当前正在做 batch32
-  显存与 exact-resume 的单节点 8 卡门禁，通过后直接启动正式训练。
+  显存与 resume 门禁已由 `tide-chenyufei03-10261-akccc` 通过；正式 Msp→Mset 作业为
+  `tide-chenyufei03-10262-acfvr`。
 - 1000-step 表示审计 `tide-chenyufei03-10259-qxqxc` 已完成，只用于根因判断，不进入结果。
 - corrected full-prefix RIPOR-only `tide-chenyufei03-10247-ctwhg`、B/RIPOR 两套统一评测已完成。
 - 旧 PAG/PAG+RIPOR checkpoint 与评测均在 `invalid_collapsed_pag_set_ids/`，禁止进入结果。
