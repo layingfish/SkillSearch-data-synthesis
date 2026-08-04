@@ -156,3 +156,21 @@ its checkpoint (final loss 0.046081); its outer shell later hit an EOF because t
 edited while that long-lived Bash process was running. New downstream jobs strictly loaded the resulting
 Mset provenance before optimization: PAG-only `tide-chenyufei03-10248-cpaxi` and RIPOR+PAG
 `tide-chenyufei03-10249-uhccs`.
+
+Both final jobs completed, but PAG-only planning evaluation exposed a protocol-critical collapse:
+all 14,551 skills had the same unordered top-64 Set ID, so Official top-1000 candidate recall was zero.
+The 186 unique Official gold skills were all present in training and the manifest, excluding label
+coverage as the cause. The affected Msp/Mset/PAG-only/RIPOR+PAG artifacts and evaluations were moved
+intact to `invalid_collapsed_pag_set_ids/`; they are not eligible for reporting.
+
+Review against official PAG commit `49802454...` also found that Msp had omitted the official
+`RegWeightScheduler`, which quadratically ramps query/doc FLOPS weights during the first third of
+training. Commit `4318e3e` implements the exact schedule, records it in Msp provenance, makes Mset reject
+nonconforming Msp checkpoints, and fails all ranks together if every skill receives the same Set ID.
+Focused jobs `tide-chenyufei03-10255-hggkq` (100-step compressed ramp) and
+`tide-chenyufei03-10256-chxsw` (100-step FLOPS=0) both still collapsed, so FLOPS was not treated as the
+sole cause. The locked 4,700-step Msp→Mset retry is `tide-chenyufei03-10257-vkfsd`.
+
+An additional same-protocol 1,000-step Msp diagnostic, `tide-chenyufei03-10258-djvkx`, is launched only
+to observe when lexical Set-ID diversity appears; it does not replace the locked 4,700-step stage and
+cannot enter downstream training.
