@@ -80,6 +80,7 @@ from skill_gr_pipeline import (  # noqa: E402
     validate_method_setting_contract,
     validate_rank_capacity,
 )
+from distributed_utils import DistributedContext, distributed_epoch_batches_no_padding  # noqa: E402
 from train_letter_rqvae_official import (  # noqa: E402
     compute_last_code_costs,
     minimum_cost_unique_last_codes,
@@ -88,6 +89,27 @@ from train_letter_rqvae_official import (  # noqa: E402
 
 
 class SkillGRPipelineTest(unittest.TestCase):
+    def test_no_padding_distributed_epoch_visits_each_row_once(self) -> None:
+        rows = list(range(19))
+        batches_by_rank = []
+        for rank in range(8):
+            context = DistributedContext(rank=rank, local_rank=rank, world_size=8, device=None)
+            batches_by_rank.append(
+                list(
+                    distributed_epoch_batches_no_padding(
+                        rows,
+                        2,
+                        context,
+                        seed=17,
+                        epoch=3,
+                    )
+                )
+            )
+        self.assertEqual({len(batches) for batches in batches_by_rank}, {2})
+        visited = [value for batches in batches_by_rank for batch in batches for value in batch]
+        self.assertEqual(len(visited), len(rows))
+        self.assertEqual(sorted(visited), rows)
+
     def test_append_loss_history_writes_jsonl_rows(self) -> None:
         import json
         import tempfile
@@ -594,6 +616,36 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(batch["ripor_candidate_positive"].tolist()[0], [True, False])
         self.assertAlmostEqual(float(batch["ripor_candidate_teacher_scores"][0, 0]), 0.8, places=5)
         self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 2, 2))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_ripor_random_negative_sampling_changes_across_presentations(self) -> None:
+        import torch
+
+        semantic_ids = {
+            "skill/a": [1, 1],
+            "skill/b": [2, 2],
+            "skill/c": [3, 3],
+            "skill/d": [4, 4],
+        }
+        row = {"index": "query-1", "selected_skill_ids": ["skill/a"]}
+        candidates = {"index:query-1": ["skill/b", "skill/c", "skill/d"]}
+        scores = {"index:query-1": {"skill/a": 1.0, "skill/b": 0.3, "skill/c": 0.2, "skill/d": 0.1}}
+        sampled_codes = set()
+        for seed in range(8):
+            batch = build_ripor_candidate_batch(
+                [row],
+                semantic_ids,
+                depth=2,
+                max_negatives=1,
+                hard_negative_map=candidates,
+                teacher_score_map=scores,
+                seed=seed,
+                device=torch.device("cpu"),
+                require_teacher_scores=True,
+                negative_sampling="random",
+            )
+            sampled_codes.add(tuple(batch["ripor_candidate_codes"][0, 1].tolist()))
+        self.assertGreater(len(sampled_codes), 1)
 
     def test_letter_tokenizer_manifest_pins_external_lightgcn_semantic_ids(self) -> None:
         semantic_ids = {"a": [1, 2], "b": [3, 4]}

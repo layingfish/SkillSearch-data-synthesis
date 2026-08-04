@@ -297,6 +297,35 @@ PAG 进入 Mset 前的门禁不得只检查 `unique_set_count > 1`。全量报�
 比例、raw positive-coordinate 分布、unique-set ratio 和最大 token DF ratio；在官方参考分布或预注册
 阈值形成前，任何 near-collapse 都需要人工复核，不能自动放行。
 
+### 8.3 2026-08-05 baseline-anchored RIPOR 执行协议
+
+当前只推进 RIPOR；PAG Msp 保持停止。使用一个 `SCI_rudder` 节点（Tianzhi queue=`rudder-exper`，8×A800），但正式任务必须在
+以下 fail-closed gate 全部通过后才可由同一提交链继续：
+
+1. `B` 是历史 mode3 CE/LETTER checkpoint 的独立执行路径，固定 log-softmax beam；不得复用
+   RIPOR-tuned backbone。固定 panel 上逐条核对 SID、candidate、顺序和 score，`gate=0` 必须完全
+   绕过 RIPOR generation/union/reorder 并与 `B` 一致。
+2. 模型新增独立无 bias position-specific RIPOR head，复制 `B` 的 code-head weight 初始化但不复制
+   bias。记录 seed、BOS/position/code 映射、T5 scale、可训练参数和 state SHA。RIPOR train/decode
+   只使用该 head 的 raw cumulative conditional logits；control/EOS 不计入 DocID rank score。
+3. 训练顺序锁为 M2 full-SID 5k → M3 prefix 1/2/3/4 各 2.5k（阶段 i 同时保留 1..i）→ 冻结 M3
+   raw beam 挖掘 self-negative → M4 full-SID 5k。每阶段重置 AdamW/linear scheduler，LR=1e-4、
+   weight decay=0、warmup=0、每卡 batch=8、world size=8、BF16、动态采样一个 scored negative。
+4. M3 mining 对未展开 source query 无 padding 分片，每条恰好一次，rank 0 按原 index 合并。只保留
+   冻结 teacher 有数值分数的 R_raw 误检；全部 sibling GT 先排除，无有效负例记 audit skip。seal
+   artifact 记录 M3 checkpoint、teacher panel、rows、candidate 和 manifest SHA；M4 只读该 artifact。
+5. 输出严格分成 `B`、纯 `R_raw`、诊断 `R_logprob` 和 `B_union_R_anchor`。集成层固定 candidate
+   去重、query 内 score calibration、anchor 公式和 skill-id tie-break，记录 candidate 来源和各来源
+   gold coverage；Official/private 不参与权重选择。
+6. 提交前必须通过真实模型 train/decode raw-score allclose、alpha/divergence/pair count、缺 teacher
+   score fail-closed、单进程 global-batch 对 8-rank 梯度等价，以及 model/optimizer/scheduler/RNG/
+   sampler-position resume invariant。未解决 HIGH 时不得启动正式 optimizer step。
+7. RIPOR 训练的每个 epoch 不允许 DDP padding 重复样本；短尾批的空 rank 只能执行图连通的
+   zero-weight dummy，并验证非整除 global batch 下 1 卡与 8 卡梯度一致。
+
+这套协议把 RIPOR decoder-side 核心与项目集成层分开：`R_raw` 单独衡量 RIPOR，anchored union
+衡量在不删除 baseline 候选路径前提下的集成收益；后者不得被表述为纯 RIPOR 复现。
+
 ## 9. 测评设计
 
 ### 9.1 数据切分

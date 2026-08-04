@@ -180,6 +180,35 @@ def distributed_epoch_batches(
         yield [rows[index] for index in local_indices]
 
 
+def distributed_epoch_batches_no_padding(
+    rows: list[T],
+    per_device_batch_size: int,
+    context: DistributedContext,
+    *,
+    seed: int,
+    epoch: int,
+) -> Iterable[list[T]]:
+    """Yield deterministic local batches without duplicating tail examples.
+
+    Every rank yields the same number of steps.  A rank whose slice of the
+    final global batch is empty yields an empty list; model-specific callers
+    must execute a graph-connected zero-loss dummy so DDP collectives remain
+    aligned without adding that dummy to the objective.
+    """
+    if per_device_batch_size < 1:
+        raise ValueError(f"per_device_batch_size must be positive, got {per_device_batch_size}")
+    if not rows:
+        raise ValueError("cannot make distributed batches from an empty row set")
+    indices = list(range(len(rows)))
+    random.Random(int(seed) + int(epoch)).shuffle(indices)
+    global_batch_size = per_device_batch_size * context.world_size
+    for start in range(0, len(indices), global_batch_size):
+        global_indices = indices[start : start + global_batch_size]
+        local_start = context.rank * per_device_batch_size
+        local_indices = global_indices[local_start : local_start + per_device_batch_size]
+        yield [rows[index] for index in local_indices]
+
+
 def shard_with_indices(rows: list[T], context: DistributedContext) -> list[tuple[int, T]]:
     """Shard inference/evaluation without padding, duplication, or reordering."""
     return [(index, rows[index]) for index in range(context.rank, len(rows), context.world_size)]

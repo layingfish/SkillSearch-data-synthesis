@@ -80,6 +80,48 @@ def main() -> None:
         rtol=2e-5,
         atol=2e-6,
     )
+
+    # Non-divisible tail invariant: only ranks 0..2 own one real example;
+    # every other rank executes a graph-connected zero-weight dummy.  The DDP
+    # gradient must equal the same three-example objective on one device.
+    tail_core = nn.Linear(3, 2, bias=False, dtype=dtype).to(device)
+    with torch.no_grad():
+        tail_core.weight.copy_(unwrap_model(model).weight.detach())
+    tail_model = wrap_ddp(tail_core, context)
+    tail_x_all = torch.tensor(
+        [[0.2, -0.4, 0.6], [1.0, 0.5, -0.5], [-0.3, 0.8, 0.1]],
+        dtype=dtype,
+        device=device,
+    )
+    tail_y_all = torch.tensor(
+        [[0.1, -0.2], [0.7, 0.3], [-0.4, 0.9]],
+        dtype=dtype,
+        device=device,
+    )
+    owns_example = context.rank < len(tail_x_all)
+    local_tail_x = tail_x_all[context.rank : context.rank + 1] if owns_example else tail_x_all[:1]
+    local_tail_y = tail_y_all[context.rank : context.rank + 1] if owns_example else tail_y_all[:1]
+    local_tail_weight = torch.tensor(float(owns_example), dtype=dtype, device=device)
+    local_tail_prediction = tail_model(local_tail_x)
+    local_tail_sum = (local_tail_prediction - local_tail_y).square().sum() * local_tail_weight
+    local_tail_count = local_tail_weight * local_tail_prediction.shape[-1]
+    global_normalized_loss(local_tail_sum, local_tail_count, context).backward()
+    tail_ddp_gradient = unwrap_model(tail_model).weight.grad.detach().clone()
+
+    tail_reference = nn.Linear(3, 2, bias=False, dtype=dtype).to(device)
+    with torch.no_grad():
+        tail_reference.weight.copy_(unwrap_model(tail_model).weight.detach())
+    tail_reference_loss = (tail_reference(tail_x_all) - tail_y_all).square().mean()
+    tail_reference_loss.backward()
+    tail_reference_gradient = tail_reference.weight.grad.detach()
+    torch.testing.assert_close(tail_ddp_gradient, tail_reference_gradient, rtol=2e-5, atol=2e-6)
+    gathered_tail_gradients = all_gather_tensor(tail_ddp_gradient.unsqueeze(0), context)
+    torch.testing.assert_close(
+        gathered_tail_gradients,
+        tail_ddp_gradient.unsqueeze(0).expand_as(gathered_tail_gradients),
+        rtol=2e-5,
+        atol=2e-6,
+    )
     if context.is_main:
         print(
             json.dumps(
@@ -88,6 +130,11 @@ def main() -> None:
                     "world_size": context.world_size,
                     "global_count": float(all_mask.sum().cpu()),
                     "max_gradient_error": float((ddp_gradient - reference_gradient).abs().max().cpu()),
+                    "nondivisible_tail_invariant": "passed",
+                    "tail_real_examples": len(tail_x_all),
+                    "tail_max_gradient_error": float(
+                        (tail_ddp_gradient - tail_reference_gradient).abs().max().cpu()
+                    ),
                 },
                 sort_keys=True,
             ),

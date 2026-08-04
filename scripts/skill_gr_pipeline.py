@@ -28,6 +28,7 @@ from distributed_utils import (
     barrier,
     destroy_distributed,
     distributed_epoch_batches,
+    distributed_epoch_batches_no_padding,
     global_normalized_loss,
     initialize_distributed,
     reduce_sum_count,
@@ -77,9 +78,11 @@ LETTER_METHOD_SETTINGS = (
 PAG_SEQUENTIAL_ONLY_PREFIXES = (
     "sid_embedding.",
     "code_heads.",
+    "ripor_heads.",
     "dedup_head.",
     "control_head.",
 )
+RIPOR_OPTIONAL_STATE_PREFIXES = ("ripor_heads.", "ripor_doc_embeddings.")
 
 
 def pag_quadratic_regularization_weight(
@@ -128,6 +131,20 @@ def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def module_state_sha256(module) -> str:
+    """Hash a torch module state without serialization-version dependence."""
+    import torch
+
+    digest = hashlib.sha256()
+    for key, value in sorted(module.state_dict().items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -209,6 +226,10 @@ def save_structured_decoder_checkpoint(
         "seed": seed,
         "training_formulation": training_formulation,
     }
+    if hasattr(model, "code_heads"):
+        payload["ce_code_head_state_sha256"] = module_state_sha256(model.code_heads)
+    if hasattr(model, "ripor_heads"):
+        payload["ripor_head_state_sha256"] = module_state_sha256(model.ripor_heads)
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     if extra:
@@ -237,7 +258,7 @@ def load_structured_decoder_checkpoint(
                 f"checkpoint={checkpoint_mode}, requested={expected_mode}"
             )
     missing_keys, unexpected_keys = model.load_state_dict(checkpoint["state_dict"], strict=False)
-    optional_missing_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+    optional_missing_prefixes = (*RIPOR_OPTIONAL_STATE_PREFIXES, "pag_set_head.")
     unexpected_required = [key for key in unexpected_keys if not key.startswith(optional_missing_prefixes)]
     missing_required = [key for key in missing_keys if not key.startswith(optional_missing_prefixes)]
     if unexpected_required or missing_required:
@@ -245,6 +266,13 @@ def load_structured_decoder_checkpoint(
             "structured decoder checkpoint parameter mismatch: "
             f"missing={missing_required[:5]}, unexpected={unexpected_required[:5]}"
         )
+    ripor_head_initialized_from_code_heads = False
+    if any(key.startswith("ripor_heads.") for key in missing_keys):
+        initializer = getattr(model, "initialize_ripor_heads_from_code_heads", None)
+        if initializer is None:
+            raise ValueError("legacy decoder is missing RIPOR heads but the model cannot initialize them")
+        initializer()
+        ripor_head_initialized_from_code_heads = True
     optimizer_state_loaded = False
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         try:
@@ -261,6 +289,7 @@ def load_structured_decoder_checkpoint(
             for group in optimizer.param_groups:
                 group["lr"] = lr
     checkpoint["optimizer_state_loaded"] = optimizer_state_loaded
+    checkpoint["ripor_head_initialized_from_code_heads"] = ripor_head_initialized_from_code_heads
     return checkpoint
 
 
@@ -1652,6 +1681,7 @@ def build_ripor_candidate_batch(
     seed: int,
     device,
     require_teacher_scores: bool = False,
+    negative_sampling: str = "top",
 ) -> dict[str, Any]:
     """Build teacher-forced SID paths for RIPOR relevance-prefix ranking.
 
@@ -1664,6 +1694,8 @@ def build_ripor_candidate_batch(
 
     if max_negatives < 0:
         raise ValueError(f"ripor max negatives must be non-negative, got {max_negatives}")
+    if negative_sampling not in {"top", "random"}:
+        raise ValueError(f"unknown RIPOR negative sampling mode: {negative_sampling}")
     known_skill_ids = sorted(semantic_ids)
     known_skill_set = set(known_skill_ids)
     positives_by_row = [ripor_positive_skill_ids(row, semantic_ids) for row in rows]
@@ -1673,19 +1705,37 @@ def build_ripor_candidate_batch(
     candidate_lists: list[list[str]] = []
     for row, positives in zip(rows, positives_by_row):
         exclusion_set = ranking_excluded_skill_ids(row, known_skill_set)
+        stable_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{retrieval_row_keys(row)[0]}".encode("utf-8")).digest()[:8],
+            byteorder="big",
+        )
+        candidate_pool = [
+            sid
+            for sid in ranked_candidates_for_row(row, hard_negative_map)
+            if sid in semantic_ids and sid not in exclusion_set
+        ]
+        candidate_pool = _unique_preserving_order(candidate_pool)
+        if negative_sampling == "random":
+            random.Random(stable_seed).shuffle(candidate_pool)
         negatives: list[str] = []
-        for sid in [*ranked_candidates_for_row(row, hard_negative_map), *in_batch_positives]:
+        for sid in candidate_pool:
             if sid in semantic_ids and sid not in exclusion_set and sid not in negatives:
                 negatives.append(sid)
                 if len(negatives) >= max_negatives:
                     break
         if len(negatives) < max_negatives:
-            stable_seed = int.from_bytes(
-                hashlib.sha256(f"{seed}:{retrieval_row_keys(row)[0]}".encode("utf-8")).digest()[:8],
-                byteorder="big",
-            )
+            if require_teacher_scores:
+                raise ValueError(
+                    "strict RIPOR sampling requires enough mined, teacher-scored negatives; "
+                    f"needed={max_negatives}, available={len(negatives)}, row={row.get('index')}"
+                )
             rng = random.Random(stable_seed)
-            random_pool = [sid for sid in known_skill_ids if sid not in exclusion_set and sid not in negatives]
+            random_pool = [
+                sid
+                for sid in [*in_batch_positives, *known_skill_ids]
+                if sid not in exclusion_set and sid not in negatives
+            ]
+            random_pool = _unique_preserving_order(random_pool)
             rng.shuffle(random_pool)
             negatives.extend(random_pool[: max_negatives - len(negatives)])
         candidate_lists.append([*positives, *negatives[:max_negatives]])
@@ -3158,10 +3208,13 @@ def validate_method_setting_contract(args: argparse.Namespace, *, pag_set_enable
         raise ValueError(
             f"method setting {setting} keeps fixed LETTER IDs and cannot take RIPOR M0/RQ ID initialization"
         )
-    if not bool(getattr(args, "reset_optimizer", False)):
+    resume_from_checkpoint = getattr(args, "resume_from_checkpoint", None)
+    if not bool(getattr(args, "reset_optimizer", False)) and not resume_from_checkpoint:
         raise ValueError(
             f"method setting {setting} requires --reset-optimizer so every arm starts a fresh optimizer"
         )
+    if resume_from_checkpoint and bool(getattr(args, "reset_optimizer", False)):
+        raise ValueError("resumed method training must restore, not reset, the optimizer")
     if bool(getattr(args, "pag_set_stage_only", False)) or getattr(args, "pag_sparse_checkpoint", None):
         raise ValueError(
             f"method setting {setting} is a final project arm; train the shared Msp/Mset stage separately"
@@ -4147,12 +4200,17 @@ def make_structured_t5_sid_model(
                 structured_sid_vocab_size(self.codebook_size, self.depth, self.dedup_size),
                 d_model,
             )
-            # Keep the established fixed-LETTER decoder parameterization.  Its
-            # position-specific heads include learned biases, and RIPOR changes
-            # the ranking objective rather than replacing those heads.
+            # Keep the established fixed-LETTER CE decoder parameterization
+            # untouched.  RIPOR has a separate bias-free position-specific
+            # output table: its raw dot-product scores must not train through
+            # the legacy CE biases or replace the baseline log-probability path.
             self.code_heads = nn.ModuleList(
                 nn.Linear(d_model, self.codebook_size, bias=True) for _ in range(self.depth)
             )
+            self.ripor_heads = nn.ModuleList(
+                nn.Linear(d_model, self.codebook_size, bias=False) for _ in range(self.depth)
+            )
+            self.initialize_ripor_heads_from_code_heads()
             self.dedup_head = (
                 nn.Linear(d_model, self.dedup_size)
                 if self.semantic_id_mode == SEMANTIC_ID_MODE_DEDUP
@@ -4174,6 +4232,7 @@ def make_structured_t5_sid_model(
                         stop = start + self.codebook_size
                         self.sid_embedding.weight[start:stop].copy_(codebooks[level])
                         self.code_heads[level].weight.copy_(codebooks[level])
+                        self.ripor_heads[level].weight.copy_(codebooks[level])
                         if self.code_heads[level].bias is not None:
                             self.code_heads[level].bias.zero_()
             # PAG's lexical branch uses the T5 LM head over a one-token
@@ -4186,6 +4245,16 @@ def make_structured_t5_sid_model(
                     "PAG set vocabulary must match the T5 LM head vocabulary: "
                     f"manifest={self.pag_set_vocab_size}, model={self.backbone.config.vocab_size}"
                 )
+
+        @torch.no_grad()
+        def initialize_ripor_heads_from_code_heads(self) -> None:
+            """Initialize the bias-free RIPOR tables from fixed-LETTER weights."""
+            if len(self.ripor_heads) != len(self.code_heads):
+                raise ValueError("RIPOR/CE position-specific head depth mismatch")
+            for ripor_head, code_head in zip(self.ripor_heads, self.code_heads):
+                if tuple(ripor_head.weight.shape) != tuple(code_head.weight.shape):
+                    raise ValueError("RIPOR/CE position-specific head shape mismatch")
+                ripor_head.weight.copy_(code_head.weight)
 
         def configure_distributed(self, context: DistributedContext | None) -> None:
             self.distributed_context = context
@@ -4308,7 +4377,7 @@ def make_structured_t5_sid_model(
             cumulative = hidden.new_zeros(batch_size * candidate_count)
             prefixes = []
             flat_codes = candidate_codes.reshape(batch_size * candidate_count, rank_depth)
-            for level, head in enumerate(self.code_heads):
+            for level, head in enumerate(self.ripor_heads):
                 logits = head(hidden[:, level, :])
                 selected = logits.gather(1, flat_codes[:, level : level + 1]).squeeze(1)
                 cumulative = cumulative + selected
@@ -4344,6 +4413,7 @@ def make_structured_t5_sid_model(
             temperature: float,
             candidate_teacher_scores=None,
             candidate_teacher_observed=None,
+            row_weights=None,
             alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
             prefix_max_length: int | None = None,
             decoder_prefix_input_ids=None,
@@ -4416,8 +4486,13 @@ def make_structured_t5_sid_model(
                         "RIPOR prefix loss/mask shape mismatch: "
                         f"loss={tuple(pair_losses.shape)}, mask={tuple(diverged.shape)}"
                     )
-                loss_sum = loss_sum + (pair_losses * diverged).sum()
-                pair_count = pair_count + diverged.sum()
+                row_weight = (
+                    row_weights[row_index].to(device=prefix_scores.device, dtype=prefix_scores.dtype)
+                    if row_weights is not None
+                    else prefix_scores.new_tensor(1.0)
+                )
+                loss_sum = loss_sum + (pair_losses * diverged).sum() * row_weight
+                pair_count = pair_count + diverged.sum() * row_weight
             return loss_sum, pair_count, prefix_scores
 
         def forward(
@@ -4433,6 +4508,7 @@ def make_structured_t5_sid_model(
             ripor_candidate_positive=None,
             ripor_candidate_teacher_scores=None,
             ripor_candidate_teacher_observed=None,
+            training_sample_weights=None,
             ripor_loss_weight: float = 0.0,
             ripor_margin: float = 1.0,
             ripor_temperature: float = 1.0,
@@ -4468,26 +4544,40 @@ def make_structured_t5_sid_model(
                 decoder_prefix_input_ids=pag_prefix_ids,
                 decoder_prefix_attention_mask=pag_prefix_mask,
             )
+            if training_sample_weights is None:
+                training_sample_weights = hidden.new_ones(hidden.shape[0])
+            training_sample_weights = training_sample_weights.to(device=hidden.device, dtype=hidden.dtype)
+            if training_sample_weights.ndim != 1 or training_sample_weights.shape[0] != hidden.shape[0]:
+                raise ValueError("structured training sample weights must have shape [batch]")
+            token_sample_weights = training_sample_weights[:, None].expand_as(target_types)
             loss_sum = hidden.new_tensor(0.0)
             token_count = hidden.new_tensor(0.0)
             for level, head in enumerate(self.code_heads):
                 mask = target_types == level
                 if mask.any():
-                    loss_sum = loss_sum + F.cross_entropy(head(hidden[mask]), labels[mask], reduction="sum")
-                    token_count = token_count + mask.sum()
+                    weights = token_sample_weights[mask]
+                    per_token = F.cross_entropy(head(hidden[mask]), labels[mask], reduction="none")
+                    loss_sum = loss_sum + (per_token * weights).sum()
+                    token_count = token_count + weights.sum()
             if self.dedup_head is not None:
                 dedup_mask = target_types == self.depth
                 if dedup_mask.any():
-                    loss_sum = loss_sum + F.cross_entropy(
+                    weights = token_sample_weights[dedup_mask]
+                    per_token = F.cross_entropy(
                         self.dedup_head(hidden[dedup_mask]),
                         labels[dedup_mask],
-                        reduction="sum",
+                        reduction="none",
                     )
-                    token_count = token_count + dedup_mask.sum()
+                    loss_sum = loss_sum + (per_token * weights).sum()
+                    token_count = token_count + weights.sum()
             control_mask = target_types == self.control_type
             if control_mask.any():
-                loss_sum = loss_sum + F.cross_entropy(self.control_head(hidden[control_mask]), labels[control_mask], reduction="sum")
-                token_count = token_count + control_mask.sum()
+                weights = token_sample_weights[control_mask]
+                per_token = F.cross_entropy(
+                    self.control_head(hidden[control_mask]), labels[control_mask], reduction="none"
+                )
+                loss_sum = loss_sum + (per_token * weights).sum()
+                token_count = token_count + weights.sum()
             ce_loss = self._normalize_loss(loss_sum, token_count, global_loss_normalization)
             ripor_loss_sum = hidden.new_tensor(0.0)
             ripor_pair_count = hidden.new_tensor(0.0)
@@ -4511,6 +4601,7 @@ def make_structured_t5_sid_model(
                     candidate_valid=ripor_candidate_valid,
                     candidate_positive=ripor_candidate_positive,
                     candidate_teacher_scores=ripor_candidate_teacher_scores,
+                    row_weights=training_sample_weights,
                     margin=ripor_margin,
                     temperature=ripor_temperature,
                     alpha_beta=ripor_alpha_beta,
@@ -4524,6 +4615,15 @@ def make_structured_t5_sid_model(
                     global_loss_normalization,
                 )
             loss = float(sequential_ce_weight) * ce_loss + float(ripor_loss_weight) * ripor_loss
+            if float(ripor_loss_weight) == 0.0:
+                # A custom catalog→RIPOR run keeps the ranking heads trainable
+                # for the later query stage.  Touch each parameter with an
+                # exact graph-connected zero during catalog CE so DDP does not
+                # classify those parameters as unused between iterations.
+                for head in self.ripor_heads:
+                    for parameter in head.parameters():
+                        if parameter.requires_grad:
+                            loss = loss + parameter.reshape(-1)[0] * 0.0
             pag_set_loss_sum = hidden.new_tensor(0.0)
             pag_set_count = hidden.new_tensor(0.0)
             pag_set_loss = hidden.new_tensor(0.0)
@@ -4631,6 +4731,7 @@ def make_structured_t5_sid_model(
             decoder_input_ids,
             decoder_attention_mask,
             target_type: int,
+            ripor_score: bool = False,
             decoder_prefix_input_ids=None,
             decoder_prefix_attention_mask=None,
         ):
@@ -4642,7 +4743,7 @@ def make_structured_t5_sid_model(
                 decoder_prefix_input_ids=decoder_prefix_input_ids,
                 decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
-            return self.logits_for_hidden_type(hidden, target_type)
+            return self.logits_for_hidden_type(hidden, target_type, ripor_score=ripor_score)
 
         @torch.no_grad()
         def logits_for_next_type_from_encoder(
@@ -4652,6 +4753,7 @@ def make_structured_t5_sid_model(
             decoder_input_ids,
             decoder_attention_mask,
             target_type: int,
+            ripor_score: bool = False,
             decoder_prefix_input_ids=None,
             decoder_prefix_attention_mask=None,
         ):
@@ -4663,12 +4765,13 @@ def make_structured_t5_sid_model(
                 decoder_prefix_input_ids=decoder_prefix_input_ids,
                 decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
-            return self.logits_for_hidden_type(hidden, target_type)
+            return self.logits_for_hidden_type(hidden, target_type, ripor_score=ripor_score)
 
-        def logits_for_hidden_type(self, hidden, target_type: int):
+        def logits_for_hidden_type(self, hidden, target_type: int, ripor_score: bool = False):
             last_hidden = hidden[:, -1, :]
             if target_type < self.depth:
-                return self.code_heads[target_type](last_hidden)
+                heads = self.ripor_heads if ripor_score else self.code_heads
+                return heads[target_type](last_hidden)
             if self.dedup_head is not None and target_type == self.depth:
                 return self.dedup_head(last_hidden)
             if target_type == self.control_type:
@@ -4781,6 +4884,11 @@ def structured_sid_batch(
         "decoder_attention_mask": torch.tensor(decoder_attention_mask, dtype=torch.long, device=device),
         "target_types": torch.tensor(target_types, dtype=torch.long, device=device),
         "labels": torch.tensor(labels, dtype=torch.long, device=device),
+        "training_sample_weights": torch.tensor(
+            [float(row.get("_distributed_sample_weight", 1.0)) for row in rows],
+            dtype=torch.float32,
+            device=device,
+        ),
     }
     if pag_set_token_ids:
         if pag_set_vocab_size <= 0:
@@ -4936,6 +5044,62 @@ def _run_distributed_structured_training(
         "warmup_steps": warmup_steps,
         "total_steps": total_optimizer_steps,
     }
+    use_no_padding_sampler = checkpoint_metadata.get("method_setting") == METHOD_SETTING_RIPOR
+    checkpoint_metadata["distributed_sampler"] = (
+        "no_padding_graph_zero_tail_v1" if use_no_padding_sampler else "padded_equal_batch_v1"
+    )
+    resume_payload = None
+    resume_training_state = None
+    if getattr(args, "resume_from_checkpoint", None):
+        if catalog_total_steps != 0:
+            raise ValueError("structured resume currently requires catalog_max_steps=0")
+        if args.init_model_dir != args.resume_from_checkpoint:
+            raise ValueError("--resume-from-checkpoint must also be the exact --init-model-dir")
+        resume_payload = torch.load(
+            args.resume_from_checkpoint / "structured_decoder.pt",
+            map_location=device,
+        )
+        resume_training_state = resume_payload.get("training_state")
+        if not isinstance(resume_training_state, dict):
+            raise ValueError("resume checkpoint is missing training_state")
+        if int(resume_training_state.get("world_size", -1)) != context.world_size:
+            raise ValueError("resume checkpoint world size does not match the current job")
+        if int(resume_training_state.get("total_steps", -1)) != query_total_steps:
+            raise ValueError("resume checkpoint total steps do not match the current stage")
+        scheduler_state = resume_training_state.get("scheduler_state_dict")
+        if not isinstance(scheduler_state, dict):
+            raise ValueError("resume checkpoint is missing scheduler state")
+        scheduler.load_state_dict(scheduler_state)
+        saved_optimizer_groups = (resume_payload.get("optimizer_state_dict") or {}).get("param_groups")
+        if not isinstance(saved_optimizer_groups, list) or len(saved_optimizer_groups) != len(optimizer.param_groups):
+            raise ValueError("resume checkpoint optimizer parameter groups do not match the current optimizer")
+        # LambdaLR performs an initialization step when it is constructed and
+        # can overwrite the optimizer's restored in-flight LR.  Reapply the
+        # checkpoint LR after loading the scheduler so the very next update is
+        # identical to an uninterrupted run.
+        for optimizer_group, saved_group in zip(optimizer.param_groups, saved_optimizer_groups):
+            optimizer_group["lr"] = float(saved_group["lr"])
+        rng_states = resume_training_state.get("rng_states")
+        if not isinstance(rng_states, list) or len(rng_states) != context.world_size:
+            raise ValueError("resume checkpoint is missing one RNG state per rank")
+        rank_rng = rng_states[context.rank]
+        random.setstate(rank_rng["python"])
+        torch.set_rng_state(rank_rng["torch"])
+        if torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rank_rng["cuda"])
+
+    def capture_rng_states() -> list[dict[str, Any]]:
+        local_state = {
+            "rank": context.rank,
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        }
+        states = all_gather_object(local_state, context)
+        states.sort(key=lambda item: int(item["rank"]))
+        if len(states) != context.world_size:
+            raise RuntimeError("failed to collect one structured-training RNG state per rank")
+        return states
 
     def save_checkpoint(directory: Path, extra: dict[str, Any]) -> None:
         if context.is_main:
@@ -4976,23 +5140,60 @@ def _run_distributed_structured_training(
                 "best_dev_loss": initial_best_loss,
                 "best_checkpoint": str(args.init_model_dir) if initial_best_loss is not None and args.init_model_dir else None,
             }
+        stage_ce_weight = (
+            1.0 if stage_name == "catalog" else float(getattr(args, "sequential_ce_weight", 1.0))
+        )
         best_loss = initial_best_loss
         best_checkpoint = args.init_model_dir if best_loss is not None else None
         step = 0
         epoch_index = 0
+        resume_batch_index = 0
+        if resume_training_state is not None:
+            if stage_name != str(resume_training_state.get("stage")):
+                raise ValueError(
+                    f"resume stage mismatch: current={stage_name}, saved={resume_training_state.get('stage')}"
+                )
+            step = int(resume_training_state.get("completed_steps", 0))
+            epoch_index = int(resume_training_state.get("next_epoch", 0))
+            resume_batch_index = int(resume_training_state.get("next_batch_index", 0))
+            if step < 0 or step >= total_steps:
+                raise ValueError(f"invalid resumed step {step} for total_steps={total_steps}")
         last_metrics: dict[str, float] | None = None
         steps_per_epoch = max(1, math.ceil(len(stage_rows) / (args.batch_size * context.world_size)))
         model.train()
         while step < total_steps:
-            for batch_rows in distributed_epoch_batches(
+            batch_iterator = (
+                distributed_epoch_batches_no_padding
+                if use_no_padding_sampler
+                else distributed_epoch_batches
+            )
+            for batch_index, raw_batch_rows in enumerate(batch_iterator(
                 stage_rows,
                 args.batch_size,
                 context,
                 seed=args.seed + (10_000 if stage_name == "catalog" else 0),
                 epoch=epoch_index,
-            ):
+            )):
+                if batch_index < resume_batch_index:
+                    continue
                 if step >= total_steps:
                     break
+                # RIPOR must see every source query exactly once per epoch.  On
+                # a short final global batch, ranks without a real example run
+                # the first row with zero sample weight so all DDP parameters
+                # stay graph-connected without duplicating objective mass.
+                if use_no_padding_sampler:
+                    if raw_batch_rows:
+                        batch_rows = [
+                            {**row, "_distributed_sample_weight": 1.0}
+                            for row in raw_batch_rows
+                        ]
+                    else:
+                        batch_rows = [
+                            {**stage_rows[0], "_distributed_sample_weight": 0.0}
+                        ]
+                else:
+                    batch_rows = raw_batch_rows
                 batch = structured_sid_batch(
                     batch_rows,
                     tokenizer,
@@ -5014,7 +5215,7 @@ def _run_distributed_structured_training(
                 batch["pag_query_prefix_max_length"] = int(
                     getattr(args, "pag_query_prefix_max_length", DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH)
                 )
-                batch["sequential_ce_weight"] = float(getattr(args, "sequential_ce_weight", 1.0))
+                batch["sequential_ce_weight"] = stage_ce_weight
                 if use_ripor:
                     batch.update(
                         build_ripor_candidate_batch(
@@ -5027,6 +5228,7 @@ def _run_distributed_structured_training(
                             seed=args.seed + step,
                             device=device,
                             require_teacher_scores=not args.ripor_allow_weak_teacher,
+                            negative_sampling=args.ripor_negative_sampling,
                         )
                     )
                     batch.update(
@@ -5036,6 +5238,9 @@ def _run_distributed_structured_training(
                             "ripor_temperature": args.ripor_temperature,
                             "ripor_alpha_beta": args.ripor_alpha_beta,
                             "ripor_prefix_max_length": (
+                                int(args.ripor_prefix_max_length)
+                                if int(getattr(args, "ripor_prefix_max_length", 0) or 0) > 0
+                                else
                                 max(
                                     1,
                                     min(
@@ -5079,12 +5284,17 @@ def _run_distributed_structured_training(
                 scheduler.step()
                 step += 1
                 display_step = step + step_offset
+                next_epoch = epoch_index
+                next_batch_index = batch_index + 1
+                if next_batch_index >= steps_per_epoch:
+                    next_epoch += 1
+                    next_batch_index = 0
                 should_log = step % args.logging_steps == 0 or step == total_steps
                 if should_log:
                     last_metrics = _structured_global_train_metrics(components, context)
                     pag_set_weight = float(getattr(args, "pag_set_loss_weight", 0.0))
                     ripor_weight = float(getattr(args, "ripor_loss_weight", 0.0))
-                    ce_weight = float(getattr(args, "sequential_ce_weight", 1.0))
+                    ce_weight = stage_ce_weight
                     train_loss = ce_weight * last_metrics["ce_loss"] + (
                         ripor_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
                     ) + pag_set_weight * last_metrics["pag_set_loss"]
@@ -5105,6 +5315,27 @@ def _run_distributed_structured_training(
                         }
                         append_loss_history(loss_history_path, event)
                         log_training_event(wandb_run, event)
+                if args.save_steps > 0 and step % args.save_steps == 0 and step < total_steps:
+                    rng_states = capture_rng_states()
+                    save_checkpoint(
+                        args.output_dir / f"checkpoint-{display_step}",
+                        {
+                            **checkpoint_metadata,
+                            "training_state": {
+                                "format": "structured_ddp_resume_v1",
+                                "stage": stage_name,
+                                "completed_steps": step,
+                                "display_step": display_step,
+                                "total_steps": total_steps,
+                                "next_epoch": next_epoch,
+                                "next_batch_index": next_batch_index,
+                                "world_size": context.world_size,
+                                "per_device_batch_size": args.batch_size,
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "rng_states": rng_states,
+                            },
+                        },
+                    )
                 if eval_rows and args.eval_steps > 0 and (step % args.eval_steps == 0 or step == total_steps):
                     dev_loss = _distributed_structured_eval_loss(
                         model,
@@ -5147,13 +5378,14 @@ def _run_distributed_structured_training(
                             },
                         )
             epoch_index += 1
+            resume_batch_index = 0
         if last_metrics is None:
             # This branch is only reachable when logging_steps is invalid; keep
             # an explicit error instead of silently writing rank-local metrics.
             raise RuntimeError("training stage completed without a globally reduced loss event")
         return {
             "steps": step,
-            "last_train_loss": float(getattr(args, "sequential_ce_weight", 1.0)) * last_metrics["ce_loss"] + (
+            "last_train_loss": stage_ce_weight * last_metrics["ce_loss"] + (
                 float(getattr(args, "ripor_loss_weight", 0.0)) * last_metrics["ripor_loss"] if use_ripor else 0.0
             ) + float(getattr(args, "pag_set_loss_weight", 0.0)) * last_metrics["pag_set_loss"],
             "last_ce_loss": last_metrics["ce_loss"],
@@ -5285,7 +5517,14 @@ def _initialize_structured_training_model(
         ripor_codebook_embeddings=getattr(args, "ripor_codebook_embeddings", None),
         ripor_relevance_checkpoint=getattr(args, "ripor_relevance_checkpoint", None),
     ).to(context.device)
-    optimizer = torch.optim.AdamW(core_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    ripor_head_trainable = float(getattr(args, "ripor_loss_weight", 0.0)) != 0.0
+    for parameter in core_model.ripor_heads.parameters():
+        parameter.requires_grad_(ripor_head_trainable)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in core_model.parameters() if parameter.requires_grad),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     loaded_optimizer_state = False
     init_semantic_ids_verified = False
     init_source_length_verified = False
@@ -5294,6 +5533,8 @@ def _initialize_structured_training_model(
     relevance_initialization = False
     sparse_initialization = False
     merge_semantic_heads_verified = False
+    ripor_head_initialized_from_code_heads = False
+    init_checkpoint_provenance = None
     if getattr(args, "ripor_relevance_checkpoint", None):
         if args.init_model_dir or getattr(args, "pag_set_init_model_dir", None) or getattr(args, "pag_seq_init_model_dir", None):
             raise ValueError(
@@ -5571,7 +5812,7 @@ def _initialize_structured_training_model(
             core_model.state_dict(),
         )
         missing_keys, unexpected_keys = core_model.load_state_dict(merged_state, strict=False)
-        optional_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+        optional_prefixes = (*RIPOR_OPTIONAL_STATE_PREFIXES, "pag_set_head.")
         missing_required = [key for key in missing_keys if not key.startswith(optional_prefixes)]
         if missing_required or unexpected_keys:
             raise ValueError(
@@ -5597,16 +5838,24 @@ def _initialize_structured_training_model(
         init_source_length_verified = True
         init_source_text_policy_verified = True
     elif args.init_model_dir:
+        init_checkpoint_path = args.init_model_dir / "structured_decoder.pt"
+        init_checkpoint_provenance = {
+            "path": str(init_checkpoint_path.resolve(strict=True)),
+            "sha256": file_sha256(init_checkpoint_path),
+        }
         init_checkpoint = load_structured_decoder_checkpoint(
             core_model,
             args.init_model_dir,
             context.device,
             optimizer=None if getattr(args, "reset_optimizer", False) else optimizer,
-            lr=args.lr,
+            lr=None if getattr(args, "resume_from_checkpoint", None) else args.lr,
             semantic_id_mode=semantic_id_mode,
         )
-        loaded_optimizer_state = bool(
-            "optimizer_state_dict" in init_checkpoint and not getattr(args, "reset_optimizer", False)
+        loaded_optimizer_state = bool(init_checkpoint.get("optimizer_state_loaded", False))
+        if getattr(args, "resume_from_checkpoint", None) and not loaded_optimizer_state:
+            raise ValueError("resume checkpoint optimizer state was not restored exactly")
+        ripor_head_initialized_from_code_heads = bool(
+            init_checkpoint.get("ripor_head_initialized_from_code_heads", False)
         )
         init_semantic_ids_verified = validate_checkpoint_semantic_ids(
             init_checkpoint,
@@ -5647,8 +5896,11 @@ def _initialize_structured_training_model(
         "merged_pag_initialization": merged_initialization,
         "ripor_relevance_initialization": relevance_initialization,
         "ripor_codebook_initialization": bool(getattr(args, "ripor_codebook_embeddings", None)),
+        "ripor_head_initialized_from_code_heads": ripor_head_initialized_from_code_heads,
+        "ripor_head_trainable": ripor_head_trainable,
         "pag_sparse_initialization": sparse_initialization,
         "merge_semantic_heads_verified": merge_semantic_heads_verified,
+        "init_checkpoint": init_checkpoint_provenance,
     }
 
 
@@ -5741,6 +5993,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     )
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    checkpoint_metadata["initialization"] = init_info
     checkpoint_metadata["setting_contract"] = setting_contract_provenance(args.setting_contract)
     checkpoint_metadata["method_setting"] = method_setting
     checkpoint_metadata["letter_tokenizer"] = letter_tokenizer
@@ -5748,6 +6001,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "enabled": bool(args.ripor_loss_weight > 0),
         "loss_weight": float(args.ripor_loss_weight),
         "max_negatives": int(args.ripor_max_negatives),
+        "negative_sampling": str(args.ripor_negative_sampling),
         "margin": float(args.ripor_margin),
         "temperature": float(args.ripor_temperature),
         "hard_negative_predictions": str(args.ripor_hard_negatives) if args.ripor_hard_negatives else None,
@@ -5763,6 +6017,11 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "progressive_schedule": "linear_prefix_expansion_with_multi_objective_retention"
         if args.ripor_progressive_prefix
         else "disabled",
+        "fixed_prefix_max_length": int(args.ripor_prefix_max_length or 0),
+        "score_head": "position_specific_linear_without_bias",
+        "score_head_initialization": "copy_fixed_letter_ce_weight_without_bias",
+        "docid_score": "sum_raw_conditional_logits_codes_only",
+        "control_score": "excluded",
         "teacher_score_fallback": "explicit_weak_ablation_only",
         "strict_teacher_scores": not args.ripor_allow_weak_teacher,
         "relevance_m0_checkpoint": str(args.ripor_relevance_checkpoint) if args.ripor_relevance_checkpoint else None,
@@ -5774,7 +6033,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     barrier(context)
     loss_history_path = args.output_dir / "loss_history.jsonl"
-    if context.is_main and loss_history_path.exists():
+    if context.is_main and loss_history_path.exists() and not args.resume_from_checkpoint:
         loss_history_path.unlink()
     barrier(context)
     wandb_run = init_wandb_run(
@@ -6091,6 +6350,7 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     )
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    checkpoint_metadata["initialization"] = init_info
     checkpoint_metadata["setting_contract"] = setting_contract
     checkpoint_metadata["pag_msp_protocol"] = pag_msp_protocol
     checkpoint_metadata["method_setting"] = method_setting
@@ -6161,7 +6421,7 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     barrier(context)
     loss_history_path = args.output_dir / "loss_history.jsonl"
-    if context.is_main and loss_history_path.exists():
+    if context.is_main and loss_history_path.exists() and not args.resume_from_checkpoint:
         loss_history_path.unlink()
     barrier(context)
     wandb_run = init_wandb_run(
@@ -6450,6 +6710,26 @@ def ranked_skill_ids_from_structured_beams(
     return ranked
 
 
+def ranked_skill_scores_from_structured_beams(
+    beams: list[dict[str, Any]],
+    sequence_to_skill_id: dict[tuple[int, ...], str],
+    ranked_skill_ids: list[str],
+) -> dict[str, float]:
+    """Return the max completion score for each beam-ordered skill."""
+    best_scores: dict[str, float] = {}
+    for beam in beams:
+        records = beam.get("completed_records")
+        if records is None:
+            records = [{"semantic_id": tuple(values), "score": beam["score"]} for values in beam["completed"]]
+        for record in records:
+            sid = sequence_to_skill_id.get(tuple(record["semantic_id"]))
+            if sid is None:
+                continue
+            score = float(record.get("score", beam["score"]))
+            best_scores[sid] = max(best_scores.get(sid, float("-inf")), score)
+    return {sid: best_scores[sid] for sid in ranked_skill_ids if sid in best_scores}
+
+
 def _logsumexp_pair(left: float | None, right: float) -> float:
     if left is None:
         return float(right)
@@ -6554,6 +6834,20 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         actual_sid_hash = semantic_ids_sha256(semantic_ids, semantic_id_mode)
         if str(checkpoint.get("letter_tokenizer", {}).get("semantic_ids_sha256")) != actual_sid_hash:
             raise ValueError("checkpoint does not carry the evaluated frozen LETTER semantic IDs")
+    decoder_head = str(getattr(args, "decoder_head", "auto") or "auto")
+    score_transform = str(getattr(args, "score_transform", "auto") or "auto")
+    if decoder_head == "auto":
+        decoder_head = (
+            "ripor"
+            if checkpoint_method_setting in (METHOD_SETTING_RIPOR, METHOD_SETTING_RIPOR_PAG)
+            else "ce"
+        )
+    if score_transform == "auto":
+        score_transform = "raw" if decoder_head == "ripor" else "logprob"
+    if decoder_head not in {"ce", "ripor"}:
+        raise ValueError(f"unknown decoder head: {decoder_head}")
+    if score_transform not in {"raw", "logprob"}:
+        raise ValueError(f"unknown decoder score transform: {score_transform}")
     source_text_policy_verified = validate_checkpoint_source_text_policy(
         checkpoint,
         args.allow_checkpoint_config_mismatch,
@@ -6687,7 +6981,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         pag_set_vocab_size=checkpoint_pag_vocab_size,
     )
     missing_keys, unexpected_keys = model.load_state_dict(checkpoint["state_dict"], strict=False)
-    optional_missing_prefixes = ("ripor_doc_embeddings.", "pag_set_head.")
+    optional_missing_prefixes = (*RIPOR_OPTIONAL_STATE_PREFIXES, "pag_set_head.")
     missing_required = [key for key in missing_keys if not key.startswith(optional_missing_prefixes)]
     unexpected_required = [key for key in unexpected_keys if not key.startswith(optional_missing_prefixes)]
     if missing_required or unexpected_required:
@@ -6695,6 +6989,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "structured decoder checkpoint parameter mismatch: "
             f"missing={missing_required[:5]}, unexpected={unexpected_required[:5]}"
         )
+    if any(key.startswith("ripor_heads.") for key in missing_keys):
+        model.initialize_ripor_heads_from_code_heads()
     model.to(device).eval()
 
     rows = load_jsonl(args.rows)
@@ -6820,6 +7116,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     decoder_input_ids,
                     decoder_attention_mask,
                     target_type,
+                    ripor_score=decoder_head == "ripor",
                     decoder_prefix_input_ids=(
                         pag_prefix_ids.repeat(batch_size, 1) if pag_prefix_ids is not None else None
                     ),
@@ -6827,13 +7124,18 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                         pag_prefix_mask.repeat(batch_size, 1) if pag_prefix_mask is not None else None
                     ),
                 )
-                # RIPOR's constrained decoder ranks with the raw conditional
-                # code logits, matching ``ripor_prefix_scores`` and the paper's
-                # position-specific codebook dot products.
-                raw_scores_batch = logits_batch
-                for (beam, allowed), raw_scores in zip(active_items, raw_scores_batch):
+                if decoder_head == "ripor" and target_type >= semantic_length:
+                    # RIPOR ranks the fixed-length DocID only.  Structural stop
+                    # tokens are deterministic controls and must not perturb the
+                    # candidate score after the final code.
+                    score_batch = torch.zeros_like(logits_batch)
+                elif score_transform == "logprob":
+                    score_batch = F.log_softmax(logits_batch, dim=-1)
+                else:
+                    score_batch = logits_batch
+                for (beam, allowed), step_scores in zip(active_items, score_batch):
                     allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
-                    allowed_scores = raw_scores.index_select(0, allowed_tensor)
+                    allowed_scores = step_scores.index_select(0, allowed_tensor)
                     ranked_with_planner = []
                     for raw_score, value in zip(allowed_scores.detach().cpu().tolist(), allowed):
                         planner_absolute_score = float(beam.get("planner_score", 0.0))
@@ -6877,6 +7179,11 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         ranked_skill_scores = None
         if args.rank_aggregation == "beam_order":
             ranked_skill_ids = ranked_skill_ids_from_structured_beams(beams, sequence_to_skill_id, max_rank)
+            ranked_skill_scores = ranked_skill_scores_from_structured_beams(
+                beams,
+                sequence_to_skill_id,
+                ranked_skill_ids,
+            )
         elif args.rank_aggregation == "marginal":
             ranked_skill_ids, ranked_skill_scores = ranked_skill_ids_from_marginal_structured_beams(
                 beams,
@@ -6985,6 +7292,9 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "max_skills": args.max_skills,
             "rank_aggregation": args.rank_aggregation,
             "method_setting": checkpoint_method_setting,
+            "decoder_head": decoder_head,
+            "score_transform": score_transform,
+            "docid_control_score": "excluded" if decoder_head == "ripor" else "included",
             "pag_set_ids": str(args.pag_set_ids) if args.pag_set_ids else None,
             "pag_set_weight": pag_set_weight,
             "pag_set_top_n": args.pag_set_top_n,
@@ -7282,8 +7592,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dev-ratio", type=float, default=0.1)
     p.add_argument("--logging-steps", type=int, default=25)
     p.add_argument("--eval-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=0)
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
+    p.add_argument("--resume-from-checkpoint", type=Path)
     p.add_argument(
         "--method-setting",
         choices=METHOD_SETTINGS,
@@ -7344,6 +7656,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--ripor-loss-weight", type=float, default=0.0)
     p.add_argument("--ripor-max-negatives", type=int, default=16)
+    p.add_argument("--ripor-negative-sampling", choices=["top", "random"], default="top")
     p.add_argument("--ripor-margin", type=float, default=1.0)
     p.add_argument("--ripor-temperature", type=float, default=1.0)
     p.add_argument("--ripor-alpha-beta", type=float, default=DEFAULT_RIPOR_ALPHA_BETA)
@@ -7352,6 +7665,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="expand RIPOR prefix objectives from short to full paths while retaining earlier prefixes",
+    )
+    p.add_argument(
+        "--ripor-prefix-max-length",
+        type=int,
+        default=0,
+        help="fixed multi-objective prefix depth; positive values override the linear progressive schedule",
     )
     p.add_argument("--ripor-hard-negatives", type=Path)
     p.add_argument("--ripor-allow-weak-teacher", action="store_true")
@@ -7383,8 +7702,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dev-ratio", type=float, default=0.1)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--eval-steps", type=int, default=200)
+    p.add_argument("--save-steps", type=int, default=0)
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
+    p.add_argument("--resume-from-checkpoint", type=Path)
     p.add_argument(
         "--method-setting",
         choices=METHOD_SETTINGS,
@@ -7431,6 +7752,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="sequential CE weight; fixed-LETTER RIPOR-only requires 0 after the shared CE checkpoint",
     )
     p.add_argument("--ripor-max-negatives", type=int, default=16)
+    p.add_argument("--ripor-negative-sampling", choices=["top", "random"], default="top")
     p.add_argument("--ripor-margin", type=float, default=1.0)
     p.add_argument("--ripor-temperature", type=float, default=1.0)
     p.add_argument("--ripor-alpha-beta", type=float, default=DEFAULT_RIPOR_ALPHA_BETA)
@@ -7439,6 +7761,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="expand RIPOR prefix objectives from short to full paths while retaining earlier prefixes",
+    )
+    p.add_argument(
+        "--ripor-prefix-max-length",
+        type=int,
+        default=0,
+        help="fixed multi-objective prefix depth; positive values override the linear progressive schedule",
     )
     p.add_argument(
         "--ripor-allow-weak-teacher",
@@ -7476,6 +7804,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["beam_order", "marginal", "marginal_length_norm"],
         default="beam_order",
     )
+    p.add_argument("--decoder-head", choices=["auto", "ce", "ripor"], default="auto")
+    p.add_argument("--score-transform", choices=["auto", "logprob", "raw"], default="auto")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)
     p.add_argument("--pag-set-weight", type=float, default=0.0)
@@ -7516,6 +7846,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["beam_order", "marginal", "marginal_length_norm"],
         default="beam_order",
     )
+    p.add_argument("--decoder-head", choices=["auto", "ce", "ripor"], default="auto")
+    p.add_argument("--score-transform", choices=["auto", "logprob", "raw"], default="auto")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)
     p.add_argument("--pag-set-weight", type=float, default=0.0)
