@@ -2,7 +2,8 @@
 set -euo pipefail
 
 STAGE="${1:-all}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+git config --global --add safe.directory "${ROOT_DIR}"
 cd "${ROOT_DIR}"
 
 set -a

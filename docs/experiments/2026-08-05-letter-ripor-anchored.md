@@ -89,3 +89,8 @@ cannot shadow the repository tests.
 Two earlier routing attempts (`tide-chenyufei03-10290-gaxan` and the zero-work probe
 `tide-chenyufei03-10291-dstlh`) were cancelled before scheduling; neither started a Pod or wrote an
 experiment artifact.  The replacement run is explicitly bound to `rudder-r1`.
+
+The first `rudder-r1` launch (`tide-chenyufei03-10297-asokx`) reached a node but stopped before contract
+creation because Git rejected the CFS repository ownership.  It performed no preflight or optimizer step
+and wrote no checkpoint.  The launcher now resolves the physical repository path and registers that exact
+path as Git `safe.directory` before the clean-tree/commit provenance checks.
