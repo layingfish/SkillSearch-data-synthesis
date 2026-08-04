@@ -1,5 +1,5 @@
 # Experiment: Frozen-LETTER RIPOR with baseline anchoring
-Status: planned
+Status: done
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -60,10 +60,10 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchore
 - [x] `gate=0` bypasses RIPOR generation/union/reordering and equals `B`
 - [x] Real-model teacher-forced raw cumulative scores equal constrained-prefix scores
 - [x] Bias-free RIPOR head initialization, mapping, trainable parameters and SHA are recorded
-- [ ] Dynamic negative sampling changes across presentations and excludes every sibling GT
-- [ ] M3 mining covers each unexpanded source query exactly once and seals checkpoint/artifact SHA
+- [x] Dynamic negative sampling changes across presentations and excludes every sibling GT
+- [x] M3 mining covers each unexpanded source query exactly once and seals checkpoint/artifact SHA
 - [x] Single-process global-batch and 8-rank RIPOR loss/gradient invariants pass
-- [ ] Resume restores model/optimizer/scheduler/RNG/sampler position
+- [x] Resume restores model/optimizer/scheduler/RNG/sampler position
 - [x] Reviewer required? yes — independent plan review and final focused cross-review completed; no unresolved CRITICAL/HIGH
 - [x] Minimal local check — shell syntax, Python compilation, and 62 unit tests pass (10 torch-only skips)
 
@@ -142,3 +142,56 @@ absolute threshold was unnecessarily tighter than a single representable FP32 ro
 DDP process.  Resume verification now retains exact loss-history equality and records changed tensor/value
 counts, with a still-strict `1e-7` absolute parameter bound.  `_v6` remains intact and the corrected run
 writes to fresh `_v7`.
+
+The formal `_v7` run (`tide-chenyufei03-10304-sugoo`, queue `rudder-r1`, commit `7e2385f`) completed on one
+8×A800 node.  Preflight passed before the first formal optimizer step, including 62 tests, real-model
+teacher-forced/constrained raw-score parity (`3.81e-6` maximum error), exact single-GPU/8-rank ranking
+parity, exact historical top-50 reproduction on all 75 Official rows, gate-zero SHA equality, 8-rank
+loss/gradient invariants, and resume parity (`5.96e-8` maximum parameter error with byte-identical loss
+history).  M2, all four M3 prefix stages, and M4 completed their locked `5,000 + 4×2,500 + 5,000` steps;
+every final checkpoint passed direct-upstream provenance verification.
+
+M3 raw-score mining covered all `100,078` unexpanded source queries exactly once.  The sealed M4 input has
+`58,481` eligible queries and `130,373` teacher-scored self-negatives; `41,597` queries without an available
+teacher-scored negative were skipped, and `68,327` sibling-GT candidate mentions were excluded.  The
+checkpoint, predictions, teacher panel, eligible rows, and output panel hashes are recorded in
+`m3_self_negative_mining/self_negatives.manifest.json` and were re-verified before M4.
+
+Overall macro Recall@K:
+
+| Split | Arm | R@1 | R@10 | R@50 |
+|---|---|---:|---:|---:|
+| dev | B | 0.2189 | 0.7538 | 0.8930 |
+| dev | R_raw | 0.0353 | 0.1387 | 0.2097 |
+| dev | R_logprob | 0.0334 | 0.1360 | 0.2087 |
+| dev | B_union_R_anchor | 0.1480 | 0.6403 | 0.8580 |
+| Official core75 | B | 0.2932 | 0.6904 | 0.7856 |
+| Official core75 | R_raw | 0.1932 | 0.4400 | 0.5178 |
+| Official core75 | R_logprob | 0.1932 | 0.4489 | 0.5044 |
+| Official core75 | B_union_R_anchor | 0.2566 | 0.6356 | 0.7522 |
+| private test | B | 0.2233 | 0.7584 | 0.8909 |
+| private test | R_raw | 0.0436 | 0.1512 | 0.2374 |
+| private test | R_logprob | 0.0465 | 0.1519 | 0.2337 |
+| private test | B_union_R_anchor | 0.1553 | 0.6206 | 0.8517 |
+
+Single-skill versus multi-skill macro Recall@K (the multi value aggregates target counts 2–4 by row):
+
+| Split | Arm | single R@1/R@10/R@50 | multi R@1/R@10/R@50 |
+|---|---|---|---|
+| dev | B | 0.2500 / 0.7019 / 0.8077 | 0.2153 / 0.7598 / 0.9029 |
+| dev | R_raw | 0.1154 / 0.2692 / 0.3365 | 0.0259 / 0.1236 / 0.1949 |
+| dev | B_union_R_anchor | 0.2500 / 0.6731 / 0.7981 | 0.1362 / 0.6365 / 0.8650 |
+| Official core75 | B | 0.5417 / 0.5833 / 0.6250 | 0.1763 / 0.7408 / 0.8611 |
+| Official core75 | R_raw | 0.2917 / 0.3333 / 0.3750 | 0.1469 / 0.4902 / 0.5850 |
+| Official core75 | B_union_R_anchor | 0.4167 / 0.5417 / 0.5833 | 0.1812 / 0.6797 / 0.8317 |
+| private test | B | 0.3365 / 0.7308 / 0.8077 | 0.2102 / 0.7616 / 0.9006 |
+| private test | R_raw | 0.1923 / 0.3558 / 0.3750 | 0.0263 / 0.1274 / 0.2214 |
+| private test | B_union_R_anchor | 0.2885 / 0.6538 / 0.7885 | 0.1399 / 0.6167 / 0.8591 |
+
+The preregistered `lambda=1` anchor does not preserve the baseline advantage.  RIPOR's top-50 candidate
+union adds only `+0.00075` dev, `+0.00444` Official, and `+0.00175` private macro recall over B, while its
+scores substantially disturb B's ordering.  Therefore this run rejects the hypothesis that the current
+RIPOR schedule and M4 self-negatives strengthen the fixed-LETTER retriever: the main failure is weak RIPOR
+retrieval/ranking signal, not merely score calibration.  Gate-zero outputs remain byte-identical to B, so
+the historical branch itself is preserved and the regression is isolated to the RIPOR contribution and
+nonzero fusion.
