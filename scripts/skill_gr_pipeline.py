@@ -6285,8 +6285,32 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         if "object has no attribute 'keys'" not in str(exc):
             raise
         tokenizer = AutoTokenizer.from_pretrained(args.model_dir, extra_special_tokens={})
+    checkpoint_model = str(checkpoint["model"])
+    architecture_model = checkpoint_model
+    if not Path(checkpoint_model).exists():
+        # Legacy structured checkpoints recorded the Hub id (for example
+        # ``t5-base``) even though they contain the complete trained state
+        # dict.  Locked cluster jobs are offline and expose the exact pinned
+        # base revision through SKILLGR_MODEL, so use that local copy only to
+        # instantiate the architecture before strictly validating the saved
+        # weights below.
+        local_model = os.environ.get("SKILLGR_MODEL", "").strip()
+        if local_model and Path(local_model).is_dir():
+            architecture_model = local_model
+            if context.is_main:
+                print(
+                    json.dumps(
+                        {
+                            "checkpoint_model": checkpoint_model,
+                            "architecture_model": architecture_model,
+                            "model_resolution": "SKILLGR_MODEL_local_fallback",
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
     model = make_structured_t5_sid_model(
-        str(checkpoint["model"]),
+        architecture_model,
         codebook_size,
         depth,
         dedup_size,
@@ -6574,6 +6598,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         {
             "rows": str(args.rows),
             "model_dir": str(args.model_dir),
+            "checkpoint_model": checkpoint_model,
+            "architecture_model": architecture_model,
             "semantic_ids": str(args.semantic_ids),
             "batch_size": 1,
             "max_source_length": args.max_source_length,
