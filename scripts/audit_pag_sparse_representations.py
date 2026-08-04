@@ -35,10 +35,12 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=64)
     parser.add_argument("--label", required=True)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     context = initialize_distributed(cpu=False)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    special_ids = {int(value) for value in getattr(tokenizer, "all_special_ids", [])}
     vocab_size = int(AutoConfig.from_pretrained(args.model).vocab_size)
     model = make_pag_sparse_encoder(str(args.model), vocab_size).to(context.device).eval()
     if args.checkpoint:
@@ -75,7 +77,10 @@ def main() -> None:
                 lexical = torch.log1p(torch.relu(raw_logits))
                 lexical = lexical * attention_mask.unsqueeze(-1).to(dtype=lexical.dtype)
                 lexical = lexical.max(dim=1).values
-            top_ids = torch.topk(lexical, k=args.top_k, dim=-1).indices.cpu().tolist()
+            lexical_for_topk = lexical.clone()
+            if special_ids:
+                lexical_for_topk[:, sorted(special_ids)] = float("-inf")
+            top_ids = torch.topk(lexical_for_topk, k=args.top_k, dim=-1).indices.cpu().tolist()
             for row_index, ((original_index, skill), token_ids) in enumerate(zip(chunk, top_ids)):
                 valid_length = int(attention_mask[row_index].sum().item())
                 row_raw = raw_logits[row_index, :valid_length]
@@ -116,7 +121,11 @@ def main() -> None:
             "lexical_max": summarize([row["lexical_max"] for row in rows]),
             "lexical_sum": summarize([row["lexical_sum"] for row in rows]),
         }
-        print(json.dumps(audit, sort_keys=True), flush=True)
+        serialized = json.dumps(audit, sort_keys=True)
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(serialized + "\n", encoding="utf-8")
+        print(serialized, flush=True)
     barrier(context)
     destroy_distributed(context)
 
