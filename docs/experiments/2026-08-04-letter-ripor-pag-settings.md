@@ -148,3 +148,11 @@ The corrected full-prefix final was launched concurrently as `tide-chenyufei03-1
 isolated `ripor_only_fullprefix` directory. At the same local training position, its first logged loss was
 about 0.048 versus about 0.018 for the restarted-curriculum run, confirming that the two invocations were
 supervising different active prefix sets rather than merely carrying different provenance labels.
+
+Corrected RIPOR-only job `tide-chenyufei03-10247-ctwhg` succeeded with final loss 0.008334; its isolated
+directory was promoted to the canonical `ripor_only/` path, while the audit-only checkpoint remains
+recoverable under `invalid_restarted_prefix_curriculum/`. PAG Mset also completed 5,000 steps and saved
+its checkpoint (final loss 0.046081); its outer shell later hit an EOF because the launcher file had been
+edited while that long-lived Bash process was running. New downstream jobs strictly loaded the resulting
+Mset provenance before optimization: PAG-only `tide-chenyufei03-10248-cpaxi` and RIPOR+PAG
+`tide-chenyufei03-10249-uhccs`.

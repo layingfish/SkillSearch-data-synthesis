@@ -106,6 +106,11 @@
   full-prefix final 将写入独立目录并与 audit-only job 并行，完成后再原子切换 canonical 结果目录。
 - corrected run 已提交为 `tide-chenyufei03-10247-ctwhg`；同一 local step 的首批 loss 约 0.048，
   audit-only restarted-curriculum run 约 0.018，证实二者实际监督的 prefix 集不同。
+- corrected RIPOR-only `tide-chenyufei03-10247-ctwhg` 已成功，末步 loss=0.008334，并已切换到
+  canonical `ripor_only/`；audit-only 目录保存在 `invalid_restarted_prefix_curriculum/`。
+- PAG Mset 完成 5000 steps 并写出 checkpoint（末步 loss=0.046081）；外层 Bash 因运行期间 launcher
+  文件被编辑而在写盘后 EOF。严格下游加载任务 PAG-only `tide-chenyufei03-10248-cpaxi` 与
+  RIPOR+PAG `tide-chenyufei03-10249-uhccs` 已启动，用实际 load guard 验证该 checkpoint。
 
 ## 错误与处理
 
