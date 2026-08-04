@@ -48,11 +48,11 @@ used to tune it.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/eval/`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v4/eval/`
 
 ## Verification
 
@@ -109,3 +109,11 @@ baseline already owns catalog indexing.  The catalog→RIPOR graph-connectivity 
 to `custom` with the explicit weak-teacher ablation flag, while the separate exact-M2 smoke remains
 `--method-setting ripor --catalog-epochs 0`.  The two failed roots remain intact; the corrected run writes
 to a fresh `_v3` root so no partial artifact can be mistaken for a resumable formal stage.
+
+The `_v3` `rudder-r1` launch (`tide-chenyufei03-10300-jbrnj`) passed the custom catalog→RIPOR DDP smoke,
+including one catalog and one ranking optimizer step, then failed before the real-model score comparison.
+The historical checkpoint stores T5 `extra_special_tokens` in the older list form, which Transformers 4.57
+cannot consume directly.  The preflight now uses the same guarded metadata-only compatibility fallback as
+structured evaluation (`extra_special_tokens={}` only when that exact legacy list/error pair is observed);
+weights, tokenizer vocabulary and LETTER IDs are unchanged.  `_v3` remains intact and the corrected run
+writes to fresh `_v4`.

@@ -72,7 +72,25 @@ def main() -> None:
         dtype=torch.long,
         device=context.device,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.base_decoder)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.base_decoder)
+    except AttributeError as exc:
+        # Match the structured-eval compatibility path exactly.  Older T5
+        # checkpoints serialized generated sentinel tokens as a list, while
+        # Transformers 4.57 expects this field to be a mapping; extra_ids
+        # reconstructs the same sentinel vocabulary after this metadata-only
+        # override.
+        tokenizer_config_path = args.base_decoder / "tokenizer_config.json"
+        tokenizer_config = (
+            json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+            if tokenizer_config_path.is_file()
+            else {}
+        )
+        if not isinstance(tokenizer_config.get("extra_special_tokens"), list):
+            raise
+        if "object has no attribute 'keys'" not in str(exc):
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(args.base_decoder, extra_special_tokens={})
     encoded = tokenizer(
         [decoder_source_text(row)],
         padding=True,
