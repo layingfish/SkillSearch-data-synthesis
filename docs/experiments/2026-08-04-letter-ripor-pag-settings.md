@@ -234,3 +234,12 @@ lexical representation is still all zero: lexical positive coordinates/max/sum a
 -18.022705). This is a read-only intermediate diagnostic; per the locked protocol it does not select a
 checkpoint or authorize early stopping, so the same formal process continues toward step 200,000 and the
 mandatory full-catalog Set-ID gate.
+
+The step-50,000 checkpoint was also written successfully. Its read-only 8-GPU representation audit was
+submitted as `tide-chenyufei03-10270-uruvn` and remains queued while the formal Msp job continues without
+interruption. A scheduler recheck after 77 minutes confirmed that the audit container requests and limits
+exactly 8 GPUs, one Fuse resource and one RDMA HCA; its PodGroup has `minMember=1` with the same aggregate
+resources and is `Inqueue`. The current `Unschedulable/NotEnoughResources` condition reports 47 nodes
+failing resource fit and five failing the fixed HPN node selector. This is cluster capacity pressure rather
+than a launch-contract regression, so the job keeps its queue position and the main 8-GPU training is not
+cancelled or slowed.
