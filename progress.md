@@ -121,6 +121,15 @@
 - 失效的 `pag_msp/pag_mset/pag_only/ripor_pag` 已整体、可恢复地移动到
   `invalid_collapsed_pag_set_ids/`，没有删除 checkpoint。首次普通用户移动因 root-owned 目录权限不足
   未产生任何变更，随后在源/目标/mount 安全检查后使用 `sudo mv` 成功隔离。
+- 1000-step 同协议诊断 `tide-chenyufei03-10258-djvkx` 仍得到 `unique_set_count=1/14551`。
+  随后的 8-rank 表示审计 `tide-chenyufei03-10259-qxqxc` 对相同 512 个 skill 比较 base T5 与
+  1000-step Msp：base 每行平均只有 0.021484 个正 raw coordinate、仍有 9 个 top-64 set；训练后
+  raw-logit 最大值均小于 0，lexical representation 全零、top-64 set 只剩 1 个。短 Msp 把模型
+  推入官方 ReLU lexical branch 的全零区，是 collapse 的直接机制。
+- 官方 scheduler 下的锁定 4700-step 正式复核为 `tide-chenyufei03-10257-vkfsd`，当前正常运行；
+  `task_plan.md` 已预注册其失败分支：若全量 Set ID 仍 collapse，只把 PAG Msp 对齐到官方
+  200000-step/每卡 batch32/save-25000 协议，并以独立 Msp contract 绑定原 setting contract，
+  其余 RIPOR、LETTER、Mset/final 和评测均不改变。
 
 ## 错误与处理
 
@@ -132,17 +141,17 @@
 
 ## 下一步
 
-1. 持续监控 `pag_shared` 与 `ripor_mseq` 的 8 卡训练、loss、checkpoint 和异常退出。
-2. 共享 checkpoint 完成后并发提交三组 final。
-3. 三组 final 完成后并发运行 baseline/三组统一评测。
-4. 持续回填 job ID、日志、checkpoint 和 metrics。
+1. 监控 `tide-chenyufei03-10257-vkfsd` 到 4700-step 全量 Set ID 审计。
+2. 若通过，继续 Mset；若 collapse，按 `task_plan.md` 8.1 节实现可续训的官方 200k Msp 分支。
+3. 有效 Mset 完成后并发运行 PAG-only 与 RIPOR+PAG final，再并发统一评测。
+4. 汇总已完成 B/RIPOR 与待完成 PAG 两组的 subset 指标、delta 和交互项。
 
 ## 5 问恢复检查
 
 | 问题 | 答案 |
 |---|---|
-| 当前在哪？ | Phase 7，共享 PAG 与 RIPOR Mseq 正式训练 |
-| 接下来去哪？ | 三组 final → baseline/三组统一评测 → 归因表 |
+| 当前在哪？ | Phase 7，PAG Msp 有效 Set ID 门禁；B/RIPOR 已完成 |
+| 接下来去哪？ | 有效 Msp/Mset → PAG/PAG+RIPOR final → 统一评测与归因表 |
 | 目标是什么？ | 固定 LETTER，测量 RIPOR、PAG 和联合方法在 single/multi subsets 上的贡献 |
 | 已学到什么？ | 见 `findings.md` |
 | 已做什么？ | 见本文件此前工作和测试记录 |

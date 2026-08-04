@@ -151,7 +151,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 ### Phase 4：PAG set 分支和联合模型
 
 - [x] 实现 8 卡 `Msp`：T5-SPLADE log-saturation、max pooling、MarginMSE 和全局 FLOPS。
-- [ ] 修正并锁定官方 FLOPS quadratic warmup；Set ID 构建必须报告 unordered unique-set
+- [x] 修正并锁定官方 FLOPS quadratic warmup；Set ID 构建必须报告 unordered unique-set
   count/token document frequency，并对全量 Set ID collapse fail closed。
 - [x] 实现 8 卡分片构建固定 `m=64` Set ID。
 - [x] 实现从 `Msp` 初始化并训练共享 `Mset`。
@@ -159,7 +159,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] 合并后验证 sequential SID embedding/code/control heads bitwise 等于对应 Mseq。
 - [x] 联合阶段启用 query decoder prefix，同时训练 `Lset + CE` 或 `Lset + Lseq`。
 - [x] 实现 top-N Set candidate domain 和 planning-ahead constrained beam。
-- **Status：in_progress（首次正式 Msp 暴露 Set ID collapse，修复后须刷新 8 卡门禁并重跑 PAG 链）**
+- **Status：in_progress（官方 scheduler 已实现并通过 focused invariant；锁定的 4700-step 复核任务正在运行，Set ID 审计仍是 Mset 前置门禁）**
 
 ### Phase 5：8 卡 DDP 与启动器
 
@@ -192,15 +192,15 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [ ] 持续监控 pod、日志、checkpoint 和异常退出。
 - [ ] 输出三组统一指标表和相对 `B` 的差值。
 - [ ] 输出 RIPOR、PAG 的边际贡献与交互项，不用单个 overall 指标替代 subset 分析。
-- **Status：in_progress（共享 PAG 与 RIPOR Mseq 已并行提交）**
+- **Status：in_progress（B/RIPOR checkpoint 与统一评测已完成；PAG 链正停留在有效 Msp/Set ID 门禁）**
 
 当前活动任务：
 
-- canonical contract PAG `Msp → Mset`：`tide-chenyufei03-10242-tmick`。
-- PAG-only final：`tide-chenyufei03-10248-cpaxi`。
-- RIPOR+PAG final：`tide-chenyufei03-10249-uhccs`。
-- corrected full-prefix RIPOR-only final `tide-chenyufei03-10247-ctwhg` 已成功并切换到 canonical result path；
-  audit-only `tide-chenyufei03-10245-pcgrm` 已隔离，禁止进入结果。
+- 官方 FLOPS scheduler 下的 4700-step PAG `Msp → Set ID audit → Mset`：
+  `tide-chenyufei03-10257-vkfsd`；若全量 Set ID collapse，任务必须在 Mset 前失败。
+- 1000-step 表示审计 `tide-chenyufei03-10259-qxqxc` 已完成，只用于根因判断，不进入结果。
+- corrected full-prefix RIPOR-only `tide-chenyufei03-10247-ctwhg`、B/RIPOR 两套统一评测已完成。
+- 旧 PAG/PAG+RIPOR checkpoint 与评测均在 `invalid_collapsed_pag_set_ids/`，禁止进入结果。
 
 ## 8. 训练协议
 
@@ -222,6 +222,27 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - 每卡 batch `8`，world size `8`，global batch `64`。
 - AdamW（weight decay `0`），初始学习率 `5e-4`，linear warmup + linear decay，warmup ratio `4.5%`；每个 stage 重置 optimizer/scheduler。
 - BF16，seed `20260626`，PAG `m=64`、top-N `1000`、planning weight `1.0`，beam `50`，`K={1,10,50}`。
+
+### 8.1 PAG Msp 失败分支（预注册，禁止自由调参）
+
+4700-step 重跑只用于验证“补齐官方 FLOPS scheduler 后原锁定预算是否足够”。若全量审计仍为
+`unique_set_count=1`，该 checkpoint 直接判为无效，不允许进入 Mset，也不允许通过改 ReLU、换
+embedding/backbone、改 Set ID 规则或挑某个中间结果规避 collapse。唯一允许的后续协议修订是把
+**PAG 自身的 Msp 预训练阶段**对齐到官方脚本：
+
+- 8×A800 DDP，`max_steps=200000`、`save_steps=25000`、`max_length=128`、每卡 batch=32、
+  LR=`5e-4`、weight decay=0、linear decay、Msp warmup=0；BF16 是本集群精度替代。
+- query/doc FLOPS 仍为 `0.01/0.008`，在前 66666 steps 按官方平方曲线增权。
+- 先做一次 batch=32 的 8 卡显存门禁；只有 OOM 才允许降低每卡 batch，并用 gradient
+  accumulation 保持 global batch=256，不能借此改变有效 batch。
+- 每 25000 步保存 model/optimizer/scheduler/global-step/RNG/data-position，允许原协议精确续训；
+  中间 checkpoint 只做固定 512-skill activation/Set-ID diversity 只读审计，不按指标选点。
+- 新增独立 `pag_msp_protocol.json`，绑定现有 `setting_contract.json` SHA，并记录上述修订；Mset、
+  PAG-only 与 RIPOR+PAG 必须同时验证两份 contract。这样不改变已完成 RIPOR 分支的原始契约。
+- Msp 之外的 Mset=5000、三组 final=5000、数据、teacher、LETTER、解码和评测全部不变。
+
+该失败分支已经写入计划，但只有 4700-step 全量审计实际失败后才能启用；启动前须把实际失败
+证据、代码改动和新 contract SHA 回填到实验记录，不能静默切换。
 
 ## 9. 测评设计
 
@@ -282,3 +303,4 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 | 首次正式启动误用了 alias 归一化前的 raw dev，含 80 个不在固定 LETTER pool 的 GT mentions | 已定位，正式结果无效 | 改回既有 canonical dev/private-test，并把 Official core75 单列为主评测；重新生成 SHA-bound contract 后重启共享阶段 |
 | final 阶段若沿用 parser 默认值会从短 prefix 重新启动 curriculum | 已定位 | shared Mseq 保留 progressive schedule；`ripor` continuation 和 `ripor_pag` joint 显式 `--no-ripor-progressive-prefix`，监督完整四层；旧 final 产物禁止用于结果 |
 | 首次正式 PAG Msp 生成的 14,551 个 top-64 Set ID 全部相同；同时发现实现遗漏官方 FLOPS quadratic scheduler，但 100-step no-FLOPS 诊断仍会 collapse，故不能把正则视为唯一根因 | 相关 PAG 产物已隔离，根因继续收敛 | 保留官方前 1/3 steps 二次增权与 unique-set/DF fail-closed 门禁；先按锁定 4700 steps 重跑 Msp，若仍失败再依据表示审计调整训练尺度并先更新计划 |
+| pinned vanilla T5-base 在 512-skill 审计中平均每行只有 0.021484 个正 raw-logit coordinate；1000-step Msp 后所有 raw logits 均为负、lexical representation 全零 | 已定位为短 Msp collapse 的直接机制 | 不改官方 `log(1+ReLU(logits))`；若 4700-step 仍 collapse，只启用 8.1 节预注册的官方 200k Msp 分支 |

@@ -62,6 +62,14 @@
   确实遗漏官方 FLOPS quadratic scheduler，但 100-step、FLOPS=0 的诊断仍然 collapse，因此该偏差
   不是充分根因；还需用锁定的 4700-step 训练和表示审计判断是否为训练尺度/优化动态问题。全部
   相关 PAG checkpoint/eval 已隔离，不能进入结果。
+- 8-rank 表示审计 `tide-chenyufei03-10259-qxqxc` 在相同 512 个 skill 上发现：pinned vanilla
+  T5-base 每行平均只有 `0.021484` 个正 raw-logit coordinate（最多 1 个），但仍有 9 个 unordered
+  top-64 set；1000-step Msp 的 raw-logit 最大值均为负（均值 `-9.4857`，最大 `-4.09375`），
+  lexical positive coordinate 为 0，top-64 只剩 1 个 set。这证明短训练发生的是官方 ReLU lexical
+  表示进入全零区，而不是 Set ID 写盘/合并错误。
+- 官方 `t5_splade_train.sh` 使用 8 卡、每卡 batch 32、`max_steps=200000`、每 25000 步保存；
+  当前 4700-step 预算远短于官方 Msp 训练尺度。若 4700-step 正式复核仍 collapse，计划只允许把
+  Msp 对齐到该官方尺度，不允许换激活、换 backbone 或改 top-m 规则。
 - teacher query 已分片；catalog encoding 也应分片后按原始 skill index 合并。
 - 本地 `uv` 环境没有 torch，tensor invariant 要在已验证 GPU 镜像中运行；本地只做无 torch 的契约与语法检查。
 

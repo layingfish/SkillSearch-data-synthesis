@@ -174,3 +174,22 @@ sole cause. The locked 4,700-step Msp→Mset retry is `tide-chenyufei03-10257-vk
 An additional same-protocol 1,000-step Msp diagnostic, `tide-chenyufei03-10258-djvkx`, is launched only
 to observe when lexical Set-ID diversity appears; it does not replace the locked 4,700-step stage and
 cannot enter downstream training.
+
+Because the 1,000-step loss trajectory remains nearly unchanged across regularization schedules, a
+read-only 8-rank representation audit compares the pinned untrained T5-base and the 1,000-step Msp
+checkpoint on the same first 512 skills. It reports raw-logit positive coordinates, lexical non-zero
+coordinates, activation magnitudes, and unordered top-64 diversity; no weights or artifacts are mutated.
+
+Representation audit `tide-chenyufei03-10259-qxqxc` completed. Base T5 has only 0.021484 positive raw
+coordinates per skill row on average (maximum 1), raw-logit maximum mean -1.8689, lexical maximum mean
+0.00815, 9 unordered top-64 sets and 10 distinct top-1 IDs. The 1,000-step Msp has zero positive raw or
+lexical coordinates for every audited row; its raw-logit maximum mean is -9.4857 and even its largest
+maximum is -4.09375, leaving one top-64 set and one top-1 ID. Thus the collapsed manifest reflects an
+actual all-zero PAG lexical representation, not a distributed merge or serialization defect.
+
+The official `full_scripts/t5_splade_train.sh` uses 8 GPUs, per-device batch 32, 200,000 steps and
+25,000-step checkpoints. The locked 4,700-step scheduler-corrected job remains the mandatory confirmation
+before changing protocol. If its full-catalog audit also collapses, `task_plan.md` section 8.1 permits only
+an official-scale Msp amendment, bound to the unchanged experiment contract through a separate PAG Msp
+protocol artifact; no activation, backbone, Set-ID rule, downstream step budget, or evaluation setting may
+change.
