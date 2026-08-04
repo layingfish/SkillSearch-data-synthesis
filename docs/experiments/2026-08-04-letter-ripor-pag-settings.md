@@ -272,3 +272,27 @@ all lexical statistics are zero, `unique_top1_ids=1`, and `unique_unordered_top_
 maximum mean is -22.645508 (range -25.125 to -18.25), farther below zero than both step 25,000 and
 step 50,000. More optimization under this unchanged recipe is therefore not supported as a lexical
 recovery mechanism.
+
+The subsequent RIPOR audit separates execution validation from paper-level method validation. The shared
+progressive job `tide-chenyufei03-10241-trolo` and corrected full-prefix continuation
+`tide-chenyufei03-10247-ctwhg` both completed, the image preflight covered the ranking loss and DDP
+invariant, and both Official core75 and private-test retrieval evaluations exist. However, the current
+fixed-LETTER implementation is not a complete reproduction of the official RIPOR pipeline: it omits M0/RQ
+by design, but also lacks the official initial full-sequence rank stage, discrete progressive stages,
+dynamic hard-negative sampling, post-progressive self-negative mining and final retraining. It trains at
+5e-4 for 5k progressive + 5k continuation steps with up to 16 frozen teacher-panel negatives, rather than
+the official decoder-side schedule using 1e-4, 120-epoch stages and freshly sampled/mined negatives.
+
+The existing end-to-end result is therefore evidence only about this checkpoint, not evidence that the
+RIPOR method is ineffective. On Official core75, baseline versus current RIPOR overall macro recall is
+0.23546 versus 0.18546 at @1, 0.69511 versus 0.47111 at @10, and 0.75444 versus 0.55111 at @50. On the
+private test it is 0.16325 versus 0.02242 at @1, 0.70025 versus 0.09033 at @10, and 0.89975 versus 0.12350
+at @50. Single-skill Official @1 rises from 0.29167 to 0.33333, but @10/@50 fall from 0.54167/0.58333 to
+0.41667/0.45833; private single-skill declines at all three cutoffs. The checkpoint is retained for audit
+but is not eligible as a paper-faithful RIPOR result.
+
+Independent review found no CRITICAL issue but marked the missing real-model train/decode score parity as
+HIGH. Before any new RIPOR training, the implementation must prove that teacher-forced cumulative raw
+conditional-logit scores equal constrained-decoding cumulative scores for identical query/candidate
+prefixes, and must make every fixed-LETTER difference from official RIPOR explicit. These requirements are
+now locked in `task_plan.md` section 8.2; no new GPU job is authorized by this audit.

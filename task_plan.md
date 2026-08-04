@@ -248,6 +248,55 @@ embedding/backbone、改 Set ID 规则或挑某个中间结果规避 collapse。
 该失败分支已经写入计划，但只有 4700-step 全量审计实际失败后才能启用；启动前须把实际失败
 证据、代码改动和新 contract SHA 回填到实验记录，不能静默切换。
 
+### 8.2 50k collapse 后的官方实现核对（当前执行）
+
+本节覆盖第 2 节的“可提交”状态：在本节的 parity/invariant 全部通过前，只允许本地最小数值核对
+和只读 checkpoint 审计，不恢复 Msp、不启动新的训练任务。
+
+1. 保持 PAG Msp 训练停止；核对期间不恢复训练，也不让无效 Msp 进入 Mset。
+2. 以 PAG 官方 commit `49802454fb157fc659c1c6c42bb2d940a9f6bc1b`、RIPOR 官方 commit
+   `03fd0cbfafdeeb9cdd866e0c44727fec39a96a52` 和对应论文全文为基准；比较报告同时记录关键源码
+   SHA、Python/Torch/Transformers 版本。官方 PAG 数值 oracle 使用其要求的 `transformers==4.17.0`，
+   不能用当前镜像运行时替代官方 oracle。
+3. 端到端追踪 PAG Msp 的文本输入、T5 encoder/decoder 调用、logit 变换、mask/max-pool、MarginMSE、FLOPS、teacher triplet、优化器与调度器。
+4. 在同一 T5 checkpoint 和同一 tokenized mini-batch 上建立两段 PAG oracle：
+   - `eval + FP32` 逐项比较 tokenizer/config/state dict/tied weights、input IDs、encoder/decoder mask、
+     encoder/decoder hidden states、raw logits、ReLU/log1p、masked max 值与 argmax；query/positive/
+     negative 都覆盖，并输出第一个不满足 allclose 的张量及 raw-logit 正坐标数。
+   - 固定 RNG 的 `train` 单步比较 step 0、optimizer 后 step 1 和 50k checkpoint 的 loss 分量、梯度、
+     LR 与 FLOPS 权重；锁定 scheduler 在 `0/1/T/3-1/T/3/resume` 的调用顺序和边界值。
+   单进程官方局部-batch FLOPS parity 与 8-rank DDP 检查分开：前者复现官方目标，后者只验证当前
+   分布式目标等价于单进程 global-batch 公式。当前 all-gather 后计算全局 FLOPS 不是官方目标，
+   必须改成官方每 rank 局部 FLOPS 或明确登记为有意实验差异，不能混称官方对齐。
+5. 端到端追踪 RIPOR 的 raw conditional-logit prefix score、`alpha_i`、prefix 采样、progressive/multi-objective schedule、hard/self negative 与固定 LETTER SID 边界。
+6. 将 RIPOR 现有证据分为实现单测、训练稳定性和统一检索评测三层，禁止用某一层替代完整方法验证。
+7. 只修复有官方证据支持的实现分歧，运行最小数值/invariant 检查并完成独立审查；未经用户确认不提交新的 GPU 训练。
+
+RIPOR 核对边界固定如下；“有意不同”不等于实现错误，但相应结果不能称为完整 RIPOR 复现：
+
+| 项目 | 本项目边界 | 判定 / 必须验证 |
+|---|---|---|
+| SID 与 M0/RQ | 保持 Qwen+LightGCN+LETTER 四层 SID | 有意不同，禁止替换；不复现 RIPOR 的 dense M0 + Faiss RQ |
+| decoder 输入/BOS | 使用同一固定 LETTER decoder 协议 | 与基线一致；核对 teacher forcing 与 constrained decode 的 token/position 对齐 |
+| 输出头 | 保留带 bias 的 LETTER position-specific `code_heads` | 有意不同，禁止静默换成官方无 bias position embedding dot product；单独记录 bias/scale |
+| prefix/alpha | 四层 LETTER prefix；`alpha_L=1`、单调凹 | 深度受 LETTER 限制；数值公式必须与论文一致 |
+| progressive schedule | 当前一次线性扩展 1/2/3/4 | 与官方分阶段 4/8/16/32 不同；补齐等价的四层分阶段训练协议后才可称 decoder-side 对齐 |
+| M1 pseudo-query | 复用 CE+LETTER base | 有意不同；不声称复现官方 10 pseudo-query/doc、250k M1 |
+| 初始/渐进/最终阶段 | 当前 progressive 5k + full-prefix 5k | 与官方 initial full-seq → progressive multi-objective → self-negative final 不同，必须补齐 decoder-side 三阶段 |
+| negatives | 当前冻结 teacher panel、每例最多 16 个 | 与官方逐次随机 hard negative 及最终 self-negative 不同；需补齐动态采样和重新挖掘 |
+| teacher margin | 当前 SkillRouter teacher score margin | 研究边界内允许，但需锁定 score/hash、positive/sibling exclusion 和缺失分数 fail-closed |
+| train/decode score | position-wise raw conditional logits 的累积和 | 必须端到端 allclose；训练与推理不得优化两套分数 |
+
+RIPOR 的强制端到端 invariant：对同一 query/candidate，teacher-forced 每级 cumulative raw
+conditional-logit 必须与 constrained beam 在相同 prefix 上的累计分数 allclose；同时验证
+`alpha_L=1`、alpha 单调凹、首个分歧前不计 pair、pair count、缺失 teacher score fail-closed，且
+continuation/joint 全程为 full-prefix、不会重新开启 curriculum。现有 mock prefix-score 单测、loss
+下降和最终检索评测均不能替代该 invariant。
+
+PAG 进入 Mset 前的门禁不得只检查 `unique_set_count > 1`。全量报告必须包含非零 lexical row
+比例、raw positive-coordinate 分布、unique-set ratio 和最大 token DF ratio；在官方参考分布或预注册
+阈值形成前，任何 near-collapse 都需要人工复核，不能自动放行。
+
 ## 9. 测评设计
 
 ### 9.1 数据切分
