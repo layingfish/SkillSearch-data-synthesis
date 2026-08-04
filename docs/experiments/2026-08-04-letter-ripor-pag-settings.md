@@ -226,3 +226,11 @@ queue: `skillsearch-final-pag-0804a`, `skillsearch-final-ripor-pag-0804a`,
 waits for both the valid Set-ID manifest and Mset final checkpoint, submits the two final arms in parallel,
 then submits each arm's Official/private evaluation after its own final checkpoint is present. Submission
 failure terminates the controller instead of retrying and risking duplicate jobs.
+
+The first recoverable checkpoint was written at step 25,000 and the independent 8-GPU representation
+audit `tide-chenyufei03-10268-vohwm` completed successfully. On the fixed 512-skill audit panel its ReLU
+lexical representation is still all zero: lexical positive coordinates/max/sum are all 0,
+`unique_top1_ids=1`, `unique_unordered_top_sets=1`, and raw-logit maxima range from -22 to -12 (mean
+-18.022705). This is a read-only intermediate diagnostic; per the locked protocol it does not select a
+checkpoint or authorize early stopping, so the same formal process continues toward step 200,000 and the
+mandatory full-catalog Set-ID gate.
