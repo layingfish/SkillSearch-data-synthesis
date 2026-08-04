@@ -299,7 +299,8 @@ PAG 进入 Mset 前的门禁不得只检查 `unique_set_count > 1`。全量报�
 
 ### 8.3 2026-08-05 baseline-anchored RIPOR 执行协议
 
-当前只推进 RIPOR；PAG Msp 保持停止。使用一个 `SCI_rudder` 节点（Tianzhi queue=`rudder-exper`，8×A800），但正式任务必须在
+当前只推进 RIPOR；PAG Msp 保持停止。使用一个独立的 `SCI_rudder` 集群节点（8×A800；不得映射为
+`rudder-exper` queue），但正式任务必须在
 以下 fail-closed gate 全部通过后才可由同一提交链继续：
 
 1. `B` 是历史 mode3 CE/LETTER checkpoint 的独立执行路径，固定 log-softmax beam；不得复用
