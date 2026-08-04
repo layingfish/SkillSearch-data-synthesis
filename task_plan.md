@@ -56,7 +56,9 @@
 
 本轮实现 PAG 的以下核心机制：
 
-- `Msp`：T5-SPLADE lexical representation，MarginMSE + FLOPS regularization。
+- `Msp`：T5-SPLADE lexical representation，MarginMSE + FLOPS regularization；严格采用 PAG
+  官方实现的 quadratic regularization scheduler，在前 `max_steps/3` 内把 query/doc FLOPS
+  权重从 0 二次增长到 `0.01/0.008`，之后保持不变，禁止从第 1 步直接施加满权重。
 - `Msp` 输入长度固定为原始 PAG 官方训练脚本的 `max_length=128`；GR decoder 的 `max_source_length=2048` 只用于 Mset/RIPOR/joint，不与稀疏编码器混用。
 - PAG Mset/joint 的 decoder query prefix 固定为官方 unified-training 脚本的 `max_length=64`；encoder 仍读取既有 `max_source_length=2048`，不削弱原 GR 语义输入。
 - 从每个 skill document 的 `Msp` 表示选择固定 `m` 个 lexical Set ID。
@@ -149,13 +151,15 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 ### Phase 4：PAG set 分支和联合模型
 
 - [x] 实现 8 卡 `Msp`：T5-SPLADE log-saturation、max pooling、MarginMSE 和全局 FLOPS。
+- [ ] 修正并锁定官方 FLOPS quadratic warmup；Set ID 构建必须报告 unordered unique-set
+  count/token document frequency，并对全量 Set ID collapse fail closed。
 - [x] 实现 8 卡分片构建固定 `m=64` Set ID。
 - [x] 实现从 `Msp` 初始化并训练共享 `Mset`。
 - [x] 实现 `Mset + B` 和 `Mset + RIPOR Mseq` 两种受控合并。
 - [x] 合并后验证 sequential SID embedding/code/control heads bitwise 等于对应 Mseq。
 - [x] 联合阶段启用 query decoder prefix，同时训练 `Lset + CE` 或 `Lset + Lseq`。
 - [x] 实现 top-N Set candidate domain 和 planning-ahead constrained beam。
-- **Status：implemented，8 卡 preflight 已通过**
+- **Status：in_progress（首次正式 Msp 暴露 Set ID collapse，修复后须刷新 8 卡门禁并重跑 PAG 链）**
 
 ### Phase 5：8 卡 DDP 与启动器
 
@@ -277,3 +281,4 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 | 联合组若直接从 CE base 开始会遗漏 RIPOR Mseq 阶段 | 已修正并 fail closed | `ripor_pag` 强制使用与 `ripor` 共享的 RIPOR Mseq |
 | 首次正式启动误用了 alias 归一化前的 raw dev，含 80 个不在固定 LETTER pool 的 GT mentions | 已定位，正式结果无效 | 改回既有 canonical dev/private-test，并把 Official core75 单列为主评测；重新生成 SHA-bound contract 后重启共享阶段 |
 | final 阶段若沿用 parser 默认值会从短 prefix 重新启动 curriculum | 已定位 | shared Mseq 保留 progressive schedule；`ripor` continuation 和 `ripor_pag` joint 显式 `--no-ripor-progressive-prefix`，监督完整四层；旧 final 产物禁止用于结果 |
+| 首次正式 PAG Msp 生成的 14,551 个 top-64 Set ID 全部相同；同时发现实现遗漏官方 FLOPS quadratic scheduler，但 100-step no-FLOPS 诊断仍会 collapse，故不能把正则视为唯一根因 | 相关 PAG 产物已隔离，根因继续收敛 | 保留官方前 1/3 steps 二次增权与 unique-set/DF fail-closed 门禁；先按锁定 4700 steps 重跑 Msp，若仍失败再依据表示审计调整训练尺度并先更新计划 |

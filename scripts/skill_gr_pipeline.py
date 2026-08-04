@@ -79,6 +79,19 @@ PAG_SEQUENTIAL_ONLY_PREFIXES = (
 )
 
 
+def pag_quadratic_regularization_weight(
+    target_weight: float,
+    completed_steps: int,
+    total_steps: int,
+) -> float:
+    """Match PAG's RegWeightScheduler for SPLADE FLOPS losses."""
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+    saturation_steps = max(1, int(total_steps) // 3)
+    progress = min(max(int(completed_steps), 0), saturation_steps) / saturation_steps
+    return float(target_weight) * progress**2
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as f:
@@ -2119,6 +2132,7 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError(f"warmup ratio must be in [0, 1), got {args.warmup_ratio}")
     warmup_steps = int(math.ceil(total_steps * args.warmup_ratio))
+    regularization_saturation_steps = max(1, total_steps // 3)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -2179,9 +2193,23 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                     torch.tensor(float(len(batch_rows)), device=context.device),
                     context,
                 )
+                # PAG's official RegWeightScheduler quadratically increases
+                # both FLOPS coefficients during the first third of training.
+                # Applying their full values from step one can drive every
+                # ReLU lexical coordinate into the zero-gradient region.
+                query_reg_weight = pag_quadratic_regularization_weight(
+                    args.query_reg_weight,
+                    step + 1,
+                    total_steps,
+                )
+                doc_reg_weight = pag_quadratic_regularization_weight(
+                    args.doc_reg_weight,
+                    step + 1,
+                    total_steps,
+                )
                 # FLOPS is computed after an autograd-preserving all-gather, so
                 # it is the same global-batch objective under 1 or 8 GPUs.
-                loss = rank_loss + float(args.query_reg_weight) * query_reg + float(args.doc_reg_weight) * doc_reg
+                loss = rank_loss + query_reg_weight * query_reg + doc_reg_weight * doc_reg
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -2189,7 +2217,8 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
             if context.is_main and (step % args.logging_steps == 0 or step == total_steps):
                 print(
                     f"pag_sparse_step={step} loss={float(loss.detach().cpu()):.6f} "
-                    f"lr={optimizer.param_groups[0]['lr']:.8g}",
+                    f"lr={optimizer.param_groups[0]['lr']:.8g} "
+                    f"query_reg_weight={query_reg_weight:.8g} doc_reg_weight={doc_reg_weight:.8g}",
                     flush=True,
                 )
         epoch += 1
@@ -2206,6 +2235,8 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                 "objective": "T5SPLADE MarginMSE + FLOPS (PAG stage 1)",
                 "query_reg_weight": args.query_reg_weight,
                 "doc_reg_weight": args.doc_reg_weight,
+                "regularization_schedule": "quadratic_ramp_first_third",
+                "regularization_saturation_steps": regularization_saturation_steps,
                 "lr": args.lr,
                 "warmup_ratio": args.warmup_ratio,
                 "warmup_steps": warmup_steps,
@@ -2254,8 +2285,30 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                 for item, values in zip(chunk, top_ids)
             )
     gathered = all_gather_object(local_sets, context)
+    merged = sorted((item for part in gathered for item in part), key=lambda item: item[0])
+    unordered_sets = [frozenset(item[2]) for item in merged]
+    unique_set_count = len(set(unordered_sets))
+    token_document_frequency = Counter(
+        token_id for token_ids in unordered_sets for token_id in token_ids
+    )
+    set_id_audit = {
+        "skills": len(merged),
+        "unique_set_count": unique_set_count,
+        "unique_set_ratio": unique_set_count / max(1, len(merged)),
+        "max_token_document_frequency": max(token_document_frequency.values(), default=0),
+        "max_token_document_frequency_ratio": (
+            max(token_document_frequency.values(), default=0) / max(1, len(merged))
+        ),
+    }
     if context.is_main:
-        merged = sorted((item for part in gathered for item in part), key=lambda item: item[0])
+        print(json.dumps({"pag_set_id_audit": set_id_audit}, sort_keys=True), flush=True)
+    # Every rank evaluates the same gathered audit and fails together, avoiding
+    # a rank-0 exception while peers wait indefinitely at the final barrier.
+    if len(merged) > 1 and unique_set_count <= 1:
+        raise RuntimeError(
+            "PAG SPLADE Set IDs collapsed: every skill has the same unordered top-m token set"
+        )
+    if context.is_main:
         write_json(
             args.output_dir / "pag_set_ids.json",
             {
@@ -2266,6 +2319,7 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                 "skill_token_ids": {item[1]: item[2] for item in merged},
                 "source_checkpoint": str(args.output_dir / "pag_sparse_encoder.pt"),
                 "objective": "T5SPLADE top-m lexical coordinates",
+                **set_id_audit,
             },
         )
     barrier(context)
@@ -5077,6 +5131,11 @@ def _initialize_structured_training_model(
             raise ValueError("--pag-sparse-checkpoint must contain pag_sparse_encoder.pt/state_dict")
         if not sparse_checkpoint.get("strict_teacher_scores"):
             raise ValueError("PAG Msp checkpoint was not trained with frozen numeric teacher scores")
+        if sparse_checkpoint.get("regularization_schedule") != "quadratic_ramp_first_third":
+            raise ValueError("PAG Msp checkpoint does not use the official quadratic FLOPS schedule")
+        expected_reg_saturation = max(1, int(sparse_checkpoint.get("total_steps", 0)) // 3)
+        if int(sparse_checkpoint.get("regularization_saturation_steps", 0)) != expected_reg_saturation:
+            raise ValueError("PAG Msp checkpoint carries an inconsistent FLOPS saturation step")
         expected_contract = setting_contract_provenance(getattr(args, "setting_contract", None))
         sparse_contract = sparse_checkpoint.get("setting_contract") or {}
         if expected_contract is not None and sparse_contract.get("sha256") != expected_contract.get("sha256"):

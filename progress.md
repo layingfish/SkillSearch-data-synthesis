@@ -111,6 +111,16 @@
 - PAG Mset 完成 5000 steps 并写出 checkpoint（末步 loss=0.046081）；外层 Bash 因运行期间 launcher
   文件被编辑而在写盘后 EOF。严格下游加载任务 PAG-only `tide-chenyufei03-10248-cpaxi` 与
   RIPOR+PAG `tide-chenyufei03-10249-uhccs` 已启动，用实际 load guard 验证该 checkpoint。
+- PAG-only final `tide-chenyufei03-10248-cpaxi` 虽完成 5000 steps，但 Official planning eval 的
+  candidate recall 为 0。全量资产审计证明 14,551 个 skill 的 top-64 Set ID 全部相同；Official
+  186 个 unique gold 均见于训练且 manifest 无缺失，排除数据覆盖问题。
+- 对照 PAG 官方 commit `49802454...` 后确认本实现遗漏 `RegWeightScheduler`：官方在前
+  `max_steps/3` 对 query/doc FLOPS 权重做 quadratic ramp，本实现此前从第 1 步使用完整
+  `0.01/0.008`。该偏差已修正并增加 Set ID collapse 门禁；但 100-step、FLOPS=0 的诊断任务
+  `tide-chenyufei03-10256-chxsw` 仍然 collapse，所以不能把正则视为唯一根因。
+- 失效的 `pag_msp/pag_mset/pag_only/ripor_pag` 已整体、可恢复地移动到
+  `invalid_collapsed_pag_set_ids/`，没有删除 checkpoint。首次普通用户移动因 root-owned 目录权限不足
+  未产生任何变更，随后在源/目标/mount 安全检查后使用 `sudo mv` 成功隔离。
 
 ## 错误与处理
 

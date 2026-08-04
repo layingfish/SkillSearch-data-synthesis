@@ -57,6 +57,7 @@ from skill_gr_pipeline import (  # noqa: E402
     load_ranked_skill_candidates_with_scores,
     load_pag_set_token_ids,
     native_semantic_id_text,
+    pag_quadratic_regularization_weight,
     ripor_prefix_alphas,
     pag_prefix_planner_score,
     prepared_selected_skill_ids,
@@ -812,6 +813,14 @@ class SkillGRPipelineTest(unittest.TestCase):
             token_ids, vocab_size = load_pag_set_token_ids(path)
         self.assertEqual(token_ids, {"a": [3, 4]})
         self.assertEqual(vocab_size, 20)
+
+    def test_pag_flops_regularization_matches_official_quadratic_ramp(self) -> None:
+        self.assertAlmostEqual(pag_quadratic_regularization_weight(0.01, 0, 300), 0.0)
+        self.assertAlmostEqual(pag_quadratic_regularization_weight(0.01, 50, 300), 0.0025)
+        self.assertAlmostEqual(pag_quadratic_regularization_weight(0.01, 100, 300), 0.01)
+        self.assertAlmostEqual(pag_quadratic_regularization_weight(0.01, 250, 300), 0.01)
+        with self.assertRaisesRegex(ValueError, "total_steps must be positive"):
+            pag_quadratic_regularization_weight(0.01, 1, 0)
 
     def test_beam_skill_scores_snapshot_at_sid_completion(self) -> None:
         beam = {

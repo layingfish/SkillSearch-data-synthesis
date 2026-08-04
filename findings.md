@@ -22,6 +22,8 @@
 - 官方代码仓库为 `https://github.com/HansiZeng/PAG`；项目镜像中的参考版本固定为 commit `49802454fb157fc659c1c6c42bb2d940a9f6bc1b`。
 - Set ID 是固定大小的 lexical token set，与 sequential identifier 并存。
 - `Msp` 用 T5-SPLADE + MarginMSE + FLOPS 构造 lexical representation；top-m token 成为 Set ID。
+- 官方 `SpladeTrainer` 对 query/doc FLOPS 分别使用 `0.01/0.008`，并通过
+  `RegWeightScheduler` 在前 `max_steps/3` 以平方曲线从 0 增长到目标权重；满权重不能从第 1 步施加。
 - `Mset` 和 `Mseq` 分别训练，最终模型用两者参数平均初始化并联合优化 `Lset + Lseq`。
 - 联合模型把 query token 同时送入 decoder，官方 collator 也将 query input IDs 放入 decoder prefix。
 - planning-ahead beam score 使用当前 prefix 可到达文档的最大 simultaneous score 作为绝对先验，不是每个 token 累积一次 planner score。
@@ -55,6 +57,11 @@
 - 当前未提交实现中，联合组曾被改为直接把 `Mset` 与 CE base 合并；这不符合本计划，恢复开发后需改回共享 RIPOR Mseq。
 - 当前 candidate builder 曾让展开后的每个 example 使用全部 source positives，可能导致 multi-GT query 的 `K²` ranking 权重；必须按计划修正。
 - PAG Set ID 构建原先是 CPU 单进程，已经开始改为 8 卡分片，但仍需语义审查。
+- 首次正式 PAG Msp 生成的 14,551 份 top-64 Set ID 只有 1 个 unordered unique set；64 个
+  token 的 document frequency 均为 14,551，导致 Official top-1000 candidate recall=0。当前实现
+  确实遗漏官方 FLOPS quadratic scheduler，但 100-step、FLOPS=0 的诊断仍然 collapse，因此该偏差
+  不是充分根因；还需用锁定的 4700-step 训练和表示审计判断是否为训练尺度/优化动态问题。全部
+  相关 PAG checkpoint/eval 已隔离，不能进入结果。
 - teacher query 已分片；catalog encoding 也应分片后按原始 skill index 合并。
 - 本地 `uv` 环境没有 torch，tensor invariant 要在已验证 GPU 镜像中运行；本地只做无 torch 的契约与语法检查。
 
@@ -64,4 +71,3 @@
 - PAG official code: `https://github.com/HansiZeng/PAG`
 - 项目接入说明：`docs/ripor-pag-ddp.md`
 - 实验记录：`docs/experiments/2026-08-04-letter-ripor-pag-settings.md`
-
