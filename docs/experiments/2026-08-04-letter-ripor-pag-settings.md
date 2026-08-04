@@ -32,11 +32,12 @@ The launcher sources `configs/letter_ripor_pag_20260804.env`. The execution DAG 
 stages are submitted as one-node 8-GPU jobs. The teacher stage writes `setting_contract.json` with
 input SHA-256 hashes before method training.
 
-Locked protocol: Msp 4700 steps with the official PAG sparse-encoder `max_length=128`, PAG decoder
-query-prefix `max_length=64`, Mset 5000,
-shared RIPOR Mseq 5000, each final stage 5000; per-device
-batch 8 (global 64), AdamW with zero weight decay, LR 5e-4, 4.5% linear warmup followed by linear
-decay, BF16, seed 20260626, PAG m=64/top-N=1000/weight=1, and beam=50.
+The unchanged base setting contract records the original Msp 4,700-step confirmation, Mset 5,000,
+shared RIPOR Mseq 5,000 and each final stage 5,000. After that confirmation failed the preregistered
+full-catalog diversity gate, the active SHA-bound `pag_msp_protocol.json` amends Msp only to the official
+PAG scale: 200,000 steps, checkpoints every 25,000 steps, sparse-encoder `max_length=128`, per-device
+batch 32 (global 256 on 8 GPUs), LR 5e-4, zero warmup and BF16. Mset/final budgets and all LETTER,
+teacher, data, Set-ID, decoder query-prefix (`max_length=64`) and evaluation settings remain unchanged.
 
 Eval:
 
@@ -218,3 +219,10 @@ Fresh gate `tide-chenyufei03-10261-akccc` completed successfully with per-device
 `tide-chenyufei03-10262-acfvr`; its CFS log is `logs/pag-shared-official200k-0804a.log`. The first 100
 steps ran without OOM or NaN at roughly 0.6 seconds/step. The first recoverable checkpoint is due at step
 25,000; after step 200,000 the full-catalog Set-ID audit remains a hard gate before Mset starts.
+
+Four one-node/8-GPU downstream requests passed Tianzhi dry-run against the pinned image and `rudder-r2`
+queue: `skillsearch-final-pag-0804a`, `skillsearch-final-ripor-pag-0804a`,
+`skillsearch-eval-pag-0804a` and `skillsearch-eval-ripor-pag-0804a`. A read-only dependency controller
+waits for both the valid Set-ID manifest and Mset final checkpoint, submits the two final arms in parallel,
+then submits each arm's Official/private evaluation after its own final checkpoint is present. Submission
+failure terminates the controller instead of retrying and risking duplicate jobs.
