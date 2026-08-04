@@ -48,21 +48,21 @@ used to tune it.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v5/eval/`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v6/eval/`
 
 ## Verification
 
-- [ ] Historical `B` path reproduces archived predictions exactly on the fixed panel
-- [ ] `gate=0` bypasses RIPOR generation/union/reordering and equals `B`
-- [ ] Real-model teacher-forced raw cumulative scores equal constrained-prefix scores
-- [ ] Bias-free RIPOR head initialization, mapping, trainable parameters and SHA are recorded
+- [x] Historical `B` path reproduces archived prediction rankings exactly on the fixed panel
+- [x] `gate=0` bypasses RIPOR generation/union/reordering and equals `B`
+- [x] Real-model teacher-forced raw cumulative scores equal constrained-prefix scores
+- [x] Bias-free RIPOR head initialization, mapping, trainable parameters and SHA are recorded
 - [ ] Dynamic negative sampling changes across presentations and excludes every sibling GT
 - [ ] M3 mining covers each unexpanded source query exactly once and seals checkpoint/artifact SHA
-- [ ] Single-process global-batch and 8-rank RIPOR loss/gradient invariants pass
+- [x] Single-process global-batch and 8-rank RIPOR loss/gradient invariants pass
 - [ ] Resume restores model/optimizer/scheduler/RNG/sampler position
 - [x] Reviewer required? yes — independent plan review and final focused cross-review completed; no unresolved CRITICAL/HIGH
 - [x] Minimal local check — shell syntax, Python compilation, and 62 unit tests pass (10 torch-only skips)
@@ -127,3 +127,10 @@ as a domain mismatch.  Best-beam scores differ by at most `4.17e-6`.  The compar
 rankings, compares candidate scores whenever the archive actually supplies them, records missing archived
 maps, and uses the real-model parity tolerance (`1e-5`) for floating scores.  `_v4` remains intact and the
 corrected run writes to fresh `_v5`.
+
+The `_v5` `rudder-r1` launch (`tide-chenyufei03-10302-epnhl`) passed historical baseline and gate-zero
+parity, then failed in the final resume check before formal M2.  The metadata-only checkpoint reload used
+`map_location=device`, which converted saved CPU RNG ByteTensors to CUDA tensors; `torch.set_rng_state`
+requires a CPU ByteTensor.  That reload now stays on CPU (model/optimizer restoration remains on the rank's
+device through the normal checkpoint loader), preserving the exact per-rank Python/CPU/CUDA RNG payloads.
+`_v5` remains intact and the corrected run writes to fresh `_v6`.

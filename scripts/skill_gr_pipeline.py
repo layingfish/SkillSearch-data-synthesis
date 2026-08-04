@@ -5057,7 +5057,10 @@ def _run_distributed_structured_training(
             raise ValueError("--resume-from-checkpoint must also be the exact --init-model-dir")
         resume_payload = torch.load(
             args.resume_from_checkpoint / "structured_decoder.pt",
-            map_location=device,
+            # This second load is only for scheduler/RNG metadata.  Loading it
+            # onto CUDA converts the saved CPU RNG ByteTensors into CUDA
+            # tensors, which torch.set_rng_state rejects on resume.
+            map_location="cpu",
         )
         resume_training_state = resume_payload.get("training_state")
         if not isinstance(resume_training_state, dict):
