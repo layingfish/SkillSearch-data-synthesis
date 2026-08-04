@@ -43,6 +43,7 @@ from skill_gr_pipeline import (  # noqa: E402
     compute_at_k_metrics,
     compute_retrieval_metrics,
     command_rescore_ranked,
+    command_write_pag_msp_protocol,
     deduplicate_code_tuples,
     decoder_source_text,
     encode_structured_sid_target,
@@ -58,6 +59,7 @@ from skill_gr_pipeline import (  # noqa: E402
     load_pag_set_token_ids,
     native_semantic_id_text,
     pag_quadratic_regularization_weight,
+    pag_msp_protocol_provenance,
     ripor_prefix_alphas,
     pag_prefix_planner_score,
     prepared_selected_skill_ids,
@@ -730,6 +732,54 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(provenance["settings"], ["ripor", "pag", "ripor_pag"])
         self.assertEqual(provenance["input_sha256"], {"rows": "abc"})
         self.assertEqual(len(provenance["sha256"]), 64)
+
+    def test_pag_msp_protocol_amends_only_the_failed_sparse_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            setting_path = root / "setting_contract.json"
+            protocol_path = root / "pag_msp_protocol.json"
+            setting_path.write_text(
+                json.dumps(
+                    {
+                        "fixed_letter_semantic_ids": True,
+                        "query_target_mode": "single_sid",
+                        "settings": ["ripor", "pag", "ripor_pag"],
+                        "input_files": {},
+                        "msp_steps": 4700,
+                        "pag_sparse_max_length": 128,
+                        "per_device_batch": 8,
+                        "global_batch": 64,
+                        "lr": 5e-4,
+                        "warmup_ratio": 0.045,
+                        "weight_decay": 0.0,
+                        "world_size": 8,
+                        "seed": 20260626,
+                        "mset_steps": 5000,
+                        "final_stage_steps": 5000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            command_write_pag_msp_protocol(
+                argparse.Namespace(
+                    setting_contract=setting_path,
+                    output=protocol_path,
+                    failed_job_id="tide-test-collapse",
+                )
+            )
+            setting = setting_contract_provenance(setting_path)
+            protocol = pag_msp_protocol_provenance(protocol_path, setting)
+            payload = json.loads(protocol_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(protocol["effective"]["max_steps"], 200000)
+            self.assertEqual(protocol["effective"]["global_batch"], 256)
+            self.assertEqual(payload["superseded_base_values"]["msp_steps"], 4700)
+            self.assertEqual(payload["scope"].split(";")[0], "PAG Msp only")
+
+            payload["effective"]["warmup_ratio"] = 0.045
+            protocol_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "deviates from the preregistered official profile"):
+                pag_msp_protocol_provenance(protocol_path, setting)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_pag_merge_preserves_letter_sequential_heads_bitwise(self) -> None:

@@ -6,7 +6,7 @@ set -euo pipefail
 
 STAGE="${1:-}"
 if [[ -z "${STAGE}" ]]; then
-  echo "usage: $0 {teacher|contract|preflight|pag_shared|ripor_mseq|final_ripor|final_pag|final_ripor_pag|eval_baseline|eval_ripor|eval_pag|eval_ripor_pag|all}" >&2
+  echo "usage: $0 {teacher|contract|preflight|pag_msp_protocol|pag_msp_official|pag_mset|pag_shared|ripor_mseq|final_ripor|final_pag|final_ripor_pag|eval_baseline|eval_ripor|eval_pag|eval_ripor_pag|all}" >&2
   exit 2
 fi
 
@@ -30,6 +30,9 @@ required_vars=(
   SKILLGR_RIPOR_STAGE_STEPS SKILLGR_FINAL_STAGE_STEPS
   SKILLGR_PAG_SPARSE_MAX_LENGTH
   SKILLGR_PAG_QUERY_PREFIX_MAX_LENGTH
+  SKILLGR_PAG_MSP_PROTOCOL SKILLGR_PAG_MSP_OFFICIAL_STEPS
+  SKILLGR_PAG_MSP_OFFICIAL_BATCH SKILLGR_PAG_MSP_OFFICIAL_SAVE_STEPS
+  SKILLGR_PAG_MSP_OFFICIAL_WARMUP_RATIO
 )
 for variable_name in "${required_vars[@]}"; do
   if [[ -z "${!variable_name:-}" ]]; then
@@ -83,6 +86,10 @@ PAG_SET_SIZE="${SKILLGR_PAG_SET_SIZE:-64}"
 PAG_TOP_N="${SKILLGR_PAG_TOP_N:-1000}"
 PAG_SET_WEIGHT="${SKILLGR_PAG_SET_WEIGHT:-1.0}"
 NUM_BEAMS="${SKILLGR_NUM_BEAMS:-50}"
+PAG_MSP_OFFICIAL_STEPS="${SKILLGR_PAG_MSP_OFFICIAL_STEPS}"
+PAG_MSP_OFFICIAL_BATCH="${SKILLGR_PAG_MSP_OFFICIAL_BATCH}"
+PAG_MSP_OFFICIAL_SAVE_STEPS="${SKILLGR_PAG_MSP_OFFICIAL_SAVE_STEPS}"
+PAG_MSP_OFFICIAL_WARMUP_RATIO="${SKILLGR_PAG_MSP_OFFICIAL_WARMUP_RATIO}"
 TEACHER_QUERY_MAX_CHARS="${SKILLGR_TEACHER_QUERY_MAX_CHARS:-1500}"
 TEACHER_DESC_MAX="${SKILLGR_TEACHER_DESC_MAX:-300}"
 TEACHER_BODY_MAX="${SKILLGR_TEACHER_BODY_MAX:-2500}"
@@ -90,6 +97,7 @@ TEACHER_BODY_MAX="${SKILLGR_TEACHER_BODY_MAX:-2500}"
 TEACHER_DIR="${SKILLGR_OUTPUT_ROOT}/teacher_panel"
 TEACHER_PANEL="${TEACHER_DIR}/predictions.jsonl"
 SETTING_CONTRACT="${SKILLGR_OUTPUT_ROOT}/setting_contract.json"
+PAG_MSP_PROTOCOL="${SKILLGR_PAG_MSP_PROTOCOL}"
 MSP_DIR="${SKILLGR_OUTPUT_ROOT}/pag_msp"
 SET_IDS="${MSP_DIR}/pag_set_ids.json"
 MSET_DIR="${SKILLGR_OUTPUT_ROOT}/pag_mset"
@@ -294,8 +302,64 @@ train_msp() {
   require_file "${output}/pag_set_ids.json"
 }
 
+ensure_pag_msp_protocol() {
+  python3 scripts/skill_gr_pipeline.py write-pag-msp-protocol \
+    --setting-contract "${SETTING_CONTRACT}" \
+    --output "${PAG_MSP_PROTOCOL}" \
+    --failed-job-id tide-chenyufei03-10257-vkfsd
+  require_file "${PAG_MSP_PROTOCOL}"
+}
+
+train_msp_official() {
+  local rows="$1" output="$2"
+  local resume_args=()
+  ensure_pag_msp_protocol
+  if [[ -n "${SKILLGR_PAG_MSP_RESUME:-}" ]]; then
+    case "${SKILLGR_PAG_MSP_RESUME}" in
+      "${output}"/checkpoint-*) ;;
+      *)
+        echo "PAG Msp resume checkpoint must be inside ${output}/checkpoint-*" >&2
+        exit 3
+        ;;
+    esac
+    if [[ ! -e "${SKILLGR_PAG_MSP_RESUME}" ]]; then
+      echo "PAG Msp resume checkpoint does not exist: ${SKILLGR_PAG_MSP_RESUME}" >&2
+      exit 3
+    fi
+    resume_args=(--resume-checkpoint "${SKILLGR_PAG_MSP_RESUME}")
+  else
+    ensure_fresh_dir "${output}"
+  fi
+  run_torch scripts/skill_gr_pipeline.py train-pag-sparse-encoder \
+    --rows "${rows}" \
+    --skills-jsonl "${SKILLGR_SKILLS}" \
+    --hard-negatives "${TEACHER_PANEL}" \
+    --output-dir "${output}" \
+    --setting-contract "${SETTING_CONTRACT}" \
+    --pag-msp-protocol "${PAG_MSP_PROTOCOL}" \
+    --model "${MODEL}" \
+    --max-length "${PAG_SPARSE_MAX_LENGTH}" \
+    --top-k "${PAG_SET_SIZE}" \
+    --max-steps "${PAG_MSP_OFFICIAL_STEPS}" \
+    --batch-size "${PAG_MSP_OFFICIAL_BATCH}" \
+    --save-steps "${PAG_MSP_OFFICIAL_SAVE_STEPS}" \
+    --lr "${LR}" \
+    --weight-decay "${WEIGHT_DECAY}" \
+    --warmup-ratio "${PAG_MSP_OFFICIAL_WARMUP_RATIO}" \
+    --seed "${SEED}" \
+    --bf16 \
+    "${resume_args[@]}"
+  require_file "${output}/pag_sparse_encoder.pt"
+  require_file "${output}/pag_set_ids.json"
+}
+
 train_mset() {
-  local rows="$1" dev_rows="$2" set_ids="$3" msp_dir="$4" output="$5" steps="$6"
+  local rows="$1" dev_rows="$2" set_ids="$3" msp_dir="$4" output="$5" steps="$6" protocol="${7:-}"
+  local protocol_args=()
+  if [[ -n "${protocol}" ]]; then
+    require_file "${protocol}"
+    protocol_args=(--pag-msp-protocol "${protocol}")
+  fi
   ensure_fresh_dir "${output}"
   run_torch scripts/skill_gr_pipeline.py train-structured-decoder \
     --query-target-mode single_sid \
@@ -308,6 +372,7 @@ train_mset() {
     --pag-set-loss-weight 1 \
     --pag-set-stage-only \
     --setting-contract "${SETTING_CONTRACT}" \
+    "${protocol_args[@]}" \
     --pag-sparse-checkpoint "${msp_dir}" \
     --sequential-ce-weight 0 \
     --catalog-epochs 0 \
@@ -375,8 +440,13 @@ train_ripor_stage() {
 }
 
 train_pag_joint() {
-  local method="$1" rows="$2" dev_rows="$3" set_ids="$4" mset="$5" mseq="$6" output="$7" steps="$8"
+  local method="$1" rows="$2" dev_rows="$3" set_ids="$4" mset="$5" mseq="$6" output="$7" steps="$8" protocol="${9:-}"
   local ripor_weight=0 ce_weight=1
+  local protocol_args=()
+  if [[ -n "${protocol}" ]]; then
+    require_file "${protocol}"
+    protocol_args=(--pag-msp-protocol "${protocol}")
+  fi
   if [[ "${method}" == "ripor_pag" ]]; then
     ripor_weight=1
     ce_weight=0
@@ -387,6 +457,7 @@ train_pag_joint() {
     --query-target-mode single_sid \
     --letter-tokenizer-manifest "${SKILLGR_LETTER_MANIFEST}" \
     --setting-contract "${SETTING_CONTRACT}" \
+    "${protocol_args[@]}" \
     --rows "${rows}" \
     --dev-rows "${dev_rows}" \
     --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
@@ -489,11 +560,11 @@ PY
   local mset="${PREFLIGHT_DIR}/pag_mset"
   local mseq="${PREFLIGHT_DIR}/ripor_mseq"
   train_msp "${train_rows}" "${msp}" 2
-  train_mset "${train_rows}" "${dev_rows}" "${set_ids}" "${msp}" "${mset}" 2
+  train_mset "${train_rows}" "${dev_rows}" "${set_ids}" "${msp}" "${mset}" 2 ""
   train_ripor_stage "${train_rows}" "${dev_rows}" "${SKILLGR_BASE_DECODER}" "${mseq}" 2 0 progressive
   train_ripor_stage "${train_rows}" "${dev_rows}" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_only" 2 2 full
-  train_pag_joint pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${SKILLGR_BASE_DECODER}" "${PREFLIGHT_DIR}/pag_only" 2
-  train_pag_joint ripor_pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_pag" 2
+  train_pag_joint pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${SKILLGR_BASE_DECODER}" "${PREFLIGHT_DIR}/pag_only" 2 ""
+  train_pag_joint ripor_pag "${train_rows}" "${dev_rows}" "${set_ids}" "${mset}/final" "${mseq}/final" "${PREFLIGHT_DIR}/ripor_pag" 2 ""
   eval_pag "${dev_rows}" "${PREFLIGHT_DIR}/ripor_pag/final" "${PREFLIGHT_DIR}/eval_ripor_pag" ripor_pag "${set_ids}"
   touch "${PREFLIGHT_DIR}/PASSED"
 }
@@ -512,11 +583,23 @@ run_stage() {
     preflight)
       stage_preflight
       ;;
-    pag_shared)
-      require_file "${PREFLIGHT_DIR}/PASSED"
+    pag_msp_protocol)
+      ensure_pag_msp_protocol
+      ;;
+    pag_msp_official)
       require_file "${TEACHER_PANEL}"
-      train_msp "${SKILLGR_ROWS}" "${MSP_DIR}" "${SKILLGR_MSP_STEPS}"
-      train_mset "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSP_DIR}" "${MSET_DIR}" "${SKILLGR_MSET_STEPS}"
+      train_msp_official "${SKILLGR_ROWS}" "${MSP_DIR}"
+      ;;
+    pag_mset)
+      require_file "${SET_IDS}"
+      require_file "${MSP_DIR}/pag_sparse_encoder.pt"
+      ensure_pag_msp_protocol
+      train_mset "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSP_DIR}" "${MSET_DIR}" "${SKILLGR_MSET_STEPS}" "${PAG_MSP_PROTOCOL}"
+      ;;
+    pag_shared)
+      require_file "${TEACHER_PANEL}"
+      train_msp_official "${SKILLGR_ROWS}" "${MSP_DIR}"
+      train_mset "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSP_DIR}" "${MSET_DIR}" "${SKILLGR_MSET_STEPS}" "${PAG_MSP_PROTOCOL}"
       ;;
     ripor_mseq)
       require_file "${PREFLIGHT_DIR}/PASSED"
@@ -530,13 +613,13 @@ run_stage() {
     final_pag)
       require_file "${MSET_DIR}/final/structured_decoder.pt"
       require_file "${SET_IDS}"
-      train_pag_joint pag "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSET_DIR}/final" "${SKILLGR_BASE_DECODER}" "${PAG_ONLY_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}"
+      train_pag_joint pag "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSET_DIR}/final" "${SKILLGR_BASE_DECODER}" "${PAG_ONLY_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}" "${PAG_MSP_PROTOCOL}"
       ;;
     final_ripor_pag)
       require_file "${MSET_DIR}/final/structured_decoder.pt"
       require_file "${RIPOR_MSEQ_DIR}/final/structured_decoder.pt"
       require_file "${SET_IDS}"
-      train_pag_joint ripor_pag "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSET_DIR}/final" "${RIPOR_MSEQ_DIR}/final" "${RIPOR_PAG_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}"
+      train_pag_joint ripor_pag "${SKILLGR_ROWS}" "${SKILLGR_DEV_ROWS}" "${SET_IDS}" "${MSET_DIR}/final" "${RIPOR_MSEQ_DIR}/final" "${RIPOR_PAG_DIR}" "${SKILLGR_FINAL_STAGE_STEPS}" "${PAG_MSP_PROTOCOL}"
       ;;
     eval_baseline)
       eval_plain "${SKILLGR_EVAL_ROWS}" "${SKILLGR_BASE_DECODER}" "${SKILLGR_OUTPUT_ROOT}/baseline_eval/official_core75" custom
@@ -567,7 +650,7 @@ run_stage() {
 }
 
 if [[ "${STAGE}" == all ]]; then
-  for stage_name in teacher preflight pag_shared ripor_mseq final_ripor final_pag final_ripor_pag eval_baseline eval_ripor eval_pag eval_ripor_pag; do
+  for stage_name in teacher preflight pag_msp_protocol pag_shared ripor_mseq final_ripor final_pag final_ripor_pag eval_baseline eval_ripor eval_pag eval_ripor_pag; do
     run_stage "${stage_name}"
   done
 else

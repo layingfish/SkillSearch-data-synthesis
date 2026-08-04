@@ -68,8 +68,9 @@
   lexical positive coordinate 为 0，top-64 只剩 1 个 set。这证明短训练发生的是官方 ReLU lexical
   表示进入全零区，而不是 Set ID 写盘/合并错误。
 - 官方 `t5_splade_train.sh` 使用 8 卡、每卡 batch 32、`max_steps=200000`、每 25000 步保存；
-  当前 4700-step 预算远短于官方 Msp 训练尺度。若 4700-step 正式复核仍 collapse，计划只允许把
-  Msp 对齐到该官方尺度，不允许换激活、换 backbone 或改 top-m 规则。
+  当前 4700-step 预算远短于官方 Msp 训练尺度。scheduler-corrected 4700-step 正式复核也得到
+  `unique_set_count=1/14551`，所以已按预注册计划只把 Msp 对齐到该官方尺度；没有换激活、
+  backbone 或 top-m 规则。
 - teacher query 已分片；catalog encoding 也应分片后按原始 skill index 合并。
 - 本地 `uv` 环境没有 torch，tensor invariant 要在已验证 GPU 镜像中运行；本地只做无 torch 的契约与语法检查。
 

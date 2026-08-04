@@ -60,6 +60,9 @@ METHOD_SETTING_CUSTOM = "custom"
 METHOD_SETTING_RIPOR = "ripor"
 METHOD_SETTING_PAG = "pag"
 METHOD_SETTING_RIPOR_PAG = "ripor_pag"
+PAG_MSP_PROTOCOL_FORMAT = "pag_msp_protocol_amendment_v1"
+PAG_OFFICIAL_COMMIT = "49802454fb157fc659c1c6c42bb2d940a9f6bc1b"
+PAG_OFFICIAL_MSP_PROFILE = "pag_official_t5_splade_200k"
 METHOD_SETTINGS = (
     METHOD_SETTING_CUSTOM,
     METHOD_SETTING_RIPOR,
@@ -2103,6 +2106,7 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
 
     context = initialize_distributed(cpu=args.cpu)
     setting_contract = setting_contract_provenance(args.setting_contract)
+    pag_msp_protocol = pag_msp_protocol_provenance(args.pag_msp_protocol, setting_contract)
     if setting_contract is not None and args.allow_weak_teacher:
         raise ValueError("contract-bound PAG Msp training forbids --allow-weak-teacher")
     torch.manual_seed(args.seed + context.rank)
@@ -2133,6 +2137,39 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
         raise ValueError(f"warmup ratio must be in [0, 1), got {args.warmup_ratio}")
     warmup_steps = int(math.ceil(total_steps * args.warmup_ratio))
     regularization_saturation_steps = max(1, total_steps // 3)
+    execution_stop_step = int(args.stop_after_steps) if args.stop_after_steps > 0 else total_steps
+    if execution_stop_step > total_steps:
+        raise ValueError(
+            f"--stop-after-steps cannot exceed total max steps: {execution_stop_step} > {total_steps}"
+        )
+    if pag_msp_protocol is not None:
+        effective = pag_msp_protocol["effective"]
+        actual_protocol = {
+            "max_steps": int(total_steps),
+            "save_steps": int(args.save_steps),
+            "max_length": int(args.max_length),
+            "per_device_batch": int(args.batch_size),
+            "global_batch": int(args.batch_size * context.world_size),
+            "world_size": int(context.world_size),
+            "lr": float(args.lr),
+            "warmup_ratio": float(args.warmup_ratio),
+            "weight_decay": float(args.weight_decay),
+            "query_reg_weight": float(args.query_reg_weight),
+            "doc_reg_weight": float(args.doc_reg_weight),
+            "regularization_saturation_steps": int(regularization_saturation_steps),
+            "seed": int(args.seed),
+        }
+        mismatches = {
+            key: (actual_protocol[key], effective[key])
+            for key in actual_protocol
+            if actual_protocol[key] != effective.get(key)
+        }
+        if mismatches:
+            raise ValueError(f"PAG Msp invocation does not match protocol amendment: {mismatches}")
+        if args.skip_set_id_build:
+            raise ValueError("protocol-bound PAG Msp cannot skip the full-catalog Set ID audit")
+        if execution_stop_step != total_steps:
+            raise ValueError("protocol-bound PAG Msp cannot intentionally stop before 200000 steps")
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -2140,10 +2177,103 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
     )
     step = 0
     epoch = 0
+    resume_batch_index = 0
+    resumed_from: str | None = None
+    if args.resume_checkpoint is not None:
+        resume_path = args.resume_checkpoint
+        if resume_path.is_dir():
+            resume_path = resume_path / "pag_sparse_training_state.pt"
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"PAG Msp resume checkpoint does not exist: {resume_path}")
+        try:
+            resume_payload = torch.load(resume_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            resume_payload = torch.load(resume_path, map_location="cpu")
+        expected_resume = {
+            "total_steps": total_steps,
+            "batch_size": args.batch_size,
+            "world_size": context.world_size,
+            "max_length": args.max_length,
+            "seed": args.seed,
+            "setting_contract_sha256": (setting_contract or {}).get("sha256"),
+            "pag_msp_protocol_sha256": (pag_msp_protocol or {}).get("sha256"),
+        }
+        resume_mismatches = {
+            key: (resume_payload.get(key), value)
+            for key, value in expected_resume.items()
+            if resume_payload.get(key) != value
+        }
+        if resume_mismatches:
+            raise ValueError(f"PAG Msp resume checkpoint protocol mismatch: {resume_mismatches}")
+        model_core.load_state_dict(resume_payload["state_dict"], strict=True)
+        optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        scheduler.load_state_dict(resume_payload["scheduler_state_dict"])
+        step = int(resume_payload["step"])
+        epoch = int(resume_payload["next_epoch"])
+        resume_batch_index = int(resume_payload["next_batch_index"])
+        rank_rng_states = resume_payload.get("rank_rng_states") or []
+        if len(rank_rng_states) != context.world_size:
+            raise ValueError(
+                "PAG Msp resume checkpoint lacks one RNG state per rank: "
+                f"states={len(rank_rng_states)}, world_size={context.world_size}"
+            )
+        local_rng = rank_rng_states[context.rank]
+        random.setstate(local_rng["python"])
+        torch.set_rng_state(local_rng["torch"])
+        if torch.cuda.is_available():
+            torch.cuda.set_rng_state(local_rng["cuda"], device=context.device)
+        resumed_from = str(resume_path)
+        if context.is_main:
+            print(
+                f"pag_sparse_resume step={step} epoch={epoch} batch_index={resume_batch_index} "
+                f"checkpoint={resume_path}",
+                flush=True,
+            )
+
+    def save_training_state(*, next_epoch: int, next_batch_index: int) -> None:
+        local_rng_state = {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state(context.device) if torch.cuda.is_available() else None,
+        }
+        rank_rng_states = all_gather_object(local_rng_state, context)
+        if context.is_main:
+            checkpoint_dir = args.output_dir / f"checkpoint-{step}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = checkpoint_dir / "pag_sparse_training_state.pt"
+            temporary_path = checkpoint_dir / f".{checkpoint_path.name}.tmp-{os.getpid()}"
+            torch.save(
+                {
+                    "format": "pag_sparse_training_state_v1",
+                    "state_dict": model_core.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "step": step,
+                    "next_epoch": next_epoch,
+                    "next_batch_index": next_batch_index,
+                    "total_steps": total_steps,
+                    "batch_size": args.batch_size,
+                    "world_size": context.world_size,
+                    "max_length": args.max_length,
+                    "seed": args.seed,
+                    "setting_contract_sha256": (setting_contract or {}).get("sha256"),
+                    "pag_msp_protocol_sha256": (pag_msp_protocol or {}).get("sha256"),
+                    "rank_rng_states": rank_rng_states,
+                },
+                temporary_path,
+            )
+            os.replace(temporary_path, checkpoint_path)
+            print(f"pag_sparse_checkpoint step={step} path={checkpoint_path}", flush=True)
+        barrier(context)
+
     model.train()
-    while step < total_steps:
-        for batch_rows in distributed_epoch_batches(examples, args.batch_size, context, seed=args.seed, epoch=epoch):
-            if step >= total_steps:
+    while step < execution_stop_step:
+        for batch_index, batch_rows in enumerate(
+            distributed_epoch_batches(examples, args.batch_size, context, seed=args.seed, epoch=epoch)
+        ):
+            if batch_index < resume_batch_index:
+                continue
+            if step >= execution_stop_step:
                 break
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
@@ -2214,6 +2344,11 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
             optimizer.step()
             scheduler.step()
             step += 1
+            next_epoch = epoch
+            next_batch_index = batch_index + 1
+            if next_batch_index >= steps_per_epoch:
+                next_epoch = epoch + 1
+                next_batch_index = 0
             if context.is_main and (step % args.logging_steps == 0 or step == total_steps):
                 print(
                     f"pag_sparse_step={step} loss={float(loss.detach().cpu()):.6f} "
@@ -2221,8 +2356,20 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                     f"query_reg_weight={query_reg_weight:.8g} doc_reg_weight={doc_reg_weight:.8g}",
                     flush=True,
                 )
+            if args.save_steps > 0 and (step % args.save_steps == 0 or step == execution_stop_step):
+                save_training_state(next_epoch=next_epoch, next_batch_index=next_batch_index)
+        resume_batch_index = 0
         epoch += 1
     barrier(context)
+    if step < total_steps:
+        if context.is_main:
+            print(
+                f"pag_sparse_intentional_stop step={step} total_steps={total_steps}; "
+                "resume from the saved training state",
+                flush=True,
+            )
+        destroy_distributed(context)
+        return
     if context.is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -2245,11 +2392,17 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                 "hard_negatives": str(args.hard_negatives),
                 "strict_teacher_scores": not args.allow_weak_teacher,
                 "setting_contract": setting_contract,
+                "pag_msp_protocol": pag_msp_protocol,
+                "save_steps": args.save_steps,
+                "resumed_from": resumed_from,
             },
             args.output_dir / "pag_sparse_encoder.pt",
         )
         tokenizer.save_pretrained(str(args.output_dir))
     barrier(context)
+    if args.skip_set_id_build:
+        destroy_distributed(context)
+        return
     local_rows = [
         (index, skill_id(skill), str(skill.get("skillrouter_text") or format_skillrouter_skill(skill)))
         for index, skill in enumerate(skills)
@@ -2319,6 +2472,8 @@ def command_train_pag_sparse_encoder(args: argparse.Namespace) -> None:
                 "skill_token_ids": {item[1]: item[2] for item in merged},
                 "source_checkpoint": str(args.output_dir / "pag_sparse_encoder.pt"),
                 "objective": "T5SPLADE top-m lexical coordinates",
+                "setting_contract": setting_contract,
+                "pag_msp_protocol": pag_msp_protocol,
                 **set_id_audit,
             },
         )
@@ -3073,6 +3228,133 @@ def setting_contract_provenance(path: Path | None) -> dict[str, Any] | None:
             if isinstance(value, dict) and value.get("sha256")
         },
     }
+
+
+def pag_msp_protocol_provenance(
+    path: Path | None,
+    setting_contract: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the official-scale PAG Msp amendment without replacing the base contract."""
+    if path is None:
+        return None
+    if setting_contract is None:
+        raise ValueError("--pag-msp-protocol requires --setting-contract")
+    if not path.is_file():
+        raise FileNotFoundError(f"PAG Msp protocol does not exist: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("format") != PAG_MSP_PROTOCOL_FORMAT:
+        raise ValueError(f"invalid PAG Msp protocol amendment: {path}")
+    if payload.get("profile") != PAG_OFFICIAL_MSP_PROFILE:
+        raise ValueError(f"PAG Msp protocol does not select the official 200k profile: {path}")
+    base_contract = payload.get("base_setting_contract") or {}
+    if base_contract.get("sha256") != setting_contract.get("sha256"):
+        raise ValueError("PAG Msp protocol is bound to a different setting contract")
+    official_reference = payload.get("official_reference") or {}
+    if official_reference.get("commit") != PAG_OFFICIAL_COMMIT:
+        raise ValueError("PAG Msp protocol does not pin the reviewed official PAG commit")
+    effective = payload.get("effective") or {}
+    required_effective = {
+        "max_steps": 200_000,
+        "save_steps": 25_000,
+        "max_length": 128,
+        "per_device_batch": 32,
+        "global_batch": 256,
+        "world_size": 8,
+        "lr": 5e-4,
+        "warmup_ratio": 0.0,
+        "weight_decay": 0.0,
+        "query_reg_weight": 0.01,
+        "doc_reg_weight": 0.008,
+        "regularization_saturation_steps": 66_666,
+        "seed": 20_260_626,
+    }
+    mismatches = {
+        key: (effective.get(key), value)
+        for key, value in required_effective.items()
+        if effective.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"PAG Msp protocol deviates from the preregistered official profile: {mismatches}")
+    return {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "profile": payload["profile"],
+        "base_setting_contract_sha256": base_contract["sha256"],
+        "reason": payload.get("reason"),
+        "official_reference": official_reference,
+        "effective": effective,
+    }
+
+
+def command_write_pag_msp_protocol(args: argparse.Namespace) -> None:
+    """Write the preregistered official-scale PAG Msp contract amendment."""
+    setting_contract = setting_contract_provenance(args.setting_contract)
+    assert setting_contract is not None
+    base_payload = json.loads(args.setting_contract.read_text(encoding="utf-8"))
+    expected_base_values = {
+        "msp_steps": 4700,
+        "pag_sparse_max_length": 128,
+        "per_device_batch": 8,
+        "global_batch": 64,
+        "lr": 5e-4,
+        "warmup_ratio": 0.045,
+        "weight_decay": 0.0,
+        "world_size": 8,
+        "seed": 20_260_626,
+    }
+    mismatches = {
+        key: (base_payload.get(key), value)
+        for key, value in expected_base_values.items()
+        if base_payload.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"base setting contract is not the failed 4700-step protocol: {mismatches}")
+    payload = {
+        "format": PAG_MSP_PROTOCOL_FORMAT,
+        "profile": PAG_OFFICIAL_MSP_PROFILE,
+        "base_setting_contract": {
+            "path": str(args.setting_contract),
+            "sha256": setting_contract["sha256"],
+        },
+        "reason": "full_catalog_set_id_collapse_after_scheduler_corrected_4700_steps",
+        "failed_confirmation": {
+            "job_id": args.failed_job_id,
+            "skills": 14_551,
+            "unique_set_count": 1,
+            "max_token_document_frequency_ratio": 1.0,
+        },
+        "official_reference": {
+            "repository": "https://github.com/HansiZeng/PAG",
+            "commit": PAG_OFFICIAL_COMMIT,
+            "script": "full_scripts/t5_splade_train.sh",
+        },
+        "scope": "PAG Msp only; LETTER, RIPOR, Mset/final steps, teacher, decoding and evaluation are unchanged",
+        "superseded_base_values": expected_base_values,
+        "effective": {
+            "max_steps": 200_000,
+            "save_steps": 25_000,
+            "max_length": 128,
+            "per_device_batch": 32,
+            "global_batch": 256,
+            "world_size": 8,
+            "lr": 5e-4,
+            "warmup_ratio": 0.0,
+            "weight_decay": 0.0,
+            "query_reg_weight": 0.01,
+            "doc_reg_weight": 0.008,
+            "regularization_schedule": "quadratic_ramp_first_third",
+            "regularization_saturation_steps": 66_666,
+            "precision": "bf16_hardware_substitution_for_official_fp16",
+            "seed": 20_260_626,
+        },
+    }
+    if args.output.exists():
+        existing = json.loads(args.output.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise ValueError(f"refusing to overwrite a different PAG Msp protocol: {args.output}")
+    else:
+        write_json(args.output, payload)
+    print(json.dumps(pag_msp_protocol_provenance(args.output, setting_contract), sort_keys=True))
 
 
 def validate_checkpoint_source_length(
@@ -5137,9 +5419,19 @@ def _initialize_structured_training_model(
         if int(sparse_checkpoint.get("regularization_saturation_steps", 0)) != expected_reg_saturation:
             raise ValueError("PAG Msp checkpoint carries an inconsistent FLOPS saturation step")
         expected_contract = setting_contract_provenance(getattr(args, "setting_contract", None))
+        expected_msp_protocol = pag_msp_protocol_provenance(
+            getattr(args, "pag_msp_protocol", None),
+            expected_contract,
+        )
         sparse_contract = sparse_checkpoint.get("setting_contract") or {}
         if expected_contract is not None and sparse_contract.get("sha256") != expected_contract.get("sha256"):
             raise ValueError("PAG Msp checkpoint setting contract does not match the Mset stage contract")
+        sparse_msp_protocol = sparse_checkpoint.get("pag_msp_protocol") or {}
+        if expected_msp_protocol is not None:
+            if sparse_msp_protocol.get("sha256") != expected_msp_protocol.get("sha256"):
+                raise ValueError("PAG Msp checkpoint protocol amendment does not match the Mset stage")
+        elif sparse_msp_protocol:
+            raise ValueError("PAG Msp checkpoint carries an unacknowledged protocol amendment")
         if int(sparse_checkpoint.get("vocab_size", 0) or 0) != int(getattr(args, "pag_set_vocab_size", 0) or 0):
             raise ValueError("PAG Msp vocabulary does not match the lexical set manifest vocabulary")
         backbone_state = core_model.backbone.state_dict()
@@ -5170,6 +5462,10 @@ def _initialize_structured_training_model(
             map_location=context.device,
         )
         expected_contract = setting_contract_provenance(getattr(args, "setting_contract", None))
+        expected_msp_protocol = pag_msp_protocol_provenance(
+            getattr(args, "pag_msp_protocol", None),
+            expected_contract,
+        )
         if expected_contract is not None:
             set_contract_sha = (set_checkpoint.get("setting_contract") or {}).get("sha256")
             if set_contract_sha != expected_contract.get("sha256"):
@@ -5178,6 +5474,12 @@ def _initialize_structured_training_model(
                 seq_contract_sha = (seq_checkpoint.get("setting_contract") or {}).get("sha256")
                 if seq_contract_sha != expected_contract.get("sha256"):
                     raise ValueError("RIPOR Mseq checkpoint setting contract does not match the joint stage contract")
+        set_msp_protocol = set_checkpoint.get("pag_msp_protocol") or {}
+        if expected_msp_protocol is not None:
+            if set_msp_protocol.get("sha256") != expected_msp_protocol.get("sha256"):
+                raise ValueError("PAG Mset checkpoint protocol amendment does not match the joint stage")
+        elif set_msp_protocol:
+            raise ValueError("PAG Mset checkpoint carries an unacknowledged protocol amendment")
         set_role = str(set_checkpoint.get("stage_role") or set_checkpoint.get("pag", {}).get("stage_role") or "")
         seq_role = str(seq_checkpoint.get("stage_role") or seq_checkpoint.get("pag", {}).get("stage_role") or "")
         if set_role != "pag_mset":
@@ -5634,6 +5936,13 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     pag_set_token_ids, pag_set_vocab_size = load_pag_set_token_ids(args.pag_set_ids)
     method_setting = validate_method_setting_contract(args, pag_set_enabled=bool(pag_set_token_ids))
+    setting_contract = setting_contract_provenance(args.setting_contract)
+    pag_msp_protocol = pag_msp_protocol_provenance(args.pag_msp_protocol, setting_contract)
+    if args.pag_set_ids and pag_msp_protocol is not None:
+        set_manifest = json.loads(args.pag_set_ids.read_text(encoding="utf-8"))
+        set_manifest_protocol = set_manifest.get("pag_msp_protocol") or {}
+        if set_manifest_protocol.get("sha256") != pag_msp_protocol.get("sha256"):
+            raise ValueError("PAG Set ID manifest protocol amendment does not match training")
     if args.setting_contract and args.pag_set_allow_weak_teacher:
         raise ValueError("contract-bound PAG training forbids --pag-set-allow-weak-teacher")
     if args.setting_contract and args.ripor_allow_weak_teacher:
@@ -5782,7 +6091,8 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     )
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
-    checkpoint_metadata["setting_contract"] = setting_contract_provenance(args.setting_contract)
+    checkpoint_metadata["setting_contract"] = setting_contract
+    checkpoint_metadata["pag_msp_protocol"] = pag_msp_protocol
     checkpoint_metadata["method_setting"] = method_setting
     checkpoint_metadata["letter_tokenizer"] = letter_tokenizer
     checkpoint_metadata["query_target_mode"] = args.query_target_mode
@@ -6790,6 +7100,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=command_train_ripor_relevance_encoder)
 
+    p = sub.add_parser("write-pag-msp-protocol")
+    p.add_argument("--setting-contract", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--failed-job-id", default="tide-chenyufei03-10257-vkfsd")
+    p.set_defaults(func=command_write_pag_msp_protocol)
+
     p = sub.add_parser("train-pag-sparse-encoder")
     p.add_argument("--skills-jsonl", type=Path, required=True)
     p.add_argument("--rows", type=Path, required=True)
@@ -6801,6 +7117,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--setting-contract", type=Path)
+    p.add_argument("--pag-msp-protocol", type=Path)
     p.add_argument("--model", default="t5-base")
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--top-k", type=int, default=16)
@@ -6815,6 +7132,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--query-reg-weight", type=float, default=0.01)
     p.add_argument("--doc-reg-weight", type=float, default=0.008)
     p.add_argument("--logging-steps", type=int, default=50)
+    p.add_argument("--save-steps", type=int, default=0)
+    p.add_argument("--resume-checkpoint", type=Path)
+    p.add_argument(
+        "--stop-after-steps",
+        type=int,
+        default=-1,
+        help="resume preflight only; preserve --max-steps scheduler horizon but stop early after saving",
+    )
+    p.add_argument(
+        "--skip-set-id-build",
+        action="store_true",
+        help="training/resume preflight only; forbidden when an official Msp protocol is bound",
+    )
     p.add_argument("--seed", type=int, default=20260803)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--cpu", action="store_true")
@@ -6966,6 +7296,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="rqvae_manifest.json beside the immutable LightGCN+LETTER semantic_ids.jsonl",
     )
     p.add_argument("--setting-contract", type=Path)
+    p.add_argument("--pag-msp-protocol", type=Path)
     p.add_argument(
         "--reset-optimizer",
         action=argparse.BooleanOptionalAction,

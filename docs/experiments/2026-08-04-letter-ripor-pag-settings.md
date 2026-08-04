@@ -193,3 +193,16 @@ before changing protocol. If its full-catalog audit also collapses, `task_plan.m
 an official-scale Msp amendment, bound to the unchanged experiment contract through a separate PAG Msp
 protocol artifact; no activation, backbone, Set-ID rule, downstream step budget, or evaluation setting may
 change.
+
+The scheduler-corrected full-catalog confirmation `tide-chenyufei03-10257-vkfsd` completed all 4,700
+steps (last loss 0.026829) and still reported `unique_set_count=1/14551` with maximum token document
+frequency ratio 1.0. All eight ranks failed together before Mset, as required. Its Msp directory was moved
+intact to `invalid_collapsed_pag_set_ids/pag_msp_scheduler4700_job10257/` and is ineligible downstream.
+
+The preregistered recovery branch is now active. `pag_msp_protocol.json` is bound to base contract SHA
+`e4adb8ce...` and has SHA `0ef4ed4b0060b6b366377357b4bb9278b02ab5f2f5636711004937776a1fa1db`.
+The implementation saves model, optimizer, LR scheduler, global step, next epoch/batch position and every
+rank's Python/Torch/CUDA RNG state atomically every 25,000 steps. Msp, Set-ID manifest, Mset and both PAG
+final arms carry and validate this amendment in addition to the unchanged base setting contract. Before
+the long run, one 8-GPU correctness gate checks official per-device batch 32 memory and exact parameter
+equality between uninterrupted 4-step training and a 2-step checkpoint resumed to step 4.

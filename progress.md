@@ -126,10 +126,17 @@
   1000-step Msp：base 每行平均只有 0.021484 个正 raw coordinate、仍有 9 个 top-64 set；训练后
   raw-logit 最大值均小于 0，lexical representation 全零、top-64 set 只剩 1 个。短 Msp 把模型
   推入官方 ReLU lexical branch 的全零区，是 collapse 的直接机制。
-- 官方 scheduler 下的锁定 4700-step 正式复核为 `tide-chenyufei03-10257-vkfsd`，当前正常运行；
-  `task_plan.md` 已预注册其失败分支：若全量 Set ID 仍 collapse，只把 PAG Msp 对齐到官方
+- 官方 scheduler 下的锁定 4700-step 正式复核为 `tide-chenyufei03-10257-vkfsd`；
+  `task_plan.md` 预注册了其失败分支：若全量 Set ID 仍 collapse，只把 PAG Msp 对齐到官方
   200000-step/每卡 batch32/save-25000 协议，并以独立 Msp contract 绑定原 setting contract，
   其余 RIPOR、LETTER、Mset/final 和评测均不改变。
+- `tide-chenyufei03-10257-vkfsd` 已完成 4700 steps（末步 loss=0.026829），全量审计仍为
+  `unique_set_count=1/14551`、最大 token DF ratio=1.0；8 个 rank 同步在 Mset 前 fail closed。
+  无效 Msp 已完整移动到 `invalid_collapsed_pag_set_ids/pag_msp_scheduler4700_job10257/`，没有删除。
+- 预注册恢复分支已实现：独立 `pag_msp_protocol.json` 绑定原 setting contract SHA，协议 SHA 为
+  `0ef4ed4b0060b6b366377357b4bb9278b02ab5f2f5636711004937776a1fa1db`；Msp 支持每 25000 步
+  原子保存 model/optimizer/scheduler、每 rank RNG 和精确 data position，Mset/final 会双重校验
+  base contract 与 Msp amendment。
 
 ## 错误与处理
 
@@ -141,8 +148,8 @@
 
 ## 下一步
 
-1. 监控 `tide-chenyufei03-10257-vkfsd` 到 4700-step 全量 Set ID 审计。
-2. 若通过，继续 Mset；若 collapse，按 `task_plan.md` 8.1 节实现可续训的官方 200k Msp 分支。
+1. 用一个 8 卡节点验证官方 batch32 显存和 2→4 step exact-resume invariant。
+2. 门禁通过后启动 200000-step 正式 Msp，并在每个 25000-step checkpoint 监控表示状态。
 3. 有效 Mset 完成后并发运行 PAG-only 与 RIPOR+PAG final，再并发统一评测。
 4. 汇总已完成 B/RIPOR 与待完成 PAG 两组的 subset 指标、delta 和交互项。
 

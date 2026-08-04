@@ -159,7 +159,7 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 - [x] 合并后验证 sequential SID embedding/code/control heads bitwise 等于对应 Mseq。
 - [x] 联合阶段启用 query decoder prefix，同时训练 `Lset + CE` 或 `Lset + Lseq`。
 - [x] 实现 top-N Set candidate domain 和 planning-ahead constrained beam。
-- **Status：in_progress（官方 scheduler 已实现并通过 focused invariant；锁定的 4700-step 复核任务正在运行，Set ID 审计仍是 Mset 前置门禁）**
+- **Status：in_progress（scheduler-corrected 4700-step 复核仍全量 collapse；已按 8.1 节启用官方 200k Msp 恢复分支，Set ID 审计仍是 Mset 前置门禁）**
 
 ### Phase 5：8 卡 DDP 与启动器
 
@@ -196,8 +196,11 @@ PAG 的 sequential identifier 继续使用 LETTER SID；Set ID 是独立的 lexi
 
 当前活动任务：
 
-- 官方 FLOPS scheduler 下的 4700-step PAG `Msp → Set ID audit → Mset`：
-  `tide-chenyufei03-10257-vkfsd`；若全量 Set ID collapse，任务必须在 Mset 前失败。
+- 官方 FLOPS scheduler 下的 4700-step PAG 复核 `tide-chenyufei03-10257-vkfsd` 已按门禁在
+  Mset 前失败：`unique_set_count=1/14551`、最大 token DF ratio=1.0；产物已可恢复隔离。
+- 官方 200k Msp 的 scoped protocol SHA 为
+  `0ef4ed4b0060b6b366377357b4bb9278b02ab5f2f5636711004937776a1fa1db`；当前正在做 batch32
+  显存与 exact-resume 的单节点 8 卡门禁，通过后直接启动正式训练。
 - 1000-step 表示审计 `tide-chenyufei03-10259-qxqxc` 已完成，只用于根因判断，不进入结果。
 - corrected full-prefix RIPOR-only `tide-chenyufei03-10247-ctwhg`、B/RIPOR 两套统一评测已完成。
 - 旧 PAG/PAG+RIPOR checkpoint 与评测均在 `invalid_collapsed_pag_set_ids/`，禁止进入结果。
