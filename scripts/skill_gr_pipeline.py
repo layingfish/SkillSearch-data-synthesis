@@ -3415,7 +3415,24 @@ def command_eval_decoder(args: argparse.Namespace) -> None:
         for row in token_rows
     }
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    except AttributeError as exc:
+        # Checkpoints saved by older Transformers versions serialized T5's
+        # generated sentinel tokens as a list.  Transformers 4.57 expects the
+        # same field to be a mapping; extra_ids still reconstructs the exact
+        # sentinel vocabulary, so override only this incompatible metadata.
+        tokenizer_config_path = args.model_dir / "tokenizer_config.json"
+        tokenizer_config = (
+            json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+            if tokenizer_config_path.is_file()
+            else {}
+        )
+        if not isinstance(tokenizer_config.get("extra_special_tokens"), list):
+            raise
+        if "object has no attribute 'keys'" not in str(exc):
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, extra_special_tokens={})
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model.to(device)
@@ -6254,7 +6271,20 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         )
     prefix_descendants = build_semantic_prefix_descendants(semantic_ids, depth)
     device = context.device
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    except AttributeError as exc:
+        tokenizer_config_path = args.model_dir / "tokenizer_config.json"
+        tokenizer_config = (
+            json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+            if tokenizer_config_path.is_file()
+            else {}
+        )
+        if not isinstance(tokenizer_config.get("extra_special_tokens"), list):
+            raise
+        if "object has no attribute 'keys'" not in str(exc):
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, extra_special_tokens={})
     model = make_structured_t5_sid_model(
         str(checkpoint["model"]),
         codebook_size,
