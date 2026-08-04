@@ -119,7 +119,7 @@ payload = {
         "per_device_batch": int(os.environ["SKILLGR_PER_DEVICE_BATCH"]),
         "global_batch": 8 * int(os.environ["SKILLGR_PER_DEVICE_BATCH"]),
         "precision": "bf16",
-        "target_cluster": "SCI_rudder",
+        "queue": "rudder-r1",
         "nodes": 1,
     },
     "negatives": {
@@ -178,8 +178,8 @@ if p.get("stage_steps") != expected:
     raise SystemExit(f"stage budget drift: {p.get('stage_steps')} != {expected}")
 if p.get("distributed", {}).get("world_size") != 8:
     raise SystemExit("contract is not a one-node 8-GPU run")
-if p.get("distributed", {}).get("target_cluster") != "SCI_rudder":
-    raise SystemExit("contract is not bound to the requested SCI_rudder cluster")
+if p.get("distributed", {}).get("queue") != "rudder-r1":
+    raise SystemExit("contract is not bound to the requested rudder-r1 queue")
 status = subprocess.check_output(
     ["git", "status", "--porcelain", "--untracked-files=all"], text=True
 ).strip()

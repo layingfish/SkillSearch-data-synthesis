@@ -30,8 +30,7 @@ Train:
 bash scripts/run_letter_ripor_anchored_20260805.sh all
 ```
 
-The script is intended for one `SCI_rudder` node with 8×A800.  `SCI_rudder` is a distinct platform cluster,
-not an alias for the `rudder-exper` queue.  It runs fail-closed baseline/scoring/DDP
+The script is intended for one `rudder-r1` node with 8×A800.  It runs fail-closed baseline/scoring/DDP
 preflight before M2.  Locked first-run budgets are M2=5,000 steps, each M3 prefix stage=2,500 steps, and
 M4=5,000 steps, with per-device batch 8, LR 1e-4, weight decay 0, BF16, one dynamically sampled scored
 negative per expanded positive, and a fresh optimizer/scheduler per stage.  These are a method-complete
@@ -86,3 +85,7 @@ Final focused cross-review found no remaining CRITICAL/HIGH after changing the C
 `custom` setting, graph-connecting trainable RIPOR heads during catalog CE, adding an 8-rank
 catalog→RIPOR smoke, and switching unit invocation to discovery so an unrelated installed `tests` package
 cannot shadow the repository tests.
+
+Two earlier routing attempts (`tide-chenyufei03-10290-gaxan` and the zero-work probe
+`tide-chenyufei03-10291-dstlh`) were cancelled before scheduling; neither started a Pod or wrote an
+experiment artifact.  The replacement run is explicitly bound to `rudder-r1`.
