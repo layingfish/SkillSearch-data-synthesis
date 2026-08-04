@@ -48,11 +48,11 @@ used to tune it.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v2/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/{m2,m3_prefix1,m3_prefix2,m3_prefix3,m3_prefix4,m4}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v2/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v2/eval/`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_anchored_20260805_v3/eval/`
 
 ## Verification
 
@@ -84,8 +84,9 @@ revalidates all immutable input hashes at every formal stage.
 Final focused cross-review found no remaining CRITICAL/HIGH after changing the CE-only smoke to the legal
 `custom` setting, graph-connecting trainable RIPOR heads during catalog CE, adding an 8-rank
 catalog→RIPOR smoke, and switching unit invocation to discovery so an unrelated installed `tests` package
-cannot shadow the repository tests.  The catalog→RIPOR smoke itself uses the exact `ripor` arm and fixed
-LETTER manifest used by M2; `custom` is reserved for the full-paper M0/RQ path and for the CE-only control.
+cannot shadow the repository tests.  The catalog→RIPOR smoke is an explicitly labeled weak-teacher
+`custom` plumbing artifact; the later `train_ripor` smoke independently exercises the exact fixed-LETTER
+`ripor` arm used by formal M2, which correctly reuses the already catalog-indexed shared baseline.
 
 Two earlier routing attempts (`tide-chenyufei03-10290-gaxan` and the zero-work probe
 `tide-chenyufei03-10291-dstlh`) were cancelled before scheduling; neither started a Pod or wrote an
@@ -99,7 +100,12 @@ path as Git `safe.directory` before the clean-tree/commit provenance checks.
 The replacement `rudder-r1` launch (`tide-chenyufei03-10298-dbfqv`) created and verified the setting
 contract, passed 60+2 unit tests, the 8-rank loss/gradient invariant, and the two-step CE DDP smoke.  It then
 failed closed before formal M2 in the catalog→RIPOR smoke because that smoke was mislabeled `custom`, which
-correctly demands official M0/RQ-centroid provenance.  The smoke now selects `--method-setting ripor` and
-the locked LETTER manifest, matching the formal M2 command without weakening the strict `custom` checks.
-The failed `_v1` artifacts are retained read-only for diagnosis; the corrected run writes to a fresh `_v2`
-root so no partial artifact can be mistaken for a resumable formal stage.
+correctly demands official M0/RQ-centroid provenance unless explicitly marked as an ablation.  The failed
+`_v1` artifacts are retained read-only for diagnosis.
+
+The next `rudder-r1` launch (`tide-chenyufei03-10299-kvkhe`) repeated the successful checks above and then
+failed closed because the isolated `ripor` setting correctly prohibits catalog CE: the shared LETTER
+baseline already owns catalog indexing.  The catalog→RIPOR graph-connectivity check is therefore restored
+to `custom` with the explicit weak-teacher ablation flag, while the separate exact-M2 smoke remains
+`--method-setting ripor --catalog-epochs 0`.  The two failed roots remain intact; the corrected run writes
+to a fresh `_v3` root so no partial artifact can be mistaken for a resumable formal stage.
