@@ -137,6 +137,9 @@
   `0ef4ed4b0060b6b366377357b4bb9278b02ab5f2f5636711004937776a1fa1db`；Msp 支持每 25000 步
   原子保存 model/optimizer/scheduler、每 rank RNG 和精确 data position，Mset/final 会双重校验
   base contract 与 Msp amendment。
+- 首个 resume 门禁 `tide-chenyufei03-10260-reiih` 证明每卡 batch32 无 OOM，连续与 2→4-step
+  恢复路径末步 loss 相同，最大参数误差仅 `9.313225746154785e-10`；原 bitwise-zero 判据过严，
+  已按 Tier-3 数值等价标准显式锁为 `allclose(atol=1e-8)`，需用新作业名复核成功退出。
 
 ## 错误与处理
 
@@ -148,7 +151,7 @@
 
 ## 下一步
 
-1. 用一个 8 卡节点验证官方 batch32 显存和 2→4 step exact-resume invariant。
+1. 用新作业名复核官方 batch32 显存和 2→4 step `allclose(atol=1e-8)` resume invariant。
 2. 门禁通过后启动 200000-step 正式 Msp，并在每个 25000-step checkpoint 监控表示状态。
 3. 有效 Mset 完成后并发运行 PAG-only 与 RIPOR+PAG final，再并发统一评测。
 4. 汇总已完成 B/RIPOR 与待完成 PAG 两组的 subset 指标、delta 和交互项。

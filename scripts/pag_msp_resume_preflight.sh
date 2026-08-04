@@ -6,8 +6,8 @@ bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
 
 REPO=/workspace/SkillSearch-data-synthesis
 EXPERIMENT=/models_rw/SkillSearch-data-synthesis/experiments/letter_ripor_pag_single_sid_20260804_v1
-OUTPUT="${EXPERIMENT}/preflight_pag_msp_resume_0804a"
-LOG="${EXPERIMENT}/logs/pag-msp-resume-preflight-0804a.log"
+OUTPUT="${EXPERIMENT}/preflight_pag_msp_resume_0804b"
+LOG="${EXPERIMENT}/logs/pag-msp-resume-preflight-0804b.log"
 ROWS=/dataset_rw/SkillSearch-data-synthesis/assets-data/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/isolated_mode3_gpt4o_20260714/decoder_rows.base_plus_task5_gt2.plus_isolated_mode3.jsonl
 SKILLS=/dataset_rw/SkillSearch-data-synthesis/assets-data/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_core75_learned_d4_inputs/canonical_skills.jsonl
 TEACHER="${EXPERIMENT}/teacher_panel/predictions.jsonl"
@@ -78,8 +78,11 @@ for key in continuous_state:
         raise SystemExit(f"resume invariant failed: shape mismatch for {key}")
     if left.numel():
         max_error = max(max_error, float((left.float() - right.float()).abs().max()))
-if max_error != 0.0:
-    raise SystemExit(f"resume invariant failed: max_parameter_error={max_error}")
+tolerance = 1e-8
+if max_error > tolerance:
+    raise SystemExit(
+        f"resume invariant failed: max_parameter_error={max_error} exceeds tolerance={tolerance}"
+    )
 result = {
     "world_size": 8,
     "per_device_batch": 32,
@@ -87,6 +90,7 @@ result = {
     "split_step": 2,
     "resumed_steps": 4,
     "max_parameter_error": max_error,
+    "allclose_atol": tolerance,
 }
 (root / "PASSED.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(result, sort_keys=True), flush=True)

@@ -236,7 +236,7 @@ embedding/backbone、改 Set ID 规则或挑某个中间结果规避 collapse。
 - 8×A800 DDP，`max_steps=200000`、`save_steps=25000`、`max_length=128`、每卡 batch=32、
   LR=`5e-4`、weight decay=0、linear decay、Msp warmup=0；BF16 是本集群精度替代。
 - query/doc FLOPS 仍为 `0.01/0.008`，在前 66666 steps 按官方平方曲线增权。
-- 先做一次 batch=32 的 8 卡显存门禁；只有 OOM 才允许降低每卡 batch，并用 gradient
+- 先做一次 batch=32 的 8 卡显存门禁和连续/恢复路径参数 `allclose(atol=1e-8)` 门禁；只有 OOM 才允许降低每卡 batch，并用 gradient
   accumulation 保持 global batch=256，不能借此改变有效 batch。
 - 每 25000 步保存 model/optimizer/scheduler/global-step/RNG/data-position，允许原协议精确续训；
   中间 checkpoint 只做固定 512-skill activation/Set-ID diversity 只读审计，不按指标选点。

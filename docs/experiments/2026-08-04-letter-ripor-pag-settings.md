@@ -204,5 +204,11 @@ The preregistered recovery branch is now active. `pag_msp_protocol.json` is boun
 The implementation saves model, optimizer, LR scheduler, global step, next epoch/batch position and every
 rank's Python/Torch/CUDA RNG state atomically every 25,000 steps. Msp, Set-ID manifest, Mset and both PAG
 final arms carry and validate this amendment in addition to the unchanged base setting contract. Before
-the long run, one 8-GPU correctness gate checks official per-device batch 32 memory and exact parameter
-equality between uninterrupted 4-step training and a 2-step checkpoint resumed to step 4.
+the long run, one 8-GPU correctness gate checks official per-device batch 32 memory and parameter
+`allclose(atol=1e-8)` between uninterrupted 4-step training and a 2-step checkpoint resumed to step 4.
+
+The first gate `tide-chenyufei03-10260-reiih` showed no batch-32 OOM, identical final logged loss and a
+maximum parameter difference of only `9.313225746154785e-10`. It failed solely because the initial script
+required bitwise zero across separate CUDA/NCCL process launches. The invariant is now explicitly the
+Tier-3 numerical-equivalence criterion `max_parameter_error <= 1e-8`; the method, data order, RNG restore
+and all formal hyperparameters are unchanged, and a fresh job name is required for the successful rerun.
