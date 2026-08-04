@@ -243,3 +243,10 @@ resources and is `Inqueue`. The current `Unschedulable/NotEnoughResources` condi
 failing resource fit and five failing the fixed HPN node selector. This is cluster capacity pressure rather
 than a launch-contract regression, so the job keeps its queue position and the main 8-GPU training is not
 cancelled or slowed.
+
+The step-75,000 recoverable checkpoint was written successfully at 2026-08-04 19:42:37 +0800. Its
+training-state file is 2,675,286,719 bytes, matching the step-50,000 checkpoint size, and the formal Msp
+job continued past the save boundary with zero Pod restarts. The dependency controller submitted its
+read-only one-node/8-GPU audit as `tide-chenyufei03-10272-wwfru` and advanced to waiting for step 100,000.
+Both the step-50,000 and step-75,000 audits are currently Pending for whole-node capacity; neither blocks
+or changes the locked 200,000-step training protocol.
