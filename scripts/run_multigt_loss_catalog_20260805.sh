@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -390,14 +390,13 @@ eval_query_checkpoint() {
     --log-every 25
 }
 
-run_query() {
+run_query_from_init() {
   local query_loss="$1"
-  local catalog_epoch="$2"
-  local arm="query_${query_loss}_from_catalog_e${catalog_epoch}"
+  local arm="$2"
+  local init="$3"
+  local prerequisite="$4"
   local output="${SKILLGR_OUTPUT_ROOT}/${arm}"
-  local init
-  init="$(catalog_checkpoint "${catalog_epoch}")"
-  require_file "${SKILLGR_OUTPUT_ROOT}/catalog.done"
+  require_file "${prerequisite}"
   require_file "${init}/structured_decoder.pt"
   require_absent "${output}"
   record_runtime
@@ -436,6 +435,43 @@ run_query() {
   touch "${SKILLGR_OUTPUT_ROOT}/${arm}.done"
 }
 
+run_query() {
+  local query_loss="$1"
+  local catalog_epoch="$2"
+  local arm="query_${query_loss}_from_catalog_e${catalog_epoch}"
+  run_query_from_init \
+    "${query_loss}" \
+    "${arm}" \
+    "$(catalog_checkpoint "${catalog_epoch}")" \
+    "${SKILLGR_OUTPUT_ROOT}/catalog.done"
+}
+
+run_query_from_selected_long_catalog() {
+  local convergence_summary="${EVAL_ROOT}/catalog_long_convergence.json"
+  local selected_epoch
+  require_file "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+  require_file "${convergence_summary}"
+  selected_epoch="$(python3 - "${convergence_summary}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected_epoch = payload.get("selected_epoch")
+if payload.get("converged") is not True or selected_epoch is None:
+    raise SystemExit("long catalog has no checkpoint satisfying the convergence criterion")
+if not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool):
+    raise SystemExit(f"invalid selected catalog epoch: {selected_epoch!r}")
+print(selected_epoch)
+PY
+)"
+  run_query_from_init \
+    expanded_ce \
+    "query_expanded_ce_from_catalog_long_e${selected_epoch}" \
+    "$(long_catalog_checkpoint "${selected_epoch}")" \
+    "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+}
+
 case "${STAGE}" in
   preflight) run_preflight ;;
   preflight_eval) run_preflight_eval ;;
@@ -444,5 +480,6 @@ case "${STAGE}" in
   query_expanded_ce) run_query expanded_ce 3 ;;
   query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
   query_expanded_ce_e6) run_query expanded_ce 6 ;;
+  query_expanded_ce_long_selected) run_query_from_selected_long_catalog ;;
   *) echo "unknown stage: ${STAGE}" >&2; exit 1 ;;
 esac

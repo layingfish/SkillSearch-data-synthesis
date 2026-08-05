@@ -19,6 +19,7 @@ Catalog: 6 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, se
 Query arms: 5 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
 Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
 Long catalog: 30 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
+Selected long-catalog query: read the first converged epoch from `eval/catalog_long_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
 ```
 
 Eval:
@@ -65,3 +66,4 @@ Metrics: pending
 - `tide-chenyufei03-10362-aatho`: running on `rudder`; epoch-6 catalog initialization with expanded CE. Log: `logs/query_expanded_ce_e6.log`.
 - Long-catalog convergence is pre-registered as three consecutive 3-epoch intervals where teacher-forced CE relative change is below 0.01 and SID exact absolute change is below 0.005. The earliest checkpoint completing that window is selected. If no checkpoint qualifies by epoch 30, the run is extended instead of treating epoch 30 as converged.
 - `tide-chenyufei03-10364-psbjx`: running on `rudder-exper` with 1 node / 8 A800 GPUs for the continuous 30-epoch catalog convergence run. The launch reached `catalog_step=200` with 0 pod restarts; all 14,551 catalog rows passed the `max_source_length=2048` audit. Log: `logs/catalog_long_e30.log`.
+- Added the `query_expanded_ce_long_selected` launch stage. It requires a completed 30-epoch catalog run with `converged=true`, resolves the selected saved checkpoint, and preserves the same 5-epoch expanded-CE query/evaluation settings as the catalog epoch-3 and epoch-6 arms.
