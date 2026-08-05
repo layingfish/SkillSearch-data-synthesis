@@ -58,3 +58,6 @@ Metrics: pending
 - `tide-chenyufei03-10339-chwak`: submitted to `rudder-exper` for the formal 6-epoch catalog run with 14,551 skills, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626.
 - `tide-chenyufei03-10339-chwak` completed all 6 catalog epochs and evaluations. Every epoch contained exactly 72,755 effective CE tokens (14,551 rows x 5 target tokens). Teacher-forced CE improved from 3.955837 at epoch 3 to 3.087213 at epoch 6; constrained-greedy exact accuracy improved from 0.001100 (16/14,551) to 0.027627 (402/14,551), under the same bf16, world-size-8, max-source-length-2048 catalog evaluation.
 - Planned query jobs use the `rudder` queue. Each arm uses 1 node / 8 A800 GPUs, 5 query epochs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626.
+- `tide-chenyufei03-10360-qlvvp`: running on `rudder`; epoch-3 catalog initialization with expanded CE. Log: `logs/query_expanded_ce.log`.
+- `tide-chenyufei03-10361-oqabj`: running on `rudder`; epoch-3 catalog initialization with sibling-masked CE. Log: `logs/query_sibling_masked_ce.log`.
+- `tide-chenyufei03-10362-aatho`: running on `rudder`; epoch-6 catalog initialization with expanded CE. Log: `logs/query_expanded_ce_e6.log`.
