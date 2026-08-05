@@ -55,6 +55,9 @@ GR_SOURCE_TEXT_POLICY = "skillrouter_query_1500_chars_with_instruction_v1"
 SEMANTIC_ID_MODE_DEDUP = "rq_codes_with_dedup"
 SEMANTIC_ID_MODE_LEARNED = "learned_codes"
 SEMANTIC_ID_MODES = (SEMANTIC_ID_MODE_DEDUP, SEMANTIC_ID_MODE_LEARNED)
+QUERY_LOSS_EXPANDED_CE = "expanded_ce"
+QUERY_LOSS_SIBLING_MASKED_CE = "sibling_masked_ce"
+QUERY_LOSSES = (QUERY_LOSS_EXPANDED_CE, QUERY_LOSS_SIBLING_MASKED_CE)
 DEFAULT_RIPOR_ALPHA_BETA = 0.5
 DEFAULT_PAG_SET_TOP_N = 0
 METHOD_SETTING_CUSTOM = "custom"
@@ -193,6 +196,8 @@ def log_training_event(wandb_run, row: dict[str, Any]) -> None:
         payload[f"{stage}/train_loss"] = row["train_loss"]
     if "dev_loss" in row:
         payload[f"{stage}/dev_loss"] = row["dev_loss"]
+    if "epoch_mean_ce_loss" in row:
+        payload[f"{stage}/epoch_mean_ce_loss"] = row["epoch_mean_ce_loss"]
     if "lr" in row:
         payload["lr"] = row["lr"]
     wandb_run.log(payload)
@@ -1231,6 +1236,58 @@ def expand_single_sid_query_rows(
             expanded_row["source_target_skill_count"] = row.get("target_skill_count", len(gold_ids))
             expanded.append(expanded_row)
     return expanded
+
+
+def sibling_negative_exclusion_values(
+    row: dict[str, Any],
+    semantic_ids: dict[str, list[int]],
+    depth: int,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+) -> list[list[int]]:
+    """Return sibling-GT labels to remove from each teacher-forced denominator.
+
+    Only a sibling's first code that diverges from the current target shares the
+    same autoregressive prefix. Later codes are conditioned on another prefix
+    and therefore do not compete in the current example's softmax.
+    """
+    selected = [str(sid) for sid in row.get("selected_skill_ids", [])]
+    if len(selected) != 1:
+        raise ValueError(
+            "sibling-masked CE requires one current target per expanded row; "
+            f"got {len(selected)} for row={row.get('index')}"
+        )
+    current_sid = selected[0]
+    if current_sid not in semantic_ids:
+        raise KeyError(f"missing semantic id for current target: {current_sid}")
+    source_values = row.get("source_selected_skill_ids")
+    source_ids = [str(sid) for sid in (source_values if source_values is not None else selected)]
+    if current_sid not in source_ids:
+        raise ValueError(
+            f"current target {current_sid} is absent from source GTs for row={row.get('index')}"
+        )
+    mode = normalize_semantic_id_mode(semantic_id_mode)
+    sid_length = structured_sid_length(depth, mode)
+    current_path = [int(value) for value in semantic_ids[current_sid]]
+    if len(current_path) != sid_length:
+        raise ValueError(
+            f"semantic id length {len(current_path)} does not match schema length={sid_length}: {current_sid}"
+        )
+    exclusions: list[set[int]] = [set() for _ in range(sid_length + 1)]
+    for sibling_sid in _unique_preserving_order(source_ids):
+        if sibling_sid == current_sid:
+            continue
+        if sibling_sid not in semantic_ids:
+            raise KeyError(f"missing semantic id for sibling target: {sibling_sid}")
+        sibling_path = [int(value) for value in semantic_ids[sibling_sid]]
+        if len(sibling_path) != sid_length:
+            raise ValueError(
+                f"semantic id length {len(sibling_path)} does not match schema length={sid_length}: {sibling_sid}"
+            )
+        for position, (current_value, sibling_value) in enumerate(zip(current_path, sibling_path)):
+            if sibling_value != current_value:
+                exclusions[position].add(sibling_value)
+                break
+    return [sorted(values) for values in exclusions]
 
 
 def split_and_expand_single_sid_query_rows(
@@ -4167,6 +4224,19 @@ def _load_ripor_codebook_embeddings(
     return values
 
 
+def cross_entropy_with_label_exclusions(logits, labels, exclusions=None):
+    """Compute CE after removing explicitly allowed alternatives from its denominator."""
+    import torch.nn.functional as F
+
+    if exclusions is not None:
+        if exclusions.shape != logits.shape:
+            raise ValueError(
+                f"CE label exclusions must match logits: {tuple(exclusions.shape)} != {tuple(logits.shape)}"
+            )
+        logits = logits.masked_fill(exclusions.to(device=logits.device, dtype=bool), float("-inf"))
+    return F.cross_entropy(logits, labels, reduction="none")
+
+
 def make_structured_t5_sid_model(
     base_model: str,
     codebook_size: int,
@@ -4509,6 +4579,7 @@ def make_structured_t5_sid_model(
             ripor_candidate_teacher_scores=None,
             ripor_candidate_teacher_observed=None,
             training_sample_weights=None,
+            ce_excluded_labels=None,
             ripor_loss_weight: float = 0.0,
             ripor_margin: float = 1.0,
             ripor_temperature: float = 1.0,
@@ -4549,32 +4620,49 @@ def make_structured_t5_sid_model(
             training_sample_weights = training_sample_weights.to(device=hidden.device, dtype=hidden.dtype)
             if training_sample_weights.ndim != 1 or training_sample_weights.shape[0] != hidden.shape[0]:
                 raise ValueError("structured training sample weights must have shape [batch]")
+            if ce_excluded_labels is not None:
+                if ce_excluded_labels.ndim != 3 or ce_excluded_labels.shape[:2] != target_types.shape:
+                    raise ValueError(
+                        "CE excluded-label mask must have shape [batch, target_length, label_width]"
+                    )
+                ce_excluded_labels = ce_excluded_labels.to(device=hidden.device, dtype=torch.bool)
             token_sample_weights = training_sample_weights[:, None].expand_as(target_types)
             loss_sum = hidden.new_tensor(0.0)
             token_count = hidden.new_tensor(0.0)
+
+            def per_token_ce(logits, token_labels, token_mask):
+                if ce_excluded_labels is not None:
+                    if ce_excluded_labels.shape[-1] < logits.shape[-1]:
+                        raise ValueError(
+                            "CE excluded-label width is smaller than the active head: "
+                            f"mask={ce_excluded_labels.shape[-1]}, head={logits.shape[-1]}"
+                        )
+                    exclusions = ce_excluded_labels[token_mask][:, : logits.shape[-1]]
+                else:
+                    exclusions = None
+                return cross_entropy_with_label_exclusions(logits, token_labels, exclusions)
+
             for level, head in enumerate(self.code_heads):
                 mask = target_types == level
                 if mask.any():
                     weights = token_sample_weights[mask]
-                    per_token = F.cross_entropy(head(hidden[mask]), labels[mask], reduction="none")
+                    per_token = per_token_ce(head(hidden[mask]), labels[mask], mask)
                     loss_sum = loss_sum + (per_token * weights).sum()
                     token_count = token_count + weights.sum()
             if self.dedup_head is not None:
                 dedup_mask = target_types == self.depth
                 if dedup_mask.any():
                     weights = token_sample_weights[dedup_mask]
-                    per_token = F.cross_entropy(
-                        self.dedup_head(hidden[dedup_mask]),
-                        labels[dedup_mask],
-                        reduction="none",
+                    per_token = per_token_ce(
+                        self.dedup_head(hidden[dedup_mask]), labels[dedup_mask], dedup_mask
                     )
                     loss_sum = loss_sum + (per_token * weights).sum()
                     token_count = token_count + weights.sum()
             control_mask = target_types == self.control_type
             if control_mask.any():
                 weights = token_sample_weights[control_mask]
-                per_token = F.cross_entropy(
-                    self.control_head(hidden[control_mask]), labels[control_mask], reduction="none"
+                per_token = per_token_ce(
+                    self.control_head(hidden[control_mask]), labels[control_mask], control_mask
                 )
                 loss_sum = loss_sum + (per_token * weights).sum()
                 token_count = token_count + weights.sum()
@@ -4843,9 +4931,12 @@ def structured_sid_batch(
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
     pag_set_token_ids: dict[str, list[int]] | None = None,
     pag_set_vocab_size: int = 0,
+    query_loss: str = QUERY_LOSS_EXPANDED_CE,
 ) -> dict[str, Any]:
     import torch
 
+    if query_loss not in QUERY_LOSSES:
+        raise ValueError(f"unknown query loss: {query_loss}; expected one of {QUERY_LOSSES}")
     encoded_inputs = tokenizer(
         [decoder_source_text(row) for row in rows],
         padding=True,
@@ -4890,6 +4981,31 @@ def structured_sid_batch(
             device=device,
         ),
     }
+    if query_loss == QUERY_LOSS_SIBLING_MASKED_CE:
+        label_width = max(codebook_size, dedup_size, 2)
+        exclusion_mask = torch.zeros(
+            (len(rows), max_len, label_width), dtype=torch.bool, device=device
+        )
+        for row_index, row in enumerate(rows):
+            exclusion_values = sibling_negative_exclusion_values(
+                row,
+                semantic_ids,
+                depth,
+                semantic_id_mode,
+            )
+            if len(exclusion_values) != len(targets[row_index]["labels"]):
+                raise ValueError("sibling exclusion positions do not match the encoded target length")
+            for position, values in enumerate(exclusion_values):
+                current_label = int(targets[row_index]["labels"][position])
+                if current_label in values:
+                    raise ValueError("sibling exclusion values contain the current target label")
+                for value in values:
+                    if value < 0 or value >= label_width:
+                        raise ValueError(
+                            f"sibling exclusion label {value} is outside mask width={label_width}"
+                        )
+                    exclusion_mask[row_index, position, value] = True
+        result["ce_excluded_labels"] = exclusion_mask
     if pag_set_token_ids:
         if pag_set_vocab_size <= 0:
             raise ValueError("PAG set targets require a positive vocabulary size")
@@ -5013,7 +5129,7 @@ def _run_distributed_structured_training(
 ) -> dict[str, Any]:
     """Shared DDP-safe structured training loop for single and multi SID modes."""
     import torch
-    from transformers import get_linear_schedule_with_warmup
+    from transformers import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 
     device = context.device
     eval_batch_size = args.eval_batch_size or args.batch_size
@@ -5032,19 +5148,31 @@ def _run_distributed_structured_training(
     if total_optimizer_steps <= 0:
         raise ValueError("structured training requires at least one optimizer step")
     warmup_steps = int(math.ceil(total_optimizer_steps * args.warmup_ratio))
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_optimizer_steps,
-    )
+    lr_scheduler = str(getattr(args, "lr_scheduler", "linear"))
+    if lr_scheduler == "linear":
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_optimizer_steps,
+        )
+    elif lr_scheduler == "constant":
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+        )
+    else:
+        raise ValueError(f"unknown LR scheduler: {lr_scheduler}")
     checkpoint_metadata["optimizer_schedule"] = {
-        "name": "linear_warmup_linear_decay",
+        "name": lr_scheduler,
         "initial_lr": float(args.lr),
         "warmup_ratio": float(args.warmup_ratio),
         "warmup_steps": warmup_steps,
         "total_steps": total_optimizer_steps,
     }
-    use_no_padding_sampler = checkpoint_metadata.get("method_setting") == METHOD_SETTING_RIPOR
+    use_no_padding_sampler = (
+        checkpoint_metadata.get("method_setting") == METHOD_SETTING_RIPOR
+        or bool(getattr(args, "no_padding_distributed_sampler", False))
+    )
     checkpoint_metadata["distributed_sampler"] = (
         "no_padding_graph_zero_tail_v1" if use_no_padding_sampler else "padded_equal_batch_v1"
     )
@@ -5142,6 +5270,7 @@ def _run_distributed_structured_training(
                 "last_ripor_loss": None,
                 "best_dev_loss": initial_best_loss,
                 "best_checkpoint": str(args.init_model_dir) if initial_best_loss is not None and args.init_model_dir else None,
+                "epoch_metrics": [],
             }
         stage_ce_weight = (
             1.0 if stage_name == "catalog" else float(getattr(args, "sequential_ce_weight", 1.0))
@@ -5162,9 +5291,13 @@ def _run_distributed_structured_training(
             if step < 0 or step >= total_steps:
                 raise ValueError(f"invalid resumed step {step} for total_steps={total_steps}")
         last_metrics: dict[str, float] | None = None
+        epoch_metrics: list[dict[str, Any]] = []
         steps_per_epoch = max(1, math.ceil(len(stage_rows) / (args.batch_size * context.world_size)))
         model.train()
         while step < total_steps:
+            epoch_started_at_batch = resume_batch_index
+            local_epoch_ce_sum = torch.zeros((), device=device)
+            local_epoch_ce_count = torch.zeros((), device=device)
             batch_iterator = (
                 distributed_epoch_batches_no_padding
                 if use_no_padding_sampler
@@ -5213,6 +5346,11 @@ def _run_distributed_structured_training(
                         else None
                     ),
                     pag_set_vocab_size=pag_set_vocab_size,
+                    query_loss=(
+                        str(getattr(args, "query_loss", QUERY_LOSS_EXPANDED_CE))
+                        if stage_name == "query"
+                        else QUERY_LOSS_EXPANDED_CE
+                    ),
                 )
                 batch["pag_query_prefix"] = bool(pag_set_token_ids and stage_name != "catalog")
                 batch["pag_query_prefix_max_length"] = int(
@@ -5282,6 +5420,8 @@ def _run_distributed_structured_training(
                 ):
                     components = model(**batch, return_components=True)
                     loss = components["loss"]
+                local_epoch_ce_sum = local_epoch_ce_sum + components["local_ce_loss_sum"].detach()
+                local_epoch_ce_count = local_epoch_ce_count + components["local_ce_token_count"].detach()
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
@@ -5380,6 +5520,28 @@ def _run_distributed_structured_training(
                                 "best_step": display_step,
                             },
                         )
+            if epoch_started_at_batch == 0 and step % steps_per_epoch == 0:
+                epoch_ce_sum, epoch_ce_count = reduce_sum_count(
+                    local_epoch_ce_sum, local_epoch_ce_count, context
+                )
+                epoch_event = {
+                    "stage": stage_name,
+                    "event": "epoch",
+                    "step": step + step_offset,
+                    "epoch": epoch_index + 1,
+                    "epoch_mean_ce_loss": epoch_ce_sum / max(1, epoch_ce_count),
+                    "ce_token_count": epoch_ce_count,
+                    "lr": optimizer.param_groups[0]["lr"],
+                }
+                epoch_metrics.append(epoch_event)
+                if context.is_main:
+                    print(
+                        f"{stage_name}_epoch={epoch_index + 1} "
+                        f"mean_ce_loss={epoch_event['epoch_mean_ce_loss']:.6f}",
+                        flush=True,
+                    )
+                    append_loss_history(loss_history_path, epoch_event)
+                    log_training_event(wandb_run, epoch_event)
             epoch_index += 1
             resume_batch_index = 0
         if last_metrics is None:
@@ -5395,6 +5557,7 @@ def _run_distributed_structured_training(
             "last_ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
             "best_dev_loss": best_loss,
             "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
+            "epoch_metrics": epoch_metrics,
         }
 
     catalog_result = train_stage(
@@ -5412,6 +5575,7 @@ def _run_distributed_structured_training(
         "last_ripor_loss": None,
         "best_dev_loss": None,
         "best_checkpoint": None,
+        "epoch_metrics": [],
     }
     query_result = train_stage(
         "query",
@@ -5996,6 +6160,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     )
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    checkpoint_metadata["query_loss"] = str(args.query_loss)
     checkpoint_metadata["initialization"] = init_info
     checkpoint_metadata["setting_contract"] = setting_contract_provenance(args.setting_contract)
     checkpoint_metadata["method_setting"] = method_setting
@@ -6066,7 +6231,10 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "max_steps": args.max_steps,
             "epochs": args.epochs,
             "catalog_epochs": args.catalog_epochs,
+            "query_loss": args.query_loss,
             "lr": args.lr,
+            "lr_scheduler": args.lr_scheduler,
+            "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
             "weight_decay": args.weight_decay,
             "seed": args.seed,
             "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
@@ -6095,6 +6263,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "letter_single_sid_ripor_prefix_margin_mse"
             if method_setting == METHOD_SETTING_RIPOR
             else "single_sid_catalog_indexing_with_official_ripor_prefix_margin_mse"
+            if args.ripor_loss_weight > 0
+            else f"single_sid_catalog_indexing_then_{args.query_loss}"
         ),
         wandb_run=wandb_run,
         ripor_enabled=args.ripor_loss_weight > 0,
@@ -6139,7 +6309,10 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "query_dev_length_audit": query_dev_length_audit,
                 "catalog_length_audit": catalog_length_audit,
                 "ripor": checkpoint_metadata["ripor"],
+                "query_loss": args.query_loss,
                 "lr": args.lr,
+                "lr_scheduler": args.lr_scheduler,
+                "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
                 "weight_decay": args.weight_decay,
                 "seed": args.seed,
                 "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
@@ -6187,6 +6360,8 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     if args.query_target_mode == "single_sid":
         train_rows = expand_single_sid_query_rows(train_rows, semantic_ids)
         dev_rows = expand_single_sid_query_rows(dev_rows, semantic_ids)
+    elif args.query_loss == QUERY_LOSS_SIBLING_MASKED_CE:
+        raise ValueError("sibling-masked CE requires --query-target-mode single_sid")
     catalog_enabled = bool(args.skills_jsonl and args.catalog_max_steps != 0 and args.catalog_epochs != 0)
     catalog_rows = (
         build_single_sid_catalog_rows(load_jsonl(args.skills_jsonl), semantic_ids, args.catalog_input_prefix)
@@ -6353,6 +6528,7 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
     )
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    checkpoint_metadata["query_loss"] = str(args.query_loss)
     checkpoint_metadata["initialization"] = init_info
     checkpoint_metadata["setting_contract"] = setting_contract
     checkpoint_metadata["pag_msp_protocol"] = pag_msp_protocol
@@ -6439,6 +6615,7 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
             "pag": checkpoint_metadata["pag"],
             "method_setting": method_setting,
             "query_target_mode": args.query_target_mode,
+            "query_loss": args.query_loss,
             "letter_tokenizer": letter_tokenizer,
             "catalog_enabled": catalog_enabled,
             "codebook_size": codebook_size,
@@ -6459,6 +6636,8 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
             "max_steps": args.max_steps,
             "epochs": args.epochs,
             "catalog_epochs": args.catalog_epochs,
+            "lr_scheduler": args.lr_scheduler,
+            "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "seed": args.seed,
@@ -6541,11 +6720,14 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
                 "source_text_policy": checkpoint_metadata["source_text_policy"],
                 "method_setting": method_setting,
                 "query_target_mode": args.query_target_mode,
+                "query_loss": args.query_loss,
                 "letter_tokenizer": letter_tokenizer,
                 "pag": checkpoint_metadata["pag"],
                 "ripor": checkpoint_metadata["ripor"],
                 "reset_optimizer": bool(args.reset_optimizer),
                 "lr": args.lr,
+                "lr_scheduler": args.lr_scheduler,
+                "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
                 "weight_decay": args.weight_decay,
                 "seed": args.seed,
                 **init_info,
@@ -7560,6 +7742,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="structured",
         help="target construction for query rows; fixed-LETTER comparison settings require single_sid",
     )
+    p.add_argument(
+        "--query-loss",
+        choices=QUERY_LOSSES,
+        default=QUERY_LOSS_EXPANDED_CE,
+        help="expanded single-target CE or CE that removes sibling-GT branches from the denominator",
+    )
     p.add_argument("--catalog-epochs", type=int, default=0)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
     p.add_argument(
@@ -7591,11 +7779,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.0)
+    p.add_argument("--lr-scheduler", choices=["linear", "constant"], default="linear")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--dev-ratio", type=float, default=0.1)
     p.add_argument("--logging-steps", type=int, default=25)
     p.add_argument("--eval-steps", type=int, default=100)
     p.add_argument("--save-steps", type=int, default=0)
+    p.add_argument(
+        "--no-padding-distributed-sampler",
+        action="store_true",
+        default=False,
+        help="visit each real row once per epoch and use zero-weight tail dummies for DDP alignment",
+    )
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
     p.add_argument("--resume-from-checkpoint", type=Path)
@@ -7690,6 +7885,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--codebook-size", type=int)
     p.add_argument("--dedup-size", type=int)
     p.add_argument("--catalog-input-prefix", default="skill document: ")
+    p.add_argument(
+        "--query-loss",
+        choices=QUERY_LOSSES,
+        default=QUERY_LOSS_EXPANDED_CE,
+        help="expanded single-target CE or CE that removes sibling-GT branches from the denominator",
+    )
     p.add_argument("--catalog-epochs", type=int, default=3)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
@@ -7701,11 +7902,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.0)
+    p.add_argument("--lr-scheduler", choices=["linear", "constant"], default="linear")
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--dev-ratio", type=float, default=0.1)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--eval-steps", type=int, default=200)
     p.add_argument("--save-steps", type=int, default=0)
+    p.add_argument(
+        "--no-padding-distributed-sampler",
+        action="store_true",
+        default=False,
+        help="visit each real row once per epoch and use zero-weight tail dummies for DDP alignment",
+    )
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
     p.add_argument("--resume-from-checkpoint", type=Path)

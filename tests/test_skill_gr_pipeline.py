@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import random
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from skill_gr_pipeline import (  # noqa: E402
     canonicalize_exact_skill_documents,
     compute_at_k_metrics,
     compute_retrieval_metrics,
+    cross_entropy_with_label_exclusions,
     command_rescore_ranked,
     command_write_pag_msp_protocol,
     deduplicate_code_tuples,
@@ -70,6 +72,7 @@ from skill_gr_pipeline import (  # noqa: E402
     save_structured_decoder_checkpoint,
     semantic_ids_sha256,
     setting_contract_provenance,
+    sibling_negative_exclusion_values,
     split_and_expand_single_sid_query_rows,
     stratified_split_rows,
     structured_allowed_values,
@@ -492,6 +495,56 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(model.control_type, 4)
         self.assertEqual(model.sid_embedding.num_embeddings, 1027)
         self.assertFalse(any(name.startswith("dedup_head") for name in model.state_dict()))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sibling_exclusions_cover_narrow_control_head_in_full_forward(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        for parameter in model.parameters():
+            torch.nn.init.zeros_(parameter)
+        hidden = torch.zeros((1, 5, 8), requires_grad=True)
+        model.encode_source = lambda input_ids, attention_mask: torch.zeros((1, 1, 8))
+        model._decoder_hidden_from_encoder = lambda *args, **kwargs: hidden
+        exclusions = torch.zeros((1, 5, 16), dtype=torch.bool)
+        exclusions[0, 4, 0] = True
+
+        components = model(
+            input_ids=torch.zeros((1, 1), dtype=torch.long),
+            attention_mask=torch.ones((1, 1), dtype=torch.long),
+            decoder_input_ids=torch.zeros((1, 5), dtype=torch.long),
+            decoder_attention_mask=torch.ones((1, 5), dtype=torch.long),
+            target_types=torch.tensor([[0, 1, 2, 3, 4]]),
+            labels=torch.tensor([[1, 2, 3, 4, 1]]),
+            ce_excluded_labels=exclusions,
+            return_components=True,
+        )
+
+        self.assertAlmostEqual(
+            float(components["ce_loss"].detach()), 4.0 * math.log(16.0) / 5.0, places=6
+        )
+        components["loss"].backward()
+        self.assertIsNotNone(hidden.grad)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_ripor_progressive_prefix_slices_divergence_mask_and_count(self) -> None:
@@ -1258,6 +1311,76 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertTrue(decoder_source_text(expanded[0]).endswith("find the best audio extraction tool"))
         self.assertEqual(expanded[0]["source_selected_skill_ids"], ["skill/a", "skill/b"])
 
+    def test_sibling_exclusion_masks_only_the_first_divergence_for_each_gt(self) -> None:
+        semantic_ids = {
+            "skill/a": [1, 2, 3, 4],
+            "skill/b": [1, 9, 8, 7],
+            "skill/c": [5, 2, 3, 4],
+            "skill/d": [1, 2, 6, 4],
+        }
+        row = {
+            "index": "q1",
+            "selected_skill_ids": ["skill/a"],
+            "source_selected_skill_ids": ["skill/a", "skill/b", "skill/c", "skill/d"],
+        }
+
+        exclusions = sibling_negative_exclusion_values(
+            row,
+            semantic_ids,
+            depth=4,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+        )
+
+        self.assertEqual(exclusions, [[5], [9], [6], [], []])
+
+    def test_sibling_exclusion_is_empty_for_single_gt_and_covers_dedup_divergence(self) -> None:
+        learned_ids = {"skill/a": [1, 2, 3, 4]}
+        single = {
+            "selected_skill_ids": ["skill/a"],
+            "source_selected_skill_ids": ["skill/a"],
+        }
+        self.assertEqual(
+            sibling_negative_exclusion_values(
+                single,
+                learned_ids,
+                depth=4,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            ),
+            [[], [], [], [], []],
+        )
+
+        dedup_ids = {"skill/a": [1, 2, 3, 0], "skill/b": [1, 2, 3, 1]}
+        dedup_row = {
+            "selected_skill_ids": ["skill/a"],
+            "source_selected_skill_ids": ["skill/a", "skill/b"],
+        }
+        self.assertEqual(
+            sibling_negative_exclusion_values(
+                dedup_row,
+                dedup_ids,
+                depth=3,
+                semantic_id_mode=SEMANTIC_ID_MODE_DEDUP,
+            ),
+            [[], [], [], [1], []],
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_label_exclusion_removes_only_the_sibling_logit_from_ce(self) -> None:
+        import torch
+
+        logits = torch.zeros((1, 3), dtype=torch.float32, requires_grad=True)
+        labels = torch.tensor([0], dtype=torch.long)
+        baseline = cross_entropy_with_label_exclusions(logits, labels)
+        exclusions = torch.tensor([[False, True, False]])
+        masked = cross_entropy_with_label_exclusions(logits, labels, exclusions)
+
+        self.assertAlmostEqual(float(baseline.detach()), math.log(3.0), places=6)
+        self.assertAlmostEqual(float(masked.detach()), math.log(2.0), places=6)
+        masked.sum().backward()
+        self.assertEqual(float(logits.grad[0, 1]), 0.0)
+        self.assertLess(float(logits.grad[0, 0]), 0.0)
+        self.assertGreater(float(logits.grad[0, 2]), 0.0)
+
     def test_single_sid_fallback_split_keeps_each_source_query_in_one_split(self) -> None:
         rows = [
             {
@@ -1498,6 +1621,11 @@ class SkillGRPipelineTest(unittest.TestCase):
                 "1.269171",
                 "--eval-batch-size",
                 "128",
+                "--query-loss",
+                "sibling_masked_ce",
+                "--lr-scheduler",
+                "constant",
+                "--no-padding-distributed-sampler",
             ]
         )
         eval_args = parser.parse_args(
@@ -1529,6 +1657,12 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(train_args.step_offset, 10000)
         self.assertAlmostEqual(train_args.initial_best_dev_loss, 1.269171)
         self.assertEqual(train_args.eval_batch_size, 128)
+        self.assertEqual(train_args.query_loss, "sibling_masked_ce")
+        self.assertEqual(train_args.lr_scheduler, "constant")
+        self.assertTrue(train_args.no_padding_distributed_sampler)
+        self.assertEqual(structured_args.query_loss, "expanded_ce")
+        self.assertEqual(structured_args.lr_scheduler, "linear")
+        self.assertFalse(structured_args.no_padding_distributed_sampler)
         self.assertEqual(eval_args.command, "eval-single-sid-decoder")
         self.assertEqual(eval_args.max_skills, 1)
         self.assertIsNone(eval_args.max_source_length)
