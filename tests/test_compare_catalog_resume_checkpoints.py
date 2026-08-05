@@ -17,6 +17,7 @@ from compare_catalog_resume_checkpoints import (  # noqa: E402
     compare_tensor_mappings,
     file_sha256,
     parse_label_path,
+    tensor_mapping_sha256,
 )
 
 
@@ -64,6 +65,17 @@ class CatalogResumeCheckpointComparisonTest(unittest.TestCase):
         self.assertEqual(result["left_nonfinite_numel"], 0)
         self.assertEqual(result["right_nonfinite_numel"], 0)
         self.assertEqual(result["top_drift_tensors"][0]["key"], "weight")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch"),
+        "torch is available in the remote training environment",
+    )
+    def test_tensor_mapping_sha256_accepts_scalar_tensors(self) -> None:
+        import torch
+
+        observed = tensor_mapping_sha256({"step": torch.tensor(4.0)})
+
+        self.assertEqual(len(observed), 64)
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch"),

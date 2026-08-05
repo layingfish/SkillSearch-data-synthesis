@@ -117,7 +117,7 @@ def tensor_mapping_sha256(
         digest.update(key.encode("utf-8"))
         digest.update(str(tuple(tensor.shape)).encode("ascii"))
         digest.update(str(tensor.dtype).encode("ascii"))
-        byte_view = tensor.view(torch.uint8).reshape(-1)
+        byte_view = tensor.reshape(-1).view(torch.uint8)
         for start in range(0, byte_view.numel(), chunk_bytes):
             digest.update(byte_view[start : start + chunk_bytes].numpy().tobytes())
     return digest.hexdigest()
