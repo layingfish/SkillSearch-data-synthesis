@@ -20,7 +20,9 @@ Query arms: 5 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule,
 Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
 Long catalog: 30 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
 Catalog extension: resume the epoch-27 checkpoint to a 60-epoch total horizon with restored optimizer/scheduler/per-rank RNG/shuffle epoch, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; require exact epoch-30 model-state parity before using later checkpoints
+Fresh catalog: 60 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
 Selected long-catalog query: read the first converged epoch from `eval/catalog_long_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
+Selected fresh-catalog query: read the first converged epoch from `eval/catalog_fresh_e60_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
 ```
 
 Eval:
@@ -29,6 +31,7 @@ Eval:
 Catalog checkpoints: epoch 1/2/3/6 teacher-forced CE, per-level accuracy, exact SID accuracy
 Catalog checkpoints: epoch 3/6 constrained greedy exact SID accuracy
 Long catalog checkpoints: epoch 3/6/9/.../30 teacher-forced metrics; epoch 6/12/18/24/30 constrained greedy
+Fresh catalog checkpoints: epoch 3/6/9/.../60 teacher-forced metrics; epoch 6/12/18/24/30/36/42/48/54/60 constrained greedy
 Query checkpoints: private 1,000-query and Official core75, constrained beam=50, R@1/R@10/R@50
 ```
 
@@ -48,6 +51,7 @@ Metrics: pending
 - [x] Catalog-resume contract tests for stage, horizon, scheduler, warmup, batch, and world size
 - [ ] Remote epoch-30 exact model-state parity after resuming from epoch 27
 - [ ] Retrieval evaluation from the selected converged catalog checkpoint
+- [ ] Fresh continuous epoch-60 catalog convergence and retrieval evaluation
 - [x] Reviewer required? no; structured local semantic review completed
 
 ## Result / Notes
@@ -105,3 +109,5 @@ Metrics: pending
 - The resume diagnostic reruns epoch 28-30 from the same epoch-27 checkpoint as `resume-B`, preserving 1 node / 8 A800 GPUs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626. It compares original/resume-A/resume-B model and optimizer pairwise drift, scheduler/RNG fingerprints, current input hashes, and teacher-forced CE/SID exact on 14,551 catalog rows. No acceptance threshold is chosen before observing the repeat-resume variation; historical input-byte equality remains unproven because the original checkpoint did not record those hashes.
 - `tide-chenyufei03-10387-toima`: submitted to `rudder-exper` for the resume-B diagnostic using 1 node / 8 A800 GPUs and detached commit `c706cdc`. Log: `logs/catalog_resume_diagnostics.log`.
 - `tide-chenyufei03-10387-toima` completed resume-B epochs 28-30 and both teacher-forced evaluations, then failed in the checkpoint comparator because optimizer `step` is a scalar tensor and the byte-view helper did not flatten it before changing dtype. The completed training/evaluation artifacts are reusable; the comparator fix adds a scalar-tensor regression test.
+- `tide-chenyufei03-10389-crpnr`: submitted to `rudder-exper` from detached commit `0f43694` to reuse the completed resume-B and teacher-forced artifacts, run the fixed scalar-tensor regression test, and finish checkpoint comparison.
+- `tide-chenyufei03-10389-crpnr` completed the comparison. Resume-A and resume-B are bitwise identical across 299,290,626 model elements and 448,962,832 optimizer elements. Their model/optimizer relative-L2 drift is exactly zero, and their 14,551-row teacher-forced CE/SID exact metrics are both 0.0476795566/0.958078483 under bf16, world size 8, per-rank batch size 2, and max source length 2048. Relative to the original continuous epoch-30 checkpoint, both resumes have model relative-L2 0.00108570, teacher-forced CE delta -0.00185700, and SID-exact delta +0.000549790 under the same catalog evaluation. The resumed epoch-60 trajectory is therefore quarantined; the convergence experiment will use a fresh continuous epoch-60 run from T5-base.

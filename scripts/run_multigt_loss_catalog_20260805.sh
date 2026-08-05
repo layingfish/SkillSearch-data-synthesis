@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|catalog_resume_diagnostics|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|catalog_resume_diagnostics|catalog_fresh_e60|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected|query_expanded_ce_fresh_e60_selected}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -26,6 +26,7 @@ export SKILLGR_MODEL
 CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_e6"
 LONG_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e30"
 EXTENDED_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e60_from_e27"
+FRESH_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_fresh_e60"
 RESUME_PROBE_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_resume_probe_e30_b"
 CATALOG_ROWS="${SKILLGR_OUTPUT_ROOT}/catalog_rows.jsonl"
 EVAL_ROOT="${SKILLGR_OUTPUT_ROOT}/eval"
@@ -249,6 +250,22 @@ extended_catalog_checkpoint() {
   fi
 }
 
+fresh_catalog_checkpoint() {
+  local epoch="$1"
+  if (( epoch <= 0 || epoch > SKILLGR_EXTENDED_CATALOG_EPOCHS )); then
+    echo "unsupported fresh catalog epoch: ${epoch}" >&2
+    exit 1
+  fi
+  if (( epoch == SKILLGR_EXTENDED_CATALOG_EPOCHS )); then
+    echo "${FRESH_CATALOG_DIR}/final"
+  elif (( epoch % SKILLGR_LONG_CATALOG_EVAL_INTERVAL == 0 )); then
+    echo "${FRESH_CATALOG_DIR}/checkpoint-$((epoch * SKILLGR_CATALOG_STEPS_PER_EPOCH))"
+  else
+    echo "fresh catalog epoch is not a saved evaluation checkpoint: ${epoch}" >&2
+    exit 1
+  fi
+}
+
 eval_catalog_teacher_forced() {
   local label="$1"
   local model_dir="$2"
@@ -397,6 +414,71 @@ run_catalog_long() {
   done
   write_long_catalog_convergence_summary
   touch "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+}
+
+run_catalog_fresh_e60() {
+  local teacher_group="catalog_fresh_e60_teacher_forced"
+  local greedy_group="catalog_fresh_e60_constrained_greedy"
+  local convergence_output="${EVAL_ROOT}/catalog_fresh_e60_convergence.json"
+
+  require_file "${SKILLGR_OUTPUT_ROOT}/preflight_v3/preflight.done"
+  require_file "${CATALOG_ROWS}"
+  require_absent "${FRESH_CATALOG_DIR}"
+  require_absent "${EVAL_ROOT}/${teacher_group}"
+  require_absent "${EVAL_ROOT}/${greedy_group}"
+  require_absent "${convergence_output}"
+  require_absent "${SKILLGR_OUTPUT_ROOT}/catalog_fresh_e60.done"
+  mkdir -p "${SKILLGR_OUTPUT_ROOT}"
+  record_runtime
+  run_torch scripts/skill_gr_pipeline.py train-single-sid-decoder \
+    --rows "${SKILLGR_ROWS}" \
+    --dev-rows "${SKILLGR_DEV_ROWS}" \
+    --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+    --skills-jsonl "${SKILLGR_SKILLS}" \
+    --output-dir "${FRESH_CATALOG_DIR}" \
+    --model "${SKILLGR_MODEL}" \
+    --query-loss expanded_ce \
+    --catalog-epochs "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" \
+    --epochs 0 \
+    --max-source-length "${SKILLGR_MAX_SOURCE_LENGTH}" \
+    --batch-size "${SKILLGR_PER_DEVICE_BATCH}" \
+    --eval-batch-size "${SKILLGR_EVAL_PER_DEVICE_BATCH}" \
+    --lr "${SKILLGR_LR}" \
+    --warmup-ratio "${SKILLGR_WARMUP_RATIO}" \
+    --lr-scheduler constant \
+    --weight-decay "${SKILLGR_WEIGHT_DECAY}" \
+    --logging-steps 50 \
+    --eval-steps 0 \
+    --save-steps "$((SKILLGR_LONG_CATALOG_EVAL_INTERVAL * SKILLGR_CATALOG_STEPS_PER_EPOCH))" \
+    --no-padding-distributed-sampler \
+    --seed "${SKILLGR_SEED}" \
+    --no-load-best-model-at-end \
+    --bf16
+  verify_epoch_history \
+    "${FRESH_CATALOG_DIR}/loss_history.jsonl" catalog "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" 72755
+
+  local epoch
+  for ((
+    epoch = SKILLGR_LONG_CATALOG_EVAL_INTERVAL;
+    epoch <= SKILLGR_EXTENDED_CATALOG_EPOCHS;
+    epoch += SKILLGR_LONG_CATALOG_EVAL_INTERVAL
+  )); do
+    eval_catalog_teacher_forced \
+      "epoch${epoch}" "$(fresh_catalog_checkpoint "${epoch}")" "${teacher_group}"
+  done
+  python3 scripts/analyze_catalog_convergence.py \
+    --metrics-dir "${EVAL_ROOT}/${teacher_group}" \
+    --output "${convergence_output}" \
+    --checkpoint-interval "${SKILLGR_LONG_CATALOG_EVAL_INTERVAL}" \
+    --max-epoch "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" \
+    --ce-relative-threshold 0.01 \
+    --sid-exact-absolute-threshold 0.005 \
+    --consecutive-stable-intervals 3
+  for epoch in 6 12 18 24 30 36 42 48 54 60; do
+    eval_catalog_constrained_greedy \
+      "epoch${epoch}" "$(fresh_catalog_checkpoint "${epoch}")" "${greedy_group}"
+  done
+  touch "${SKILLGR_OUTPUT_ROOT}/catalog_fresh_e60.done"
 }
 
 run_catalog_extend_e60() {
@@ -859,6 +941,34 @@ PY
     "${prerequisite}"
 }
 
+run_query_from_selected_fresh_catalog() {
+  local convergence_summary="${EVAL_ROOT}/catalog_fresh_e60_convergence.json"
+  local prerequisite="${SKILLGR_OUTPUT_ROOT}/catalog_fresh_e60.done"
+  local selected_epoch
+
+  require_file "${prerequisite}"
+  require_file "${convergence_summary}"
+  selected_epoch="$(python3 - "${convergence_summary}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+selected_epoch = payload.get("selected_epoch")
+if payload.get("converged") is not True or selected_epoch is None:
+    raise SystemExit("fresh epoch-60 catalog has no checkpoint satisfying the convergence criterion")
+if not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool):
+    raise SystemExit(f"invalid selected catalog epoch: {selected_epoch!r}")
+print(selected_epoch)
+PY
+)"
+  run_query_from_init \
+    expanded_ce \
+    "query_expanded_ce_from_catalog_fresh_e${selected_epoch}" \
+    "$(fresh_catalog_checkpoint "${selected_epoch}")" \
+    "${prerequisite}"
+}
+
 case "${STAGE}" in
   preflight) run_preflight ;;
   preflight_eval) run_preflight_eval ;;
@@ -866,9 +976,11 @@ case "${STAGE}" in
   catalog_long_e30) run_catalog_long ;;
   catalog_extend_e60) run_catalog_extend_e60 ;;
   catalog_resume_diagnostics) run_catalog_resume_diagnostics ;;
+  catalog_fresh_e60) run_catalog_fresh_e60 ;;
   query_expanded_ce) run_query expanded_ce 3 ;;
   query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
   query_expanded_ce_e6) run_query expanded_ce 6 ;;
   query_expanded_ce_long_selected) run_query_from_selected_long_catalog ;;
+  query_expanded_ce_fresh_e60_selected) run_query_from_selected_fresh_catalog ;;
   *) echo "unknown stage: ${STAGE}" >&2; exit 1 ;;
 esac
