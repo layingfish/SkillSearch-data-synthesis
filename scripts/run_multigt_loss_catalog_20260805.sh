@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|catalog_resume_diagnostics|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -26,6 +26,7 @@ export SKILLGR_MODEL
 CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_e6"
 LONG_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e30"
 EXTENDED_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e60_from_e27"
+RESUME_PROBE_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_resume_probe_e30_b"
 CATALOG_ROWS="${SKILLGR_OUTPUT_ROOT}/catalog_rows.jsonl"
 EVAL_ROOT="${SKILLGR_OUTPUT_ROOT}/eval"
 
@@ -567,6 +568,97 @@ PY
   touch "${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done"
 }
 
+run_catalog_resume_diagnostics() {
+  local resume_epoch="${SKILLGR_CATALOG_RESUME_EPOCH}"
+  local resume_dir
+  local comparison_dir="${EVAL_ROOT}/catalog_resume_diagnostics"
+  local teacher_group="catalog_resume_diagnostics_teacher_forced"
+  resume_dir="$(long_catalog_checkpoint "${resume_epoch}")"
+
+  require_file "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+  require_file "${resume_dir}/structured_decoder.pt"
+  require_file "${LONG_CATALOG_DIR}/final/structured_decoder.pt"
+  require_file "$(extended_catalog_checkpoint 30)/structured_decoder.pt"
+  require_file "${EVAL_ROOT}/catalog_long_e60_resume_parity.json"
+  require_file "${EVAL_ROOT}/catalog_long_teacher_forced/epoch30.json"
+  require_absent "${SKILLGR_OUTPUT_ROOT}/catalog_resume_diagnostics.done"
+  python3 - "${EVAL_ROOT}/catalog_long_e60_resume_parity.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("model_state_exact_match") is not False:
+    raise SystemExit("resume diagnostics require the observed failed exact-hash parity result")
+PY
+  record_runtime
+  python3 -m unittest tests.test_compare_catalog_resume_checkpoints
+
+  if [[ ! -d "${RESUME_PROBE_DIR}" ]]; then
+    run_torch scripts/skill_gr_pipeline.py train-single-sid-decoder \
+      --rows "${SKILLGR_ROWS}" \
+      --dev-rows "${SKILLGR_DEV_ROWS}" \
+      --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+      --skills-jsonl "${SKILLGR_SKILLS}" \
+      --output-dir "${RESUME_PROBE_DIR}" \
+      --model "${SKILLGR_MODEL}" \
+      --init-model-dir "${resume_dir}" \
+      --resume-from-checkpoint "${resume_dir}" \
+      --no-reset-optimizer \
+      --query-loss expanded_ce \
+      --catalog-epochs "${SKILLGR_LONG_CATALOG_EPOCHS}" \
+      --epochs 0 \
+      --max-source-length "${SKILLGR_MAX_SOURCE_LENGTH}" \
+      --batch-size "${SKILLGR_PER_DEVICE_BATCH}" \
+      --eval-batch-size "${SKILLGR_EVAL_PER_DEVICE_BATCH}" \
+      --lr "${SKILLGR_LR}" \
+      --warmup-ratio "${SKILLGR_WARMUP_RATIO}" \
+      --lr-scheduler constant \
+      --weight-decay "${SKILLGR_WEIGHT_DECAY}" \
+      --logging-steps 50 \
+      --eval-steps 0 \
+      --save-steps "$((SKILLGR_LONG_CATALOG_EVAL_INTERVAL * SKILLGR_CATALOG_STEPS_PER_EPOCH))" \
+      --no-padding-distributed-sampler \
+      --seed "${SKILLGR_SEED}" \
+      --no-load-best-model-at-end \
+      --bf16
+  fi
+  verify_epoch_range_history \
+    "${RESUME_PROBE_DIR}/loss_history.jsonl" \
+    catalog \
+    "$((resume_epoch + 1))" \
+    "${SKILLGR_LONG_CATALOG_EPOCHS}" \
+    72755
+
+  if [[ ! -f "${EVAL_ROOT}/${teacher_group}/resume_a_epoch30.json" ]]; then
+    eval_catalog_teacher_forced \
+      resume_a_epoch30 "$(extended_catalog_checkpoint 30)" "${teacher_group}"
+  fi
+  if [[ ! -f "${EVAL_ROOT}/${teacher_group}/resume_b_epoch30.json" ]]; then
+    eval_catalog_teacher_forced \
+      resume_b_epoch30 "${RESUME_PROBE_DIR}/final" "${teacher_group}"
+  fi
+  if [[ ! -f "${comparison_dir}/checkpoint_comparison.json" ]]; then
+    python3 scripts/compare_catalog_resume_checkpoints.py \
+      --checkpoint "original_epoch30=${LONG_CATALOG_DIR}/final/structured_decoder.pt" \
+      --checkpoint "resume_a_epoch30=$(extended_catalog_checkpoint 30)/structured_decoder.pt" \
+      --checkpoint "resume_b_epoch30=${RESUME_PROBE_DIR}/final/structured_decoder.pt" \
+      --metric "original_epoch30=${EVAL_ROOT}/catalog_long_teacher_forced/epoch30.json" \
+      --metric "resume_a_epoch30=${EVAL_ROOT}/${teacher_group}/resume_a_epoch30.json" \
+      --metric "resume_b_epoch30=${EVAL_ROOT}/${teacher_group}/resume_b_epoch30.json" \
+      --input-file "query_rows=${SKILLGR_ROWS}" \
+      --input-file "query_dev_rows=${SKILLGR_DEV_ROWS}" \
+      --input-file "skills=${SKILLGR_SKILLS}" \
+      --input-file "semantic_ids=${SKILLGR_SEMANTIC_IDS}" \
+      --input-file "model_config=${SKILLGR_MODEL}/config.json" \
+      --input-file "tokenizer_json=${SKILLGR_MODEL}/tokenizer.json" \
+      --input-file "tokenizer_spiece=${SKILLGR_MODEL}/spiece.model" \
+      --input-file "experiment_config=${ROOT_DIR}/configs/multigt_loss_catalog_20260805.env" \
+      --output "${comparison_dir}/checkpoint_comparison.json"
+  fi
+  touch "${SKILLGR_OUTPUT_ROOT}/catalog_resume_diagnostics.done"
+}
+
 eval_preflight_artifacts() {
   local output="${SKILLGR_OUTPUT_ROOT}/preflight_v3"
   require_file "${output}/model/loss_history.jsonl"
@@ -773,6 +865,7 @@ case "${STAGE}" in
   catalog) run_catalog ;;
   catalog_long_e30) run_catalog_long ;;
   catalog_extend_e60) run_catalog_extend_e60 ;;
+  catalog_resume_diagnostics) run_catalog_resume_diagnostics ;;
   query_expanded_ce) run_query expanded_ce 3 ;;
   query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
   query_expanded_ce_e6) run_query expanded_ce 6 ;;
