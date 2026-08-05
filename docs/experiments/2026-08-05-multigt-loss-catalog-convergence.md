@@ -44,6 +44,7 @@ Metrics: pending
 ## Result / Notes
 
 - `tide-chenyufei03-10331-grtsb`: submitted to `rudder-r2`; remained Pending because the queue was full.
+- `tide-chenyufei03-10331-grtsb`: cancelled after the `rudder-exper` replacement entered its training loop.
 - `tide-chenyufei03-10333-dtdes`: first `rudder-exper` preflight failed before Python because Git rejected the physical CFS checkout as unsafe.
 - `tide-chenyufei03-10335-hortt`: corrected `rudder-exper` preflight passed the image smoke test and all remote tests, then failed during the first sibling-masked query batch. Python applied the head-width slice before the boolean token mask, so the 2-class control head truncated target length from 5 to 2.
 - Fix: select `[batch, target_length]` tokens first, then slice the exclusion label width for the active head. Added a full forward/backward regression test for the 2-class control head.
