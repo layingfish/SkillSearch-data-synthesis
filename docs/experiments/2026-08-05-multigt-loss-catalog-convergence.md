@@ -8,6 +8,7 @@ Risk Tier: 2
 - Test whether sibling-masked CE improves multi-GT retrieval while preserving the existing expanded single-SID training mass.
 - Keep the enhanced 100,078-source-query data, fixed 14,551-skill LETTER IDs, T5-base initialization, and evaluation splits unchanged.
 - Compare expanded CE and sibling-masked CE from the same catalog checkpoint.
+- Compare epoch-3 and epoch-6 catalog initialization under the same expanded-CE query training.
 
 ## Commands
 
@@ -16,6 +17,7 @@ Train:
 ```text
 Catalog: 6 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
 Query arms: 5 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
+Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
 ```
 
 Eval:
@@ -38,7 +40,7 @@ Metrics: pending
 
 - [x] Minimal local check
 - [x] Unit/invariant test for sibling exclusion and single-GT equivalence
-- [ ] Catalog epoch means cover every real sample exactly once
+- [x] Catalog epoch means cover every real sample exactly once
 - [x] Reviewer required? no; structured local semantic review completed
 
 ## Result / Notes
@@ -54,3 +56,5 @@ Metrics: pending
 - The follow-up `preflight_eval` stage reuses the completed `preflight_v3` checkpoint, validates its train events, runs the catalog teacher-forcing evaluator, and writes `preflight.done` without repeating training.
 - `tide-chenyufei03-10337-ahpwp`: completed on `rudder-exper`. The short-run event contract was exactly 1 catalog train event and 2 query train events. Teacher-forcing evaluation completed on 16 catalog rows with world size 8, per-rank batch size 1, bf16, and max source length 2048; CE was 4.555237 and SID exact accuracy was 0.0 after the intentionally minimal 1+2-step smoke run.
 - `tide-chenyufei03-10339-chwak`: submitted to `rudder-exper` for the formal 6-epoch catalog run with 14,551 skills, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626.
+- `tide-chenyufei03-10339-chwak` completed all 6 catalog epochs and evaluations. Every epoch contained exactly 72,755 effective CE tokens (14,551 rows x 5 target tokens). Teacher-forced CE improved from 3.955837 at epoch 3 to 3.087213 at epoch 6; constrained-greedy exact accuracy improved from 0.001100 (16/14,551) to 0.027627 (402/14,551), under the same bf16, world-size-8, max-source-length-2048 catalog evaluation.
+- Planned query jobs use the `rudder` queue. Each arm uses 1 node / 8 A800 GPUs, 5 query epochs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626.

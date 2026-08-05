@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|query_expanded_ce|query_sibling_masked_ce}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -306,10 +306,11 @@ eval_query_checkpoint() {
 
 run_query() {
   local query_loss="$1"
-  local arm="query_${query_loss}_from_catalog_e3"
+  local catalog_epoch="$2"
+  local arm="query_${query_loss}_from_catalog_e${catalog_epoch}"
   local output="${SKILLGR_OUTPUT_ROOT}/${arm}"
   local init
-  init="$(catalog_checkpoint 3)"
+  init="$(catalog_checkpoint "${catalog_epoch}")"
   require_file "${SKILLGR_OUTPUT_ROOT}/catalog.done"
   require_file "${init}/structured_decoder.pt"
   require_absent "${output}"
@@ -341,6 +342,8 @@ run_query() {
     --load-best-model-at-end \
     --bf16
 
+  verify_epoch_history \
+    "${output}/loss_history.jsonl" query "${SKILLGR_QUERY_EPOCHS}" 646705
   eval_query_checkpoint "${arm}" "${output}/final" private_test_1000 "${SKILLGR_PRIVATE_TEST_ROWS}"
   eval_query_checkpoint "${arm}" "${output}/final" official_core75 "${SKILLGR_EVAL_ROWS}"
   eval_catalog_teacher_forced "${arm}_final" "${output}/final"
@@ -351,7 +354,8 @@ case "${STAGE}" in
   preflight) run_preflight ;;
   preflight_eval) run_preflight_eval ;;
   catalog) run_catalog ;;
-  query_expanded_ce) run_query expanded_ce ;;
-  query_sibling_masked_ce) run_query sibling_masked_ce ;;
+  query_expanded_ce) run_query expanded_ce 3 ;;
+  query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
+  query_expanded_ce_e6) run_query expanded_ce 6 ;;
   *) echo "unknown stage: ${STAGE}" >&2; exit 1 ;;
 esac
