@@ -82,6 +82,7 @@ from skill_gr_pipeline import (  # noqa: E402
     validate_letter_tokenizer_manifest,
     validate_method_setting_contract,
     validate_rank_capacity,
+    validate_structured_resume_plan,
 )
 from distributed_utils import DistributedContext, distributed_epoch_batches_no_padding  # noqa: E402
 from train_letter_rqvae_official import (  # noqa: E402
@@ -92,6 +93,94 @@ from train_letter_rqvae_official import (  # noqa: E402
 
 
 class SkillGRPipelineTest(unittest.TestCase):
+    def test_structured_query_resume_keeps_exact_total_step_contract(self) -> None:
+        stage, total_steps = validate_structured_resume_plan(
+            {
+                "stage": "query",
+                "world_size": 8,
+                "per_device_batch_size": 2,
+                "total_steps": 40420,
+                "completed_steps": 30000,
+            },
+            {},
+            catalog_total_steps=0,
+            query_total_steps=40420,
+            world_size=8,
+            per_device_batch_size=2,
+            lr_scheduler="linear",
+            warmup_ratio=0.1,
+            allow_total_steps_extension=False,
+        )
+
+        self.assertEqual((stage, total_steps), ("query", 40420))
+
+    def test_structured_catalog_resume_allows_guarded_constant_lr_extension(self) -> None:
+        stage, total_steps = validate_structured_resume_plan(
+            {
+                "stage": "catalog",
+                "world_size": 8,
+                "per_device_batch_size": 2,
+                "total_steps": 27300,
+                "completed_steps": 24570,
+            },
+            {
+                "optimizer_schedule": {
+                    "name": "constant",
+                    "warmup_steps": 0,
+                    "total_steps": 27300,
+                }
+            },
+            catalog_total_steps=54600,
+            query_total_steps=0,
+            world_size=8,
+            per_device_batch_size=2,
+            lr_scheduler="constant",
+            warmup_ratio=0.0,
+            allow_total_steps_extension=True,
+        )
+
+        self.assertEqual((stage, total_steps), ("catalog", 54600))
+
+    def test_structured_catalog_resume_rejects_unguarded_or_changed_protocol(self) -> None:
+        training_state = {
+            "stage": "catalog",
+            "world_size": 8,
+            "per_device_batch_size": 2,
+            "total_steps": 27300,
+            "completed_steps": 24570,
+        }
+        checkpoint = {
+            "optimizer_schedule": {
+                "name": "constant",
+                "warmup_steps": 0,
+                "total_steps": 27300,
+            }
+        }
+        common = {
+            "catalog_total_steps": 54600,
+            "query_total_steps": 0,
+            "world_size": 8,
+            "per_device_batch_size": 2,
+            "lr_scheduler": "constant",
+            "warmup_ratio": 0.0,
+            "allow_total_steps_extension": True,
+        }
+        invalid_cases = [
+            ({"allow_total_steps_extension": False}, "total steps do not match"),
+            ({"lr_scheduler": "linear"}, "requires constant lr"),
+            ({"warmup_ratio": 0.1}, "requires constant lr"),
+            ({"per_device_batch_size": 1}, "per-device batch size"),
+            ({"catalog_total_steps": 20000}, "invalid resumed step"),
+        ]
+        for overrides, message in invalid_cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_structured_resume_plan(
+                        training_state,
+                        checkpoint,
+                        **{**common, **overrides},
+                    )
+
     def test_no_padding_distributed_epoch_visits_each_row_once(self) -> None:
         rows = list(range(19))
         batches_by_rank = []

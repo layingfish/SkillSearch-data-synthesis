@@ -157,6 +157,65 @@ def append_loss_history(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def validate_structured_resume_plan(
+    training_state: dict[str, Any],
+    checkpoint_payload: dict[str, Any],
+    *,
+    catalog_total_steps: int,
+    query_total_steps: int,
+    world_size: int,
+    per_device_batch_size: int,
+    lr_scheduler: str,
+    warmup_ratio: float,
+    allow_total_steps_extension: bool,
+) -> tuple[str, int]:
+    active_stages = [
+        ("catalog", int(catalog_total_steps)),
+        ("query", int(query_total_steps)),
+    ]
+    active_stages = [(stage, steps) for stage, steps in active_stages if steps > 0]
+    if len(active_stages) != 1:
+        raise ValueError("structured resume requires exactly one active training stage")
+    stage, current_total_steps = active_stages[0]
+    saved_stage = str(training_state.get("stage") or "")
+    if saved_stage != stage:
+        raise ValueError(f"resume stage mismatch: current={stage}, saved={saved_stage}")
+    if int(training_state.get("world_size", -1)) != int(world_size):
+        raise ValueError("resume checkpoint world size does not match the current job")
+    if int(training_state.get("per_device_batch_size", -1)) != int(per_device_batch_size):
+        raise ValueError("resume checkpoint per-device batch size does not match the current job")
+
+    saved_total_steps = int(training_state.get("total_steps", -1))
+    completed_steps = int(training_state.get("completed_steps", -1))
+    if completed_steps < 0 or completed_steps >= current_total_steps:
+        raise ValueError(
+            f"invalid resumed step {completed_steps} for current total steps {current_total_steps}"
+        )
+    if saved_total_steps == current_total_steps:
+        return stage, current_total_steps
+    if not allow_total_steps_extension:
+        raise ValueError("resume checkpoint total steps do not match the current stage")
+    if stage != "catalog":
+        raise ValueError("total-step extension is only supported for catalog training")
+    if saved_total_steps <= 0 or current_total_steps <= saved_total_steps:
+        raise ValueError(
+            "catalog resume must extend the saved total-step horizon: "
+            f"saved={saved_total_steps}, current={current_total_steps}"
+        )
+    if lr_scheduler != "constant" or float(warmup_ratio) != 0.0:
+        raise ValueError("catalog horizon extension requires constant lr and warmup_ratio=0")
+    saved_schedule = checkpoint_payload.get("optimizer_schedule")
+    if not isinstance(saved_schedule, dict):
+        raise ValueError("resume checkpoint is missing optimizer schedule metadata")
+    if (
+        str(saved_schedule.get("name")) != "constant"
+        or int(saved_schedule.get("warmup_steps", -1)) != 0
+        or int(saved_schedule.get("total_steps", -1)) != saved_total_steps
+    ):
+        raise ValueError("saved optimizer schedule is incompatible with catalog horizon extension")
+    return stage, current_total_steps
+
+
 def init_wandb_run(args: argparse.Namespace, config: dict[str, Any]):
     project = getattr(args, "wandb_project", None)
     if not project:
@@ -5179,8 +5238,6 @@ def _run_distributed_structured_training(
     resume_payload = None
     resume_training_state = None
     if getattr(args, "resume_from_checkpoint", None):
-        if catalog_total_steps != 0:
-            raise ValueError("structured resume currently requires catalog_max_steps=0")
         if args.init_model_dir != args.resume_from_checkpoint:
             raise ValueError("--resume-from-checkpoint must also be the exact --init-model-dir")
         resume_payload = torch.load(
@@ -5193,10 +5250,19 @@ def _run_distributed_structured_training(
         resume_training_state = resume_payload.get("training_state")
         if not isinstance(resume_training_state, dict):
             raise ValueError("resume checkpoint is missing training_state")
-        if int(resume_training_state.get("world_size", -1)) != context.world_size:
-            raise ValueError("resume checkpoint world size does not match the current job")
-        if int(resume_training_state.get("total_steps", -1)) != query_total_steps:
-            raise ValueError("resume checkpoint total steps do not match the current stage")
+        validate_structured_resume_plan(
+            resume_training_state,
+            resume_payload,
+            catalog_total_steps=catalog_total_steps,
+            query_total_steps=query_total_steps,
+            world_size=context.world_size,
+            per_device_batch_size=args.batch_size,
+            lr_scheduler=lr_scheduler,
+            warmup_ratio=args.warmup_ratio,
+            allow_total_steps_extension=bool(
+                getattr(args, "allow_resume_total_steps_extension", False)
+            ),
+        )
         scheduler_state = resume_training_state.get("scheduler_state_dict")
         if not isinstance(scheduler_state, dict):
             raise ValueError("resume checkpoint is missing scheduler state")
@@ -5271,6 +5337,8 @@ def _run_distributed_structured_training(
                 "best_dev_loss": initial_best_loss,
                 "best_checkpoint": str(args.init_model_dir) if initial_best_loss is not None and args.init_model_dir else None,
                 "epoch_metrics": [],
+                "next_epoch": 0,
+                "next_batch_index": 0,
             }
         stage_ce_weight = (
             1.0 if stage_name == "catalog" else float(getattr(args, "sequential_ce_weight", 1.0))
@@ -5293,6 +5361,8 @@ def _run_distributed_structured_training(
         last_metrics: dict[str, float] | None = None
         epoch_metrics: list[dict[str, Any]] = []
         steps_per_epoch = max(1, math.ceil(len(stage_rows) / (args.batch_size * context.world_size)))
+        continuation_epoch = epoch_index
+        continuation_batch_index = resume_batch_index
         model.train()
         while step < total_steps:
             epoch_started_at_batch = resume_batch_index
@@ -5432,6 +5502,8 @@ def _run_distributed_structured_training(
                 if next_batch_index >= steps_per_epoch:
                     next_epoch += 1
                     next_batch_index = 0
+                continuation_epoch = next_epoch
+                continuation_batch_index = next_batch_index
                 should_log = step % args.logging_steps == 0 or step == total_steps
                 if should_log:
                     last_metrics = _structured_global_train_metrics(components, context)
@@ -5558,6 +5630,8 @@ def _run_distributed_structured_training(
             "best_dev_loss": best_loss,
             "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
             "epoch_metrics": epoch_metrics,
+            "next_epoch": continuation_epoch,
+            "next_batch_index": continuation_batch_index,
         }
 
     catalog_result = train_stage(
@@ -5576,6 +5650,8 @@ def _run_distributed_structured_training(
         "best_dev_loss": None,
         "best_checkpoint": None,
         "epoch_metrics": [],
+        "next_epoch": 0,
+        "next_batch_index": 0,
     }
     query_result = train_stage(
         "query",
@@ -5586,16 +5662,37 @@ def _run_distributed_structured_training(
         step_offset=args.step_offset,
         initial_best_loss=args.initial_best_dev_loss,
     )
+    last_checkpoint_extra = {
+        **checkpoint_metadata,
+        "last_query_step": query_result["steps"] + args.step_offset,
+        "last_train_loss": query_result["last_train_loss"],
+        "last_ce_loss": query_result["last_ce_loss"],
+        "last_ripor_loss": query_result["last_ripor_loss"],
+    }
+    active_stages = [
+        ("catalog", catalog_total_steps, catalog_result, 0),
+        ("query", query_total_steps, query_result, args.step_offset),
+    ]
+    active_stages = [item for item in active_stages if item[1] > 0]
+    if len(active_stages) == 1:
+        active_stage, active_total_steps, active_result, active_step_offset = active_stages[0]
+        last_checkpoint_extra["training_state"] = {
+            "format": "structured_ddp_resume_v1",
+            "stage": active_stage,
+            "completed_steps": active_result["steps"],
+            "display_step": active_result["steps"] + active_step_offset,
+            "total_steps": active_total_steps,
+            "next_epoch": active_result["next_epoch"],
+            "next_batch_index": active_result["next_batch_index"],
+            "world_size": context.world_size,
+            "per_device_batch_size": args.batch_size,
+            "scheduler_state_dict": scheduler.state_dict(),
+            "rng_states": capture_rng_states(),
+        }
     last_dir = args.output_dir / "last"
     save_checkpoint(
         last_dir,
-        {
-            **checkpoint_metadata,
-            "last_query_step": query_result["steps"] + args.step_offset,
-            "last_train_loss": query_result["last_train_loss"],
-            "last_ce_loss": query_result["last_ce_loss"],
-            "last_ripor_loss": query_result["last_ripor_loss"],
-        },
+        last_checkpoint_extra,
     )
     if query_result["best_checkpoint"] is not None and args.load_best_model_at_end:
         load_structured_decoder_checkpoint(
@@ -7795,6 +7892,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--init-model-dir", type=Path)
     p.add_argument("--resume-from-checkpoint", type=Path)
     p.add_argument(
+        "--allow-resume-total-steps-extension",
+        action="store_true",
+        help="extend a constant-LR, zero-warmup catalog run while restoring optimizer, scheduler, RNG, and shuffle epoch",
+    )
+    p.add_argument(
         "--method-setting",
         choices=METHOD_SETTINGS,
         default=METHOD_SETTING_CUSTOM,
@@ -7917,6 +8019,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
     p.add_argument("--resume-from-checkpoint", type=Path)
+    p.add_argument(
+        "--allow-resume-total-steps-extension",
+        action="store_true",
+        help="extend a constant-LR, zero-warmup catalog run while restoring optimizer, scheduler, RNG, and shuffle epoch",
+    )
     p.add_argument(
         "--method-setting",
         choices=METHOD_SETTINGS,

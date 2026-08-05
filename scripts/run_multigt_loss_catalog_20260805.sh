@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -9,7 +9,7 @@ exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
 bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
 
-ROOT_DIR=/workspace/SkillSearch-data-synthesis
+ROOT_DIR="${SKILLGR_CODE_ROOT:-/workspace/SkillSearch-data-synthesis}"
 git config --global --add safe.directory "${ROOT_DIR}"
 git config --global --add safe.directory "$(readlink -f "${ROOT_DIR}")"
 cd "${ROOT_DIR}"
@@ -25,6 +25,7 @@ export SKILLGR_MODEL
 
 CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_e6"
 LONG_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e30"
+EXTENDED_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e60_from_e27"
 CATALOG_ROWS="${SKILLGR_OUTPUT_ROOT}/catalog_rows.jsonl"
 EVAL_ROOT="${SKILLGR_OUTPUT_ROOT}/eval"
 
@@ -81,6 +82,99 @@ print(json.dumps({"stage": stage, "epochs": expected_epochs, "ce_tokens_per_epoc
 PY
 }
 
+verify_epoch_range_history() {
+  local history="$1"
+  local stage="$2"
+  local first_epoch="$3"
+  local last_epoch="$4"
+  local expected_tokens="$5"
+  python3 - "${history}" "${stage}" "${first_epoch}" "${last_epoch}" "${expected_tokens}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+stage = sys.argv[2]
+first_epoch = int(sys.argv[3])
+last_epoch = int(sys.argv[4])
+expected_tokens = int(sys.argv[5])
+events = [
+    json.loads(line)
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+epochs = [row for row in events if row.get("stage") == stage and row.get("event") == "epoch"]
+observed = [int(row["epoch"]) for row in epochs]
+expected = list(range(first_epoch, last_epoch + 1))
+if observed != expected:
+    raise SystemExit(f"{stage} epoch sequence {observed} != {expected}")
+bad = [row for row in epochs if int(row.get("ce_token_count", -1)) != expected_tokens]
+if bad:
+    raise SystemExit(f"{stage} epoch token count mismatch: {bad}")
+print(
+    json.dumps(
+        {
+            "stage": stage,
+            "first_epoch": first_epoch,
+            "last_epoch": last_epoch,
+            "ce_tokens_per_epoch": expected_tokens,
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
+verify_resume_model_parity() {
+  local original_checkpoint="$1"
+  local resumed_checkpoint="$2"
+  local output="$3"
+  require_absent "${output}"
+  python3 - "${original_checkpoint}" "${resumed_checkpoint}" "${output}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+
+def state_hash(path: Path) -> str:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    digest = hashlib.sha256()
+    for key, value in sorted(payload["state_dict"].items()):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+original = Path(sys.argv[1])
+resumed = Path(sys.argv[2])
+output = Path(sys.argv[3])
+original_hash = state_hash(original)
+resumed_hash = state_hash(resumed)
+result = {
+    "format": "structured_catalog_resume_parity_v1",
+    "original_checkpoint": str(original),
+    "original_model_state_sha256": original_hash,
+    "resumed_checkpoint": str(resumed),
+    "resumed_model_state_sha256": resumed_hash,
+    "model_state_exact_match": original_hash == resumed_hash,
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(result, sort_keys=True), flush=True)
+if original_hash != resumed_hash:
+    raise SystemExit("resumed epoch-30 model state does not match the uninterrupted run")
+PY
+}
+
 verify_preflight_history() {
   local history="$1"
   python3 - "${history}" <<'PY'
@@ -134,6 +228,22 @@ long_catalog_checkpoint() {
     echo "${LONG_CATALOG_DIR}/checkpoint-$((epoch * SKILLGR_CATALOG_STEPS_PER_EPOCH))"
   else
     echo "long catalog epoch is not a saved evaluation checkpoint: ${epoch}" >&2
+    exit 1
+  fi
+}
+
+extended_catalog_checkpoint() {
+  local epoch="$1"
+  if (( epoch <= 0 || epoch > SKILLGR_EXTENDED_CATALOG_EPOCHS )); then
+    echo "unsupported extended catalog epoch: ${epoch}" >&2
+    exit 1
+  fi
+  if (( epoch == SKILLGR_EXTENDED_CATALOG_EPOCHS )); then
+    echo "${EXTENDED_CATALOG_DIR}/final"
+  elif (( epoch % SKILLGR_LONG_CATALOG_EVAL_INTERVAL == 0 )); then
+    echo "${EXTENDED_CATALOG_DIR}/checkpoint-$((epoch * SKILLGR_CATALOG_STEPS_PER_EPOCH))"
+  else
+    echo "extended catalog epoch is not a saved evaluation checkpoint: ${epoch}" >&2
     exit 1
   fi
 }
@@ -286,6 +396,175 @@ run_catalog_long() {
   done
   write_long_catalog_convergence_summary
   touch "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+}
+
+run_catalog_extend_e60() {
+  local original_summary="${EVAL_ROOT}/catalog_long_convergence.json"
+  local resume_epoch="${SKILLGR_CATALOG_RESUME_EPOCH}"
+  local resume_dir
+  local parity_output="${EVAL_ROOT}/catalog_long_e60_resume_parity.json"
+  local teacher_group="catalog_long_e60_teacher_forced"
+  local teacher_dir="${EVAL_ROOT}/${teacher_group}"
+  local combined_dir="${EVAL_ROOT}/catalog_long_e60_combined_teacher_forced"
+  local greedy_group="catalog_long_e60_constrained_greedy"
+  local convergence_output="${EVAL_ROOT}/catalog_long_e60_convergence.json"
+  resume_dir="$(long_catalog_checkpoint "${resume_epoch}")"
+
+  require_file "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+  require_file "${original_summary}"
+  require_file "${resume_dir}/structured_decoder.pt"
+  python3 - "${original_summary}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("converged") is not False or payload.get("selected_epoch") is not None:
+    raise SystemExit("epoch-30 catalog result is not the expected non-converged extension input")
+if not payload.get("checkpoints") or int(payload["checkpoints"][-1]["epoch"]) != 30:
+    raise SystemExit("epoch-30 catalog convergence summary is incomplete")
+PY
+  python3 - \
+    "${resume_dir}/structured_decoder.pt" \
+    "${resume_epoch}" \
+    "${SKILLGR_CATALOG_STEPS_PER_EPOCH}" \
+    "${SKILLGR_WORLD_SIZE}" \
+    "${SKILLGR_PER_DEVICE_BATCH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+checkpoint_path = Path(sys.argv[1])
+resume_epoch = int(sys.argv[2])
+steps_per_epoch = int(sys.argv[3])
+world_size = int(sys.argv[4])
+per_device_batch = int(sys.argv[5])
+try:
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(checkpoint_path, map_location="cpu")
+state = payload.get("training_state")
+if not isinstance(state, dict):
+    raise SystemExit("catalog resume checkpoint is missing training_state")
+expected = {
+    "stage": "catalog",
+    "completed_steps": resume_epoch * steps_per_epoch,
+    "next_epoch": resume_epoch,
+    "next_batch_index": 0,
+    "world_size": world_size,
+    "per_device_batch_size": per_device_batch,
+}
+mismatches = {
+    key: {"expected": value, "observed": state.get(key)}
+    for key, value in expected.items()
+    if state.get(key) != value
+}
+if mismatches:
+    raise SystemExit(f"catalog resume checkpoint state mismatch: {mismatches}")
+if not isinstance(payload.get("optimizer_state_dict"), dict):
+    raise SystemExit("catalog resume checkpoint is missing optimizer state")
+if not isinstance(state.get("scheduler_state_dict"), dict):
+    raise SystemExit("catalog resume checkpoint is missing scheduler state")
+if len(state.get("rng_states") or []) != world_size:
+    raise SystemExit("catalog resume checkpoint is missing per-rank RNG states")
+print(
+    json.dumps(
+        {
+            "resume_checkpoint": str(checkpoint_path),
+            **expected,
+            "optimizer_state": "present",
+            "scheduler_state": "present",
+            "rng_state_count": world_size,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+PY
+  require_absent "${EXTENDED_CATALOG_DIR}"
+  require_absent "${parity_output}"
+  require_absent "${teacher_dir}"
+  require_absent "${combined_dir}"
+  require_absent "${EVAL_ROOT}/${greedy_group}"
+  require_absent "${convergence_output}"
+  require_absent "${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done"
+  record_runtime
+
+  run_torch scripts/skill_gr_pipeline.py train-single-sid-decoder \
+    --rows "${SKILLGR_ROWS}" \
+    --dev-rows "${SKILLGR_DEV_ROWS}" \
+    --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+    --skills-jsonl "${SKILLGR_SKILLS}" \
+    --output-dir "${EXTENDED_CATALOG_DIR}" \
+    --model "${SKILLGR_MODEL}" \
+    --init-model-dir "${resume_dir}" \
+    --resume-from-checkpoint "${resume_dir}" \
+    --allow-resume-total-steps-extension \
+    --no-reset-optimizer \
+    --query-loss expanded_ce \
+    --catalog-epochs "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" \
+    --epochs 0 \
+    --max-source-length "${SKILLGR_MAX_SOURCE_LENGTH}" \
+    --batch-size "${SKILLGR_PER_DEVICE_BATCH}" \
+    --eval-batch-size "${SKILLGR_EVAL_PER_DEVICE_BATCH}" \
+    --lr "${SKILLGR_LR}" \
+    --warmup-ratio "${SKILLGR_WARMUP_RATIO}" \
+    --lr-scheduler constant \
+    --weight-decay "${SKILLGR_WEIGHT_DECAY}" \
+    --logging-steps 50 \
+    --eval-steps 0 \
+    --save-steps "$((SKILLGR_LONG_CATALOG_EVAL_INTERVAL * SKILLGR_CATALOG_STEPS_PER_EPOCH))" \
+    --no-padding-distributed-sampler \
+    --seed "${SKILLGR_SEED}" \
+    --no-load-best-model-at-end \
+    --bf16
+  verify_epoch_range_history \
+    "${EXTENDED_CATALOG_DIR}/loss_history.jsonl" \
+    catalog \
+    "$((resume_epoch + 1))" \
+    "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" \
+    72755
+  verify_resume_model_parity \
+    "${LONG_CATALOG_DIR}/final/structured_decoder.pt" \
+    "$(extended_catalog_checkpoint 30)/structured_decoder.pt" \
+    "${parity_output}"
+
+  local epoch
+  for ((
+    epoch = 30;
+    epoch <= SKILLGR_EXTENDED_CATALOG_EPOCHS;
+    epoch += SKILLGR_LONG_CATALOG_EVAL_INTERVAL
+  )); do
+    eval_catalog_teacher_forced \
+      "epoch${epoch}" "$(extended_catalog_checkpoint "${epoch}")" "${teacher_group}"
+  done
+
+  mkdir -p "${combined_dir}"
+  for ((epoch = SKILLGR_LONG_CATALOG_EVAL_INTERVAL; epoch < 30; epoch += SKILLGR_LONG_CATALOG_EVAL_INTERVAL)); do
+    install -m 0644 \
+      "${EVAL_ROOT}/catalog_long_teacher_forced/epoch${epoch}.json" \
+      "${combined_dir}/epoch${epoch}.json"
+  done
+  for ((epoch = 30; epoch <= SKILLGR_EXTENDED_CATALOG_EPOCHS; epoch += SKILLGR_LONG_CATALOG_EVAL_INTERVAL)); do
+    install -m 0644 \
+      "${teacher_dir}/epoch${epoch}.json" \
+      "${combined_dir}/epoch${epoch}.json"
+  done
+  python3 scripts/analyze_catalog_convergence.py \
+    --metrics-dir "${combined_dir}" \
+    --output "${convergence_output}" \
+    --checkpoint-interval "${SKILLGR_LONG_CATALOG_EVAL_INTERVAL}" \
+    --max-epoch "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" \
+    --ce-relative-threshold 0.01 \
+    --sid-exact-absolute-threshold 0.005 \
+    --consecutive-stable-intervals 3
+  for epoch in 36 42 48 54 60; do
+    eval_catalog_constrained_greedy \
+      "epoch${epoch}" "$(extended_catalog_checkpoint "${epoch}")" "${greedy_group}"
+  done
+  touch "${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done"
 }
 
 eval_preflight_artifacts() {
@@ -447,9 +726,18 @@ run_query() {
 }
 
 run_query_from_selected_long_catalog() {
-  local convergence_summary="${EVAL_ROOT}/catalog_long_convergence.json"
+  local convergence_summary
+  local prerequisite
   local selected_epoch
-  require_file "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+  local selected_checkpoint
+  if [[ -f "${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done" ]]; then
+    prerequisite="${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done"
+    convergence_summary="${EVAL_ROOT}/catalog_long_e60_convergence.json"
+  else
+    prerequisite="${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+    convergence_summary="${EVAL_ROOT}/catalog_long_convergence.json"
+  fi
+  require_file "${prerequisite}"
   require_file "${convergence_summary}"
   selected_epoch="$(python3 - "${convergence_summary}" <<'PY'
 import json
@@ -465,11 +753,18 @@ if not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool):
 print(selected_epoch)
 PY
 )"
+  if (( selected_epoch < 30 )); then
+    selected_checkpoint="$(long_catalog_checkpoint "${selected_epoch}")"
+  elif [[ "${prerequisite}" == "${SKILLGR_OUTPUT_ROOT}/catalog_extend_e60.done" ]]; then
+    selected_checkpoint="$(extended_catalog_checkpoint "${selected_epoch}")"
+  else
+    selected_checkpoint="$(long_catalog_checkpoint "${selected_epoch}")"
+  fi
   run_query_from_init \
     expanded_ce \
     "query_expanded_ce_from_catalog_long_e${selected_epoch}" \
-    "$(long_catalog_checkpoint "${selected_epoch}")" \
-    "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+    "${selected_checkpoint}" \
+    "${prerequisite}"
 }
 
 case "${STAGE}" in
@@ -477,6 +772,7 @@ case "${STAGE}" in
   preflight_eval) run_preflight_eval ;;
   catalog) run_catalog ;;
   catalog_long_e30) run_catalog_long ;;
+  catalog_extend_e60) run_catalog_extend_e60 ;;
   query_expanded_ce) run_query expanded_ce 3 ;;
   query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
   query_expanded_ce_e6) run_query expanded_ce 6 ;;

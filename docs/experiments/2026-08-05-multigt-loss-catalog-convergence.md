@@ -19,6 +19,7 @@ Catalog: 6 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, se
 Query arms: 5 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
 Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
 Long catalog: 30 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
+Catalog extension: resume the epoch-27 checkpoint to a 60-epoch total horizon with restored optimizer/scheduler/per-rank RNG/shuffle epoch, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; require exact epoch-30 model-state parity before using later checkpoints
 Selected long-catalog query: read the first converged epoch from `eval/catalog_long_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
 ```
 
@@ -44,6 +45,9 @@ Metrics: pending
 - [x] Minimal local check
 - [x] Unit/invariant test for sibling exclusion and single-GT equivalence
 - [x] Catalog epoch means cover every real sample exactly once
+- [x] Catalog-resume contract tests for stage, horizon, scheduler, warmup, batch, and world size
+- [ ] Remote epoch-30 exact model-state parity after resuming from epoch 27
+- [ ] Retrieval evaluation from the selected converged catalog checkpoint
 - [x] Reviewer required? no; structured local semantic review completed
 
 ## Result / Notes
@@ -65,7 +69,7 @@ Metrics: pending
 - `tide-chenyufei03-10361-oqabj`: completed artifacts on `rudder`; epoch-3 catalog initialization with sibling-masked CE. Log: `logs/query_sibling_masked_ce.log`.
 - `tide-chenyufei03-10362-aatho`: completed artifacts on `rudder`; epoch-6 catalog initialization with expanded CE. Log: `logs/query_expanded_ce_e6.log`.
 - Long-catalog convergence is pre-registered as three consecutive 3-epoch intervals where teacher-forced CE relative change is below 0.01 and SID exact absolute change is below 0.005. The earliest checkpoint completing that window is selected. If no checkpoint qualifies by epoch 30, the run is extended instead of treating epoch 30 as converged.
-- `tide-chenyufei03-10364-psbjx`: running on `rudder-exper` with 1 node / 8 A800 GPUs for the continuous 30-epoch catalog convergence run. The launch reached `catalog_step=200` with 0 pod restarts; all 14,551 catalog rows passed the `max_source_length=2048` audit. Log: `logs/catalog_long_e30.log`.
+- `tide-chenyufei03-10364-psbjx`: completed artifacts on `rudder-exper` for the continuous 30-epoch catalog run with 1 node / 8 A800 GPUs. All 30 epochs contained exactly 72,755 effective CE tokens, and all 14,551 catalog rows passed the `max_source_length=2048` audit. Log: `logs/catalog_long_e30.log`.
 - Added the `query_expanded_ce_long_selected` launch stage. It requires a completed 30-epoch catalog run with `converged=true`, resolves the selected saved checkpoint, and preserves the same 5-epoch expanded-CE query/evaluation settings as the catalog epoch-3 and epoch-6 arms.
 - All three query arms completed 5 query epochs with exactly 646,705 effective CE tokens per epoch. All retrieval cells below report macro R@1/R@10/R@50 from the final checkpoint with beam=50 and beam-order aggregation.
 
@@ -78,3 +82,20 @@ Metrics: pending
 - On the private 896-query multi-skill subset, sibling-masked CE versus epoch-3 expanded CE changed R@1/R@10/R@50 by +0.030971/+0.012649/+0.003813. Epoch-6 catalog initialization versus epoch-3 initialization under expanded CE changed them by +0.017206/+0.013393/+0.001395. Official core75 has only 51 multi-skill queries and does not reproduce the private R@10/R@50 gain for sibling-masked CE.
 - Catalog teacher-forcing on each final query checkpoint used 14,551 skills, bf16, world size 8, per-rank batch size 2, and max source length 2048. CE / SID exact was 0.704985 / 0.401484 for epoch-3 expanded CE, 0.699209 / 0.403752 for epoch-3 sibling-masked CE, and 0.599337 / 0.452340 for epoch-6 expanded CE.
 - Each query arm wrote its final checkpoint, both retrieval manifests/predictions/metrics, catalog teacher-forcing JSON, and done marker before the shared launch script reported an EOF parse error. The script was edited after these long-running shells started; their post-function file offsets no longer matched. The artifacts are complete, while the shell exit status is not a valid experiment-success signal for these three jobs.
+- The 30-epoch catalog run did not converge under the registered criterion. Teacher-forced metrics below use 14,551 skills, bf16, world size 8, per-rank batch size 2, and max source length 2048. Greedy exact uses the same skills with constrained beam=1.
+
+| Catalog epoch | Teacher-forced CE | Teacher-forced SID exact | Greedy exact |
+|---:|---:|---:|---:|
+| 3 | 3.955837 | 0.000137 | - |
+| 6 | 3.087213 | 0.004192 | 0.027627 |
+| 9 | 1.657648 | 0.118411 | - |
+| 12 | 0.410351 | 0.697547 | 0.817744 |
+| 15 | 0.088257 | 0.921243 | - |
+| 18 | 0.066194 | 0.935812 | 0.940416 |
+| 21 | 0.063209 | 0.941653 | - |
+| 24 | 0.056059 | 0.950175 | 0.951756 |
+| 27 | 0.053916 | 0.953680 | - |
+| 30 | 0.049537 | 0.957529 | 0.959178 |
+
+- The epoch-27 to epoch-30 interval changed teacher-forced CE by 0.081220 relative and SID exact by 0.003849 absolute. It therefore failed the CE threshold before any three-interval stable window could form; `eval/catalog_long_convergence.json` records `converged=false` and `selected_epoch=null`.
+- The extension resumes from epoch 27 rather than initializing from the epoch-30 final weights. The saved checkpoint contains optimizer, scheduler, per-rank RNG, and `next_epoch=27`; rerunning epochs 28-30 must produce an exact model-state hash match with the uninterrupted epoch-30 final checkpoint. The extension then continues to epoch 60, evaluates every 3 epochs, and runs constrained greedy at epochs 36/42/48/54/60.
