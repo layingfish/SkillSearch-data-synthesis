@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -24,6 +24,7 @@ export HF_HUB_OFFLINE=1
 export SKILLGR_MODEL
 
 CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_e6"
+LONG_CATALOG_DIR="${SKILLGR_OUTPUT_ROOT}/catalog_long_e30"
 CATALOG_ROWS="${SKILLGR_OUTPUT_ROOT}/catalog_rows.jsonl"
 EVAL_ROOT="${SKILLGR_OUTPUT_ROOT}/eval"
 
@@ -121,10 +122,27 @@ catalog_checkpoint() {
   esac
 }
 
+long_catalog_checkpoint() {
+  local epoch="$1"
+  if (( epoch <= 0 || epoch > SKILLGR_LONG_CATALOG_EPOCHS )); then
+    echo "unsupported long catalog epoch: ${epoch}" >&2
+    exit 1
+  fi
+  if (( epoch == SKILLGR_LONG_CATALOG_EPOCHS )); then
+    echo "${LONG_CATALOG_DIR}/final"
+  elif (( epoch % SKILLGR_LONG_CATALOG_EVAL_INTERVAL == 0 )); then
+    echo "${LONG_CATALOG_DIR}/checkpoint-$((epoch * SKILLGR_CATALOG_STEPS_PER_EPOCH))"
+  else
+    echo "long catalog epoch is not a saved evaluation checkpoint: ${epoch}" >&2
+    exit 1
+  fi
+}
+
 eval_catalog_teacher_forced() {
   local label="$1"
   local model_dir="$2"
-  local output="${EVAL_ROOT}/catalog_teacher_forced/${label}.json"
+  local output_group="${3:-catalog_teacher_forced}"
+  local output="${EVAL_ROOT}/${output_group}/${label}.json"
   local materialize_args=()
   require_file "${model_dir}/structured_decoder.pt"
   require_absent "${output}"
@@ -146,7 +164,8 @@ eval_catalog_teacher_forced() {
 eval_catalog_constrained_greedy() {
   local label="$1"
   local model_dir="$2"
-  local output="${EVAL_ROOT}/catalog_constrained_greedy/${label}"
+  local output_group="${3:-catalog_constrained_greedy}"
+  local output="${EVAL_ROOT}/${output_group}/${label}"
   require_file "${model_dir}/structured_decoder.pt"
   require_file "${CATALOG_ROWS}"
   require_absent "${output}"
@@ -200,6 +219,73 @@ run_catalog() {
   eval_catalog_constrained_greedy epoch3 "$(catalog_checkpoint 3)"
   eval_catalog_constrained_greedy epoch6 "$(catalog_checkpoint 6)"
   touch "${SKILLGR_OUTPUT_ROOT}/catalog.done"
+}
+
+write_long_catalog_convergence_summary() {
+  local output="${EVAL_ROOT}/catalog_long_convergence.json"
+  require_absent "${output}"
+  python3 scripts/analyze_catalog_convergence.py \
+    --metrics-dir "${EVAL_ROOT}/catalog_long_teacher_forced" \
+    --output "${output}" \
+    --checkpoint-interval "${SKILLGR_LONG_CATALOG_EVAL_INTERVAL}" \
+    --max-epoch "${SKILLGR_LONG_CATALOG_EPOCHS}" \
+    --ce-relative-threshold 0.01 \
+    --sid-exact-absolute-threshold 0.005 \
+    --consecutive-stable-intervals 3
+}
+
+run_catalog_long() {
+  require_file "${SKILLGR_OUTPUT_ROOT}/preflight_v3/preflight.done"
+  require_file "${CATALOG_ROWS}"
+  require_absent "${LONG_CATALOG_DIR}"
+  require_absent "${EVAL_ROOT}/catalog_long_teacher_forced"
+  require_absent "${EVAL_ROOT}/catalog_long_constrained_greedy"
+  require_absent "${EVAL_ROOT}/catalog_long_convergence.json"
+  require_absent "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
+  mkdir -p "${SKILLGR_OUTPUT_ROOT}"
+  record_runtime
+  run_torch scripts/skill_gr_pipeline.py train-single-sid-decoder \
+    --rows "${SKILLGR_ROWS}" \
+    --dev-rows "${SKILLGR_DEV_ROWS}" \
+    --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+    --skills-jsonl "${SKILLGR_SKILLS}" \
+    --output-dir "${LONG_CATALOG_DIR}" \
+    --model "${SKILLGR_MODEL}" \
+    --query-loss expanded_ce \
+    --catalog-epochs "${SKILLGR_LONG_CATALOG_EPOCHS}" \
+    --epochs 0 \
+    --max-source-length "${SKILLGR_MAX_SOURCE_LENGTH}" \
+    --batch-size "${SKILLGR_PER_DEVICE_BATCH}" \
+    --eval-batch-size "${SKILLGR_EVAL_PER_DEVICE_BATCH}" \
+    --lr "${SKILLGR_LR}" \
+    --warmup-ratio "${SKILLGR_WARMUP_RATIO}" \
+    --lr-scheduler constant \
+    --weight-decay "${SKILLGR_WEIGHT_DECAY}" \
+    --logging-steps 50 \
+    --eval-steps 0 \
+    --save-steps "$((SKILLGR_LONG_CATALOG_EVAL_INTERVAL * SKILLGR_CATALOG_STEPS_PER_EPOCH))" \
+    --no-padding-distributed-sampler \
+    --seed "${SKILLGR_SEED}" \
+    --no-load-best-model-at-end \
+    --bf16
+  verify_epoch_history \
+    "${LONG_CATALOG_DIR}/loss_history.jsonl" catalog "${SKILLGR_LONG_CATALOG_EPOCHS}" 72755
+
+  local epoch
+  for ((
+    epoch = SKILLGR_LONG_CATALOG_EVAL_INTERVAL;
+    epoch <= SKILLGR_LONG_CATALOG_EPOCHS;
+    epoch += SKILLGR_LONG_CATALOG_EVAL_INTERVAL
+  )); do
+    eval_catalog_teacher_forced \
+      "epoch${epoch}" "$(long_catalog_checkpoint "${epoch}")" catalog_long_teacher_forced
+  done
+  for epoch in 6 12 18 24 30; do
+    eval_catalog_constrained_greedy \
+      "epoch${epoch}" "$(long_catalog_checkpoint "${epoch}")" catalog_long_constrained_greedy
+  done
+  write_long_catalog_convergence_summary
+  touch "${SKILLGR_OUTPUT_ROOT}/catalog_long_e30.done"
 }
 
 eval_preflight_artifacts() {
@@ -354,6 +440,7 @@ case "${STAGE}" in
   preflight) run_preflight ;;
   preflight_eval) run_preflight_eval ;;
   catalog) run_catalog ;;
+  catalog_long_e30) run_catalog_long ;;
   query_expanded_ce) run_query expanded_ce 3 ;;
   query_sibling_masked_ce) run_query sibling_masked_ce 3 ;;
   query_expanded_ce_e6) run_query expanded_ce 6 ;;

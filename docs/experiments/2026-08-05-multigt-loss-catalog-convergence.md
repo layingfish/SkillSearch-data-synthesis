@@ -18,6 +18,7 @@ Train:
 Catalog: 6 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
 Query arms: 5 epochs, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626
 Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
+Long catalog: 30 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
 ```
 
 Eval:
@@ -25,6 +26,7 @@ Eval:
 ```text
 Catalog checkpoints: epoch 1/2/3/6 teacher-forced CE, per-level accuracy, exact SID accuracy
 Catalog checkpoints: epoch 3/6 constrained greedy exact SID accuracy
+Long catalog checkpoints: epoch 3/6/9/.../30 teacher-forced metrics; epoch 6/12/18/24/30 constrained greedy
 Query checkpoints: private 1,000-query and Official core75, constrained beam=50, R@1/R@10/R@50
 ```
 
@@ -61,3 +63,4 @@ Metrics: pending
 - `tide-chenyufei03-10360-qlvvp`: running on `rudder`; epoch-3 catalog initialization with expanded CE. Log: `logs/query_expanded_ce.log`.
 - `tide-chenyufei03-10361-oqabj`: running on `rudder`; epoch-3 catalog initialization with sibling-masked CE. Log: `logs/query_sibling_masked_ce.log`.
 - `tide-chenyufei03-10362-aatho`: running on `rudder`; epoch-6 catalog initialization with expanded CE. Log: `logs/query_expanded_ce_e6.log`.
+- Long-catalog convergence is pre-registered as three consecutive 3-epoch intervals where teacher-forced CE relative change is below 0.01 and SID exact absolute change is below 0.005. The earliest checkpoint completing that window is selected. If no checkpoint qualifies by epoch 30, the run is extended instead of treating epoch 30 as converged.
