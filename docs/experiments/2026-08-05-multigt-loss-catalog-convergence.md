@@ -1,5 +1,5 @@
 # Experiment: Multi-GT loss and catalog convergence
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -56,7 +56,7 @@ Metrics: endpoint query summary is tracked in `docs/experiments/artifacts/2026-0
 - [x] Remote epoch-30 resume diagnostic; repeat resumes match exactly, while both differ from the uninterrupted checkpoint
 - [ ] Retrieval evaluation from the selected converged catalog checkpoint
 - [x] Fresh continuous epoch-60 catalog convergence and endpoint retrieval evaluation
-- [ ] Fresh continuous epoch-120 catalog convergence and selected-checkpoint retrieval evaluation
+- [x] Fresh epoch-120 follow-up stopped at epoch 3; no convergence or selected-checkpoint retrieval result
 - [x] Reviewer required? no; structured local semantic review completed
 
 ## Result / Notes
@@ -123,3 +123,4 @@ Metrics: endpoint query summary is tracked in `docs/experiments/artifacts/2026-0
 - Against catalog epoch 3 plus expanded CE under the same 5 query epochs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, seed 20260626, beam 50, beam-order aggregation, and identical splits, fresh catalog epoch 60 changes private overall R@1/R@10/R@50 by +0.020250/+0.034583/+0.022583 and private multi-skill by +0.014788/+0.029669/+0.019625. On Official core75 overall, the changes are +0.009683/-0.033651/-0.042857.
 - The fresh epoch-120 stage preserves the epoch-60 training protocol and restarts from T5-base because cross-job resume changed the continuous trajectory. Before evaluation, its epoch-60 model state must exactly match the completed fresh epoch-60 final model across all 299,290,626 T5-base parameters. It evaluates teacher-forced CE and SID exact every 3 epochs under the same criterion, then runs constrained greedy at the earliest selected checkpoint or at epoch 120 when the criterion remains unmet. Query training is enabled only when the convergence summary selects a checkpoint.
 - `tide-chenyufei03-10447-doqbb`: submitted to `rudder-exper` from commit `7a523c5` for the fresh continuous epoch-120 catalog stage, using 1 node / 8 A800 GPUs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, seed 20260626, and the epoch-60 model-state parity gate.
+- `tide-chenyufei03-10447-doqbb` was cancelled at the user's request after completing epoch 3 with exactly 72,755 effective CE tokens under global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626. No epoch-120 convergence analysis, epoch-60 parity check, or selected-checkpoint query retrieval was produced.
