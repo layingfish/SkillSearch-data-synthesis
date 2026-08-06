@@ -1,5 +1,5 @@
 # Experiment: Legacy catalog parity and exposure sweep
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -31,10 +31,12 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_202
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260807_v2/eval/`
 
+Job: `tide-chenyufei03-10489-pwucc` (`rudder`, one 8xA800 node, commit `1268740e4ff2164c3d9a61d3d4d44a957613de62`)
+
 ## Verification
 
 - [x] Minimal local check: shell syntax, Python compile, input-path audit, and local unit suite
-- [ ] RIPOR auxiliary initialization preserves legacy CE RNG and parameters
+- [x] RIPOR auxiliary initialization preserves legacy CE RNG and parameters
 - [ ] Each arm uses one process, global batch 16, and exact catalog/query exposure
 - [ ] `c3`, seed `20260626` reproduces all 75 archived Official top-50 rankings
 - [x] Reviewer required? no; focused local semantic review completed before submission
@@ -44,4 +46,5 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep
 Local unit suite: 71 passed and 13 torch-only tests skipped in the CPU workspace. Every remote arm
 runs the skipped RNG parity test on torch 2.8.0 before training.
 
-Pending submission.
+Submitted on `2026-08-07`. Remote smoke test and torch RNG parity test passed. All eight workers
+entered training with GPUs `0-7` reporting active compute.
