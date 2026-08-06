@@ -37,6 +37,22 @@ class MultiGtCatalogLauncherTest(unittest.TestCase):
             self.script,
         )
 
+    def test_non_converged_fresh_endpoint_has_an_explicit_query_stage(self) -> None:
+        self.assertIn('run_query_from_fresh_e60_endpoint() {', self.script)
+        self.assertIn(
+            'endpoint query stage requires the observed non-converged catalog result',
+            self.script,
+        )
+        self.assertIn(
+            'query_expanded_ce_from_catalog_fresh_e60_endpoint',
+            self.script,
+        )
+        self.assertIn(
+            'query_expanded_ce_fresh_e60_endpoint) '
+            'run_query_from_fresh_e60_endpoint ;;',
+            self.script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

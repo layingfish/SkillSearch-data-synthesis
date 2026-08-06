@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|catalog_resume_diagnostics|catalog_fresh_e60|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected|query_expanded_ce_fresh_e60_selected}"
+STAGE="${1:?usage: $0 preflight|preflight_eval|catalog|catalog_long_e30|catalog_extend_e60|catalog_resume_diagnostics|catalog_fresh_e60|query_expanded_ce|query_sibling_masked_ce|query_expanded_ce_e6|query_expanded_ce_long_selected|query_expanded_ce_fresh_e60_selected|query_expanded_ce_fresh_e60_endpoint}"
 PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${STAGE}.log") 2>&1
@@ -969,6 +969,31 @@ PY
     "${prerequisite}"
 }
 
+run_query_from_fresh_e60_endpoint() {
+  local convergence_summary="${EVAL_ROOT}/catalog_fresh_e60_convergence.json"
+
+  require_file "${convergence_summary}"
+  require_file "$(fresh_catalog_checkpoint "${SKILLGR_EXTENDED_CATALOG_EPOCHS}")/structured_decoder.pt"
+  python3 - "${convergence_summary}" "${SKILLGR_EXTENDED_CATALOG_EPOCHS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_epoch = int(sys.argv[2])
+checkpoints = payload.get("checkpoints") or []
+if not checkpoints or int(checkpoints[-1].get("epoch", -1)) != expected_epoch:
+    raise SystemExit("fresh catalog convergence summary is missing the endpoint checkpoint")
+if payload.get("converged") is not False or payload.get("selected_epoch") is not None:
+    raise SystemExit("endpoint query stage requires the observed non-converged catalog result")
+PY
+  run_query_from_init \
+    expanded_ce \
+    "query_expanded_ce_from_catalog_fresh_e60_endpoint" \
+    "$(fresh_catalog_checkpoint "${SKILLGR_EXTENDED_CATALOG_EPOCHS}")" \
+    "${convergence_summary}"
+}
+
 case "${STAGE}" in
   preflight) run_preflight ;;
   preflight_eval) run_preflight_eval ;;
@@ -982,5 +1007,6 @@ case "${STAGE}" in
   query_expanded_ce_e6) run_query expanded_ce 6 ;;
   query_expanded_ce_long_selected) run_query_from_selected_long_catalog ;;
   query_expanded_ce_fresh_e60_selected) run_query_from_selected_fresh_catalog ;;
+  query_expanded_ce_fresh_e60_endpoint) run_query_from_fresh_e60_endpoint ;;
   *) echo "unknown stage: ${STAGE}" >&2; exit 1 ;;
 esac
