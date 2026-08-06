@@ -209,6 +209,70 @@ def distributed_epoch_batches_no_padding(
         yield [rows[index] for index in local_indices]
 
 
+def distributed_document_augmentation_epoch_batches(
+    query_rows: list[T],
+    catalog_rows: list[T],
+    catalog_passes: int,
+    per_device_batch_size: int,
+    context: DistributedContext,
+    *,
+    seed: int,
+    epoch: int,
+    no_padding: bool = True,
+) -> Iterable[list[T]]:
+    """Mix query and document-indexing views for one logical query epoch.
+
+    Every query row is visited once.  ``catalog_passes`` independently shuffled
+    copies of the catalog pool are added to the same stream.  The helper keeps
+    only integer references, so long document strings are not duplicated in
+    memory.  With ``no_padding=True`` the final global batch is not duplicated;
+    callers must handle empty local tail batches with a zero-weight example.
+    """
+    if per_device_batch_size < 1:
+        raise ValueError(f"per_device_batch_size must be positive, got {per_device_batch_size}")
+    if not query_rows:
+        raise ValueError("document augmentation requires a non-empty query row set")
+    if catalog_passes < 0:
+        raise ValueError(f"catalog_passes must be non-negative, got {catalog_passes}")
+    if catalog_passes > 0 and not catalog_rows:
+        raise ValueError("catalog_passes is positive but the catalog row set is empty")
+
+    query_count = len(query_rows)
+    references = list(range(query_count))
+    query_rng = random.Random(int(seed) + int(epoch))
+    query_rng.shuffle(references)
+    for pass_index in range(catalog_passes):
+        catalog_indices = list(range(len(catalog_rows)))
+        # Use a separate deterministic permutation for each catalog pass so
+        # repeated exposure does not replay the same row order verbatim.
+        pass_rng = random.Random(
+            int(seed) + int(epoch) * 1_000_003 + (pass_index + 1) * 9_176
+        )
+        pass_rng.shuffle(catalog_indices)
+        references.extend(query_count + index for index in catalog_indices)
+    query_rng.shuffle(references)
+
+    global_batch_size = per_device_batch_size * context.world_size
+    if no_padding:
+        scheduled_size = len(references)
+    else:
+        scheduled_size = int(math.ceil(len(references) / global_batch_size) * global_batch_size)
+        if scheduled_size > len(references):
+            references.extend(references[: scheduled_size - len(references)])
+
+    for start in range(0, scheduled_size, global_batch_size):
+        global_references = references[start : start + global_batch_size]
+        local_start = context.rank * per_device_batch_size
+        local_references = global_references[local_start : local_start + per_device_batch_size]
+        batch: list[T] = []
+        for reference in local_references:
+            if reference < query_count:
+                batch.append(query_rows[reference])
+            else:
+                batch.append(catalog_rows[reference - query_count])
+        yield batch
+
+
 def shard_with_indices(rows: list[T], context: DistributedContext) -> list[tuple[int, T]]:
     """Shard inference/evaluation without padding, duplication, or reordering."""
     return [(index, rows[index]) for index in range(context.rank, len(rows), context.world_size)]

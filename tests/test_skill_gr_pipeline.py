@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -48,6 +49,7 @@ from skill_gr_pipeline import (  # noqa: E402
     command_write_pag_msp_protocol,
     deduplicate_code_tuples,
     decoder_source_text,
+    document_augmentation_catalog_pass_schedule,
     encode_structured_sid_target,
     format_skillrouter_query,
     format_skillrouter_skill,
@@ -84,7 +86,11 @@ from skill_gr_pipeline import (  # noqa: E402
     validate_rank_capacity,
     validate_structured_resume_plan,
 )
-from distributed_utils import DistributedContext, distributed_epoch_batches_no_padding  # noqa: E402
+from distributed_utils import (  # noqa: E402
+    DistributedContext,
+    distributed_document_augmentation_epoch_batches,
+    distributed_epoch_batches_no_padding,
+)
 from train_letter_rqvae_official import (  # noqa: E402
     compute_last_code_costs,
     minimum_cost_unique_last_codes,
@@ -201,6 +207,116 @@ class SkillGRPipelineTest(unittest.TestCase):
         visited = [value for batches in batches_by_rank for batch in batches for value in batch]
         self.assertEqual(len(visited), len(rows))
         self.assertEqual(sorted(visited), rows)
+
+    def test_document_augmentation_catalog_pass_schedules_are_exact(self) -> None:
+        expected = {
+            0: [0, 0, 0, 0, 0],
+            3: [1, 0, 1, 0, 1],
+            6: [1, 1, 2, 1, 1],
+            12: [2, 3, 2, 3, 2],
+        }
+        for catalog_passes, schedule in expected.items():
+            with self.subTest(catalog_passes=catalog_passes):
+                observed = document_augmentation_catalog_pass_schedule(5, catalog_passes)
+                self.assertEqual(observed, schedule)
+                self.assertEqual(sum(observed), catalog_passes)
+
+        with self.assertRaisesRegex(ValueError, "query_epochs must be positive"):
+            document_augmentation_catalog_pass_schedule(0, 3)
+        with self.assertRaisesRegex(ValueError, "catalog_epochs must be non-negative"):
+            document_augmentation_catalog_pass_schedule(5, -1)
+
+    def test_document_augmentation_sampler_preserves_exact_exposure_and_order(self) -> None:
+        query_rows = [("query", index) for index in range(19)]
+        catalog_rows = [("catalog", index) for index in range(7)]
+        schedules = {
+            0: [0, 0, 0, 0, 0],
+            3: [1, 0, 1, 0, 1],
+            6: [1, 1, 2, 1, 1],
+            12: [2, 3, 2, 3, 2],
+        }
+
+        def batches_for_epoch(epoch: int, passes: int) -> list[list[list[tuple[str, int]]]]:
+            batches_by_rank = []
+            for rank in range(4):
+                context = DistributedContext(rank=rank, local_rank=rank, world_size=4, device=None)
+                batches_by_rank.append(
+                    list(
+                        distributed_document_augmentation_epoch_batches(
+                            query_rows,
+                            catalog_rows,
+                            passes,
+                            2,
+                            context,
+                            seed=20260626,
+                            epoch=epoch,
+                            no_padding=True,
+                        )
+                    )
+                )
+            return batches_by_rank
+
+        for catalog_passes, schedule in schedules.items():
+            with self.subTest(catalog_passes=catalog_passes):
+                total_query = Counter()
+                total_catalog = Counter()
+                for epoch, passes in enumerate(schedule):
+                    first = batches_for_epoch(epoch, passes)
+                    second = batches_for_epoch(epoch, passes)
+                    self.assertEqual(first, second)
+                    self.assertEqual({len(rank_batches) for rank_batches in first}, {
+                        math.ceil((len(query_rows) + passes * len(catalog_rows)) / 8)
+                    })
+                    visited = [row for rank_batches in first for batch in rank_batches for row in batch]
+                    query_counts = Counter(index for kind, index in visited if kind == "query")
+                    catalog_counts = Counter(index for kind, index in visited if kind == "catalog")
+                    self.assertEqual(query_counts, Counter({index: 1 for index in range(len(query_rows))}))
+                    self.assertEqual(
+                        catalog_counts,
+                        Counter({index: passes for index in range(len(catalog_rows))}),
+                    )
+                    total_query.update(query_counts)
+                    total_catalog.update(catalog_counts)
+                self.assertEqual(
+                    total_query,
+                    Counter({index: 5 for index in range(len(query_rows))}),
+                )
+                self.assertEqual(
+                    total_catalog,
+                    Counter({index: catalog_passes for index in range(len(catalog_rows))}),
+                )
+
+    def test_single_sid_parser_accepts_query_only_document_augmentation(self) -> None:
+        args = build_arg_parser().parse_args(
+            [
+                "train-single-sid-decoder",
+                "--rows",
+                "rows.jsonl",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--skills-jsonl",
+                "skills.jsonl",
+                "--output-dir",
+                "output",
+                "--catalog-epochs",
+                "0",
+                "--catalog-max-steps",
+                "0",
+                "--document-augmentation",
+                "--document-augmentation-catalog-epochs",
+                "0",
+                "--epochs",
+                "5",
+                "--no-load-best-model-at-end",
+            ]
+        )
+
+        self.assertTrue(args.document_augmentation)
+        self.assertEqual(args.document_augmentation_catalog_epochs, 0)
+        self.assertEqual(args.catalog_epochs, 0)
+        self.assertEqual(args.catalog_max_steps, 0)
+        self.assertEqual(args.epochs, 5)
+        self.assertFalse(args.load_best_model_at_end)
 
     def test_append_loss_history_writes_jsonl_rows(self) -> None:
         import json

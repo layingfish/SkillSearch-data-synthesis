@@ -27,6 +27,7 @@ from distributed_utils import (
     all_gather_tensor_with_grad,
     barrier,
     destroy_distributed,
+    distributed_document_augmentation_epoch_batches,
     distributed_epoch_batches,
     distributed_epoch_batches_no_padding,
     global_normalized_loss,
@@ -5159,6 +5160,28 @@ def _distributed_structured_eval_loss(
     return total_sum / max(1, total_count)
 
 
+def document_augmentation_catalog_pass_schedule(
+    query_epochs: int,
+    catalog_epochs: int,
+) -> list[int]:
+    """Spread exact catalog passes as evenly as possible over query epochs."""
+    if query_epochs <= 0:
+        raise ValueError(f"query_epochs must be positive, got {query_epochs}")
+    if catalog_epochs < 0:
+        raise ValueError(f"catalog_epochs must be non-negative, got {catalog_epochs}")
+    schedule: list[int] = []
+    previous = 0
+    for epoch in range(1, query_epochs + 1):
+        # Integer round-half-up avoids Python's banker's rounding and keeps the
+        # cumulative schedule deterministic across runtime versions.
+        cumulative = (2 * epoch * catalog_epochs + query_epochs) // (2 * query_epochs)
+        schedule.append(cumulative - previous)
+        previous = cumulative
+    if sum(schedule) != catalog_epochs:
+        raise AssertionError("document augmentation catalog schedule lost exposure mass")
+    return schedule
+
+
 def _run_distributed_structured_training(
     *,
     args: argparse.Namespace,
@@ -5195,14 +5218,68 @@ def _run_distributed_structured_training(
     loss_history_path = args.output_dir / "loss_history.jsonl"
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError(f"warmup ratio must be in [0, 1), got {args.warmup_ratio}")
-    catalog_total_steps = (
-        args.catalog_max_steps
-        if args.catalog_max_steps > 0
-        else int(math.ceil(len(catalog_rows) / (args.batch_size * context.world_size)) * args.catalog_epochs)
+    document_augmentation = bool(getattr(args, "document_augmentation", False))
+    document_augmentation_catalog_epochs = int(
+        getattr(args, "document_augmentation_catalog_epochs", 0)
     )
-    query_total_steps = args.max_steps if args.max_steps > 0 else int(
-        math.ceil(len(query_train_rows) / (args.batch_size * context.world_size)) * args.epochs
-    )
+    global_batch_size = args.batch_size * context.world_size
+    document_augmentation_schedule: list[int] = []
+    if document_augmentation:
+        if args.catalog_epochs != 0 or args.catalog_max_steps not in (-1, 0):
+            raise ValueError(
+                "unified document augmentation requires --catalog-epochs 0 and "
+                "--catalog-max-steps 0; use --document-augmentation-catalog-epochs for exposure"
+            )
+        if args.max_steps not in (-1, 0):
+            raise ValueError(
+                "unified document augmentation requires --max-steps -1 or 0 so the exact "
+                "query/catalog exposure contract is preserved"
+            )
+        if getattr(args, "resume_from_checkpoint", None):
+            raise ValueError("document augmentation resume is not implemented; start a fresh run")
+        if not catalog_rows:
+            raise ValueError("document augmentation requires catalog rows")
+        document_augmentation_schedule = document_augmentation_catalog_pass_schedule(
+            int(args.epochs),
+            document_augmentation_catalog_epochs,
+        )
+        catalog_total_steps = 0
+        scheduled_steps = sum(
+            math.ceil(
+                (len(query_train_rows) + catalog_passes * len(catalog_rows))
+                / global_batch_size
+            )
+            for catalog_passes in document_augmentation_schedule
+        )
+        query_total_steps = args.max_steps if args.max_steps > 0 else int(scheduled_steps)
+        query_samples = len(query_train_rows) * int(args.epochs)
+        catalog_samples = len(catalog_rows) * document_augmentation_catalog_epochs
+        checkpoint_metadata["document_augmentation"] = {
+            "enabled": True,
+            "sampling": "joint_shuffle_exact_query_and_catalog_passes_v1",
+            "query_rows": len(query_train_rows),
+            "catalog_rows": len(catalog_rows),
+            "query_epochs": int(args.epochs),
+            "catalog_epochs": document_augmentation_catalog_epochs,
+            "catalog_pass_schedule": document_augmentation_schedule,
+            "query_samples": query_samples,
+            "catalog_samples": catalog_samples,
+            "catalog_to_query_sample_ratio": catalog_samples / max(1, query_samples),
+        }
+    else:
+        if document_augmentation_catalog_epochs != 0:
+            raise ValueError(
+                "--document-augmentation-catalog-epochs requires --document-augmentation"
+            )
+        catalog_total_steps = (
+            args.catalog_max_steps
+            if args.catalog_max_steps > 0
+            else int(math.ceil(len(catalog_rows) / global_batch_size) * args.catalog_epochs)
+        )
+        query_total_steps = args.max_steps if args.max_steps > 0 else int(
+            math.ceil(len(query_train_rows) / global_batch_size) * args.epochs
+        )
+        checkpoint_metadata["document_augmentation"] = {"enabled": False}
     total_optimizer_steps = catalog_total_steps + query_total_steps
     if total_optimizer_steps <= 0:
         raise ValueError("structured training requires at least one optimizer step")
@@ -5230,11 +5307,17 @@ def _run_distributed_structured_training(
     }
     use_no_padding_sampler = (
         checkpoint_metadata.get("method_setting") == METHOD_SETTING_RIPOR
+        or document_augmentation
         or bool(getattr(args, "no_padding_distributed_sampler", False))
     )
-    checkpoint_metadata["distributed_sampler"] = (
-        "no_padding_graph_zero_tail_v1" if use_no_padding_sampler else "padded_equal_batch_v1"
-    )
+    if document_augmentation:
+        checkpoint_metadata["distributed_sampler"] = (
+            "document_augmentation_no_padding_graph_zero_tail_v1"
+        )
+    else:
+        checkpoint_metadata["distributed_sampler"] = (
+            "no_padding_graph_zero_tail_v1" if use_no_padding_sampler else "padded_equal_batch_v1"
+        )
     resume_payload = None
     resume_training_state = None
     if getattr(args, "resume_from_checkpoint", None):
@@ -5360,29 +5443,57 @@ def _run_distributed_structured_training(
                 raise ValueError(f"invalid resumed step {step} for total_steps={total_steps}")
         last_metrics: dict[str, float] | None = None
         epoch_metrics: list[dict[str, Any]] = []
-        steps_per_epoch = max(1, math.ceil(len(stage_rows) / (args.batch_size * context.world_size)))
+        default_steps_per_epoch = max(1, math.ceil(len(stage_rows) / global_batch_size))
         continuation_epoch = epoch_index
         continuation_batch_index = resume_batch_index
         model.train()
         while step < total_steps:
+            if document_augmentation and stage_name == "query":
+                if epoch_index >= len(document_augmentation_schedule):
+                    raise RuntimeError(
+                        "document augmentation schedule ended before the requested optimizer steps"
+                    )
+                catalog_passes_this_epoch = document_augmentation_schedule[epoch_index]
+                steps_per_epoch = max(
+                    1,
+                    math.ceil(
+                        (len(stage_rows) + catalog_passes_this_epoch * len(catalog_rows))
+                        / global_batch_size
+                    ),
+                )
+                batch_iterator = distributed_document_augmentation_epoch_batches(
+                    stage_rows,
+                    catalog_rows,
+                    catalog_passes_this_epoch,
+                    args.batch_size,
+                    context,
+                    seed=args.seed,
+                    epoch=epoch_index,
+                    no_padding=use_no_padding_sampler,
+                )
+            else:
+                catalog_passes_this_epoch = 0
+                steps_per_epoch = default_steps_per_epoch
+                batch_iterator = (
+                    distributed_epoch_batches_no_padding
+                    if use_no_padding_sampler
+                    else distributed_epoch_batches
+                )(
+                    stage_rows,
+                    args.batch_size,
+                    context,
+                    seed=args.seed + (10_000 if stage_name == "catalog" else 0),
+                    epoch=epoch_index,
+                )
             epoch_started_at_batch = resume_batch_index
             local_epoch_ce_sum = torch.zeros((), device=device)
             local_epoch_ce_count = torch.zeros((), device=device)
-            batch_iterator = (
-                distributed_epoch_batches_no_padding
-                if use_no_padding_sampler
-                else distributed_epoch_batches
-            )
-            for batch_index, raw_batch_rows in enumerate(batch_iterator(
-                stage_rows,
-                args.batch_size,
-                context,
-                seed=args.seed + (10_000 if stage_name == "catalog" else 0),
-                epoch=epoch_index,
-            )):
+            epoch_completed = True
+            for batch_index, raw_batch_rows in enumerate(batch_iterator):
                 if batch_index < resume_batch_index:
                     continue
                 if step >= total_steps:
+                    epoch_completed = False
                     break
                 # RIPOR must see every source query exactly once per epoch.  On
                 # a short final global batch, ranks without a real example run
@@ -5519,7 +5630,11 @@ def _run_distributed_structured_training(
                             "stage": stage_name,
                             "event": "train",
                             "step": display_step,
-                            "epoch": display_step / steps_per_epoch,
+                            "epoch": (
+                                epoch_index + (batch_index + 1) / steps_per_epoch
+                                if document_augmentation and stage_name == "query"
+                                else display_step / steps_per_epoch
+                            ),
                             "train_loss": train_loss,
                             "ce_loss": last_metrics["ce_loss"],
                             "sequential_ce_weight": ce_weight,
@@ -5576,7 +5691,11 @@ def _run_distributed_structured_training(
                             "stage": stage_name,
                             "event": "eval",
                             "step": display_step,
-                            "epoch": display_step / steps_per_epoch,
+                            "epoch": (
+                                epoch_index + (batch_index + 1) / steps_per_epoch
+                                if document_augmentation and stage_name == "query"
+                                else display_step / steps_per_epoch
+                            ),
                             "dev_loss": dev_loss,
                         }
                         append_loss_history(loss_history_path, event)
@@ -5592,7 +5711,7 @@ def _run_distributed_structured_training(
                                 "best_step": display_step,
                             },
                         )
-            if epoch_started_at_batch == 0 and step % steps_per_epoch == 0:
+            if epoch_started_at_batch == 0 and epoch_completed:
                 epoch_ce_sum, epoch_ce_count = reduce_sum_count(
                     local_epoch_ce_sum, local_epoch_ce_count, context
                 )
@@ -5605,6 +5724,14 @@ def _run_distributed_structured_training(
                     "ce_token_count": epoch_ce_count,
                     "lr": optimizer.param_groups[0]["lr"],
                 }
+                if document_augmentation and stage_name == "query":
+                    epoch_event["document_augmentation_query_rows"] = len(stage_rows)
+                    epoch_event["document_augmentation_catalog_rows"] = (
+                        catalog_passes_this_epoch * len(catalog_rows)
+                    )
+                    epoch_event["document_augmentation_catalog_passes"] = (
+                        catalog_passes_this_epoch
+                    )
                 epoch_metrics.append(epoch_event)
                 if context.is_main:
                     print(
@@ -6357,7 +6484,9 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         context=context,
         checkpoint_metadata=checkpoint_metadata,
         training_formulation=(
-            "letter_single_sid_ripor_prefix_margin_mse"
+            f"single_sid_document_augmentation_{args.query_loss}"
+            if args.document_augmentation
+            else "letter_single_sid_ripor_prefix_margin_mse"
             if method_setting == METHOD_SETTING_RIPOR
             else "single_sid_catalog_indexing_with_official_ripor_prefix_margin_mse"
             if args.ripor_loss_weight > 0
@@ -6410,6 +6539,9 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "lr": args.lr,
                 "lr_scheduler": args.lr_scheduler,
                 "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
+                "distributed_sampler": checkpoint_metadata["distributed_sampler"],
+                "document_augmentation": checkpoint_metadata["document_augmentation"],
+                "optimizer_schedule": checkpoint_metadata["optimizer_schedule"],
                 "weight_decay": args.weight_decay,
                 "seed": args.seed,
                 "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
@@ -6758,7 +6890,9 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
         context=context,
         checkpoint_metadata=checkpoint_metadata,
         training_formulation=(
-            "pag_mset_t5_splade_margin_mse"
+            f"structured_document_augmentation_{args.query_target_mode}_{args.query_loss}"
+            if args.document_augmentation
+            else "pag_mset_t5_splade_margin_mse"
             if args.pag_set_stage_only
             else {
                 METHOD_SETTING_RIPOR: "letter_sid_ripor_prefix_margin_mse",
@@ -6825,6 +6959,9 @@ def command_train_structured_decoder(args: argparse.Namespace) -> None:
                 "lr": args.lr,
                 "lr_scheduler": args.lr_scheduler,
                 "no_padding_distributed_sampler": bool(args.no_padding_distributed_sampler),
+                "distributed_sampler": checkpoint_metadata["distributed_sampler"],
+                "document_augmentation": checkpoint_metadata["document_augmentation"],
+                "optimizer_schedule": checkpoint_metadata["optimizer_schedule"],
                 "weight_decay": args.weight_decay,
                 "seed": args.seed,
                 **init_info,
@@ -7848,6 +7985,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--catalog-epochs", type=int, default=0)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
     p.add_argument(
+        "--document-augmentation",
+        action="store_true",
+        help="mix document-to-SID catalog rows into the query stream instead of running a catalog-only stage",
+    )
+    p.add_argument(
+        "--document-augmentation-catalog-epochs",
+        type=int,
+        default=0,
+        help="exact catalog row passes across the query epochs when --document-augmentation is enabled",
+    )
+    p.add_argument(
         "--pag-set-ids",
         type=Path,
         help="lexical set-ID manifest produced by build-pag-set-ids; enables the joint PAG set branch",
@@ -7995,6 +8143,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--catalog-epochs", type=int, default=3)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
+    p.add_argument(
+        "--document-augmentation",
+        action="store_true",
+        help="mix document-to-SID catalog rows into the query stream instead of running a catalog-only stage",
+    )
+    p.add_argument(
+        "--document-augmentation-catalog-epochs",
+        type=int,
+        default=0,
+        help="exact catalog row passes across the query epochs when --document-augmentation is enabled",
+    )
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
     p.add_argument("--allow-source-truncation", action="store_true")
     p.add_argument("--allow-checkpoint-config-mismatch", action="store_true")
