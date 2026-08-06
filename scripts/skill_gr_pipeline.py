@@ -3234,6 +3234,7 @@ def decoder_checkpoint_metadata(
         "semantic_id_count": len(semantic_ids),
         "semantic_ids_sha256": semantic_ids_sha256(semantic_ids, mode),
         "semantic_id_mode": mode,
+        "ripor_head_initialization_preserves_ce_rng": True,
     }
 
 
@@ -4337,9 +4338,12 @@ def make_structured_t5_sid_model(
             self.code_heads = nn.ModuleList(
                 nn.Linear(d_model, self.codebook_size, bias=True) for _ in range(self.depth)
             )
-            self.ripor_heads = nn.ModuleList(
-                nn.Linear(d_model, self.codebook_size, bias=False) for _ in range(self.depth)
-            )
+            # RIPOR is an auxiliary branch. Its parameter allocation must not
+            # change the historical CE decoder's control-head initialization.
+            with torch.random.fork_rng(devices=[]):
+                self.ripor_heads = nn.ModuleList(
+                    nn.Linear(d_model, self.codebook_size, bias=False) for _ in range(self.depth)
+                )
             self.initialize_ripor_heads_from_code_heads()
             self.dedup_head = (
                 nn.Linear(d_model, self.dedup_size)
@@ -6527,6 +6531,9 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "max_source_length": args.max_source_length,
                 "source_text_policy": checkpoint_metadata["source_text_policy"],
                 "semantic_ids_sha256": checkpoint_metadata["semantic_ids_sha256"],
+                "ripor_head_initialization_preserves_ce_rng": checkpoint_metadata[
+                    "ripor_head_initialization_preserves_ce_rng"
+                ],
                 "method_setting": method_setting,
                 "letter_tokenizer": letter_tokenizer,
                 "reset_optimizer": bool(args.reset_optimizer),

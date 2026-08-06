@@ -702,6 +702,51 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertFalse(any(name.startswith("dedup_head") for name in model.state_dict()))
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_ripor_head_initialization_preserves_legacy_ce_rng_and_parameters(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        seed = 20260626
+        torch.manual_seed(seed)
+        expected_sid = torch.nn.Embedding(67, 8)
+        expected_code_heads = torch.nn.ModuleList(
+            torch.nn.Linear(8, 16, bias=True) for _ in range(4)
+        )
+        expected_control = torch.nn.Linear(8, 2)
+        expected_rng = torch.get_rng_state().clone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        torch.manual_seed(seed)
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        self.assertTrue(torch.equal(model.sid_embedding.weight, expected_sid.weight))
+        for actual, expected in zip(model.code_heads, expected_code_heads):
+            self.assertTrue(torch.equal(actual.weight, expected.weight))
+            self.assertTrue(torch.equal(actual.bias, expected.bias))
+        self.assertTrue(torch.equal(model.control_head.weight, expected_control.weight))
+        self.assertTrue(torch.equal(model.control_head.bias, expected_control.bias))
+        self.assertTrue(torch.equal(torch.get_rng_state(), expected_rng))
+        for ripor, code in zip(model.ripor_heads, model.code_heads):
+            self.assertTrue(torch.equal(ripor.weight, code.weight))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_sibling_exclusions_cover_narrow_control_head_in_full_forward(self) -> None:
         import torch
 
