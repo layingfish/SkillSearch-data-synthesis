@@ -1,5 +1,5 @@
 # Experiment: Classic document augmentation catalog exposure
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -63,7 +63,7 @@ Rudder jobs (`1` node and `8` A800 GPUs per arm):
 
 - `mixed-c12`: `tide-chenyufei03-10468-kjmrb` on `rudder-exper`
 - `mixed-c6`: `tide-chenyufei03-10469-cinsp` on `rudder-exper`
-- `mixed-c3`: `tide-chenyufei03-10470-mbmpm` on `rudder-r2`
+- `mixed-c3`: `tide-chenyufei03-10475-ujgsu` on `rudder` (migrated from pending `tide-chenyufei03-10470-mbmpm`; the only free `rudder-r2` node was marked `GPUUnhealthy`)
 - `query-only`: `tide-chenyufei03-10471-fvsel` on `rudder`
 
 ## Outputs
@@ -76,9 +76,31 @@ Checkpoint root: `/models_rw/SkillSearch-data-synthesis/experiments/document_aug
   catalog row is visited exactly `0/3/6/12` times per arm.
 - [x] Local parser/sampler smoke and targeted unit tests (`80` passed and `12`
   environment-dependent tests skipped on the CPU workspace).
-- [ ] Remote launch preflight and checkpoint manifest audit.
-- [ ] Retrieval metrics with subset recomputation.
+- [x] Remote launch preflight and checkpoint manifest audit.
+- [x] Retrieval metrics with subset recomputation.
 
 ## Result / Notes
 
-Pending.
+All four arms completed their registered optimizer-step counts, exposure checks,
+and evaluation. The table below reports macro recall in percent on Official
+core75 only: `75` rows total (`24` single-skill and `51` multi-skill), beam
+`50`, `beam_order`, and the same predictions for `all/single/multi` rescoring.
+
+| Arm | Catalog passes | All R@1 | All R@10 | All R@50 | Single R@1 | Single R@10 | Single R@50 | Multi R@1 | Multi R@10 | Multi R@50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `query-only` | 0 | 27.26 | 69.33 | 76.78 | 41.67 | 54.17 | 54.17 | 20.48 | 76.47 | 87.42 |
+| `mixed-c3` | 3 | 18.58 | 59.73 | 69.33 | 25.00 | 37.50 | 50.00 | 15.56 | 70.19 | 78.43 |
+| `mixed-c6` | 6 | 22.88 | 65.23 | 75.22 | 33.33 | 50.00 | 58.33 | 17.96 | 72.40 | 83.17 |
+| `mixed-c12` | 12 | 27.59 | 65.89 | 76.00 | 41.67 | 58.33 | 58.33 | 20.97 | 69.44 | 84.31 |
+
+Against `query-only`, `mixed-c12` changes all-row R@1/R@10/R@50 by
+`+0.33/-3.44/-0.78` points. Its single-skill R@10 and R@50 each improve by
+`4.17` points, while multi-skill R@10 and R@50 fall by `7.03` and `3.10`
+points. `mixed-c3` and `mixed-c6` are below `query-only` on all-row recall at
+all three depths. Catalog exposure is therefore non-monotonic and does not
+provide a broad retrieval gain under this protocol; the largest exposure
+mainly trades multi-skill deep recall for single-skill deep recall and a small
+all-row R@1 change.
+
+The private `1,000`-row split was evaluated by the registered launcher but is
+not used in this conclusion.
