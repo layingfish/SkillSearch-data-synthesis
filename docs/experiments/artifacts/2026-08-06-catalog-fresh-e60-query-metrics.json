@@ -1,0 +1,48 @@
+{
+  "catalog_initialization": {
+    "catalog_epochs": 60,
+    "catalog_training": "fresh_continuous_from_t5_base",
+    "converged": false,
+    "teacher_forced_ce": 0.015125840914120186,
+    "teacher_forced_sid_exact_accuracy": 0.9792454126864133,
+    "constrained_greedy_exact_accuracy": 0.9797264792797746
+  },
+  "conditions": {
+    "beam": 50,
+    "catalog_global_batch_size": 16,
+    "catalog_seed": 20260626,
+    "learning_rate": 0.0003,
+    "query_epochs": 5,
+    "query_global_batch_size": 16,
+    "rank_aggregation": "beam_order",
+    "recall_aggregation": "macro",
+    "scheduler": "constant"
+  },
+  "metrics": {
+    "official_core75_multi_51": {
+      "R@1": 0.2096638655462185,
+      "R@10": 0.7275910364145658,
+      "R@50": 0.8218954248366014
+    },
+    "official_core75_overall_75": {
+      "R@1": 0.2625714285714285,
+      "R@10": 0.6414285714285713,
+      "R@50": 0.7188888888888889
+    },
+    "private_multi_896": {
+      "R@1": 0.2194940476190476,
+      "R@10": 0.7823660714285723,
+      "R@50": 0.9166666666666666
+    },
+    "private_overall_1000": {
+      "R@1": 0.24066666666666772,
+      "R@10": 0.7780000000000004,
+      "R@50": 0.909333333333333
+    }
+  },
+  "source_artifacts": {
+    "catalog_convergence": "/models_rw/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1/eval/catalog_fresh_e60_convergence.json",
+    "official_ranked_metrics": "/models_rw/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1/eval/query_expanded_ce_from_catalog_fresh_e60_endpoint/official_core75/ranked_metrics.json",
+    "private_ranked_metrics": "/models_rw/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1/eval/query_expanded_ce_from_catalog_fresh_e60_endpoint/private_test_1000/ranked_metrics.json"
+  }
+}

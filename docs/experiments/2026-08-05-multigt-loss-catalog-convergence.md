@@ -21,9 +21,11 @@ Arms: epoch-3 expanded CE; epoch-3 sibling-masked CE; epoch-6 expanded CE
 Long catalog: 30 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
 Catalog extension: resume the epoch-27 checkpoint to a 60-epoch total horizon with restored optimizer/scheduler/per-rank RNG/shuffle epoch, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; require exact epoch-30 model-state parity before using later checkpoints
 Fresh catalog: 60 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs
+Fresh long catalog: 120 continuous epochs from T5-base, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626; save and teacher-force eval every 3 epochs; require exact epoch-60 model-state parity with the completed fresh epoch-60 run before evaluation
 Selected long-catalog query: read the first converged epoch from `eval/catalog_long_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
 Selected fresh-catalog query: read the first converged epoch from `eval/catalog_fresh_e60_convergence.json`, then run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
 Fresh epoch-60 endpoint query: when the fresh run remains non-converged at epoch 60, use that endpoint for a separately named 5-query-epoch expanded-CE arm under the same global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, and seed=20260626
+Selected fresh epoch-120 query: if the fresh epoch-120 run satisfies the registered criterion, initialize from the earliest selected checkpoint and run 5 query epochs with expanded CE, global batch 16 (8 ranks x 2), lr=3e-4, constant schedule, seed=20260626, and beam=50 retrieval
 ```
 
 Eval:
@@ -33,6 +35,7 @@ Catalog checkpoints: epoch 1/2/3/6 teacher-forced CE, per-level accuracy, exact 
 Catalog checkpoints: epoch 3/6 constrained greedy exact SID accuracy
 Long catalog checkpoints: epoch 3/6/9/.../30 teacher-forced metrics; epoch 6/12/18/24/30 constrained greedy
 Fresh catalog checkpoints: epoch 3/6/9/.../60 teacher-forced metrics; epoch 6/12/18/24/30/36/42/48/54/60 constrained greedy
+Fresh epoch-120 catalog checkpoints: epoch 3/6/9/.../120 teacher-forced metrics; constrained greedy at the selected converged checkpoint, or epoch 120 if no checkpoint qualifies
 Query checkpoints: private 1,000-query and Official core75, constrained beam=50, R@1/R@10/R@50
 ```
 
@@ -42,7 +45,7 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/multigt_loss_cata
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/multigt_loss_catalog_convergence_20260805_v1/logs/`
 
-Metrics: pending
+Metrics: endpoint query summary is tracked in `docs/experiments/artifacts/2026-08-06-catalog-fresh-e60-query-metrics.json`
 
 ## Verification
 
@@ -50,9 +53,10 @@ Metrics: pending
 - [x] Unit/invariant test for sibling exclusion and single-GT equivalence
 - [x] Catalog epoch means cover every real sample exactly once
 - [x] Catalog-resume contract tests for stage, horizon, scheduler, warmup, batch, and world size
-- [ ] Remote epoch-30 exact model-state parity after resuming from epoch 27
+- [x] Remote epoch-30 resume diagnostic; repeat resumes match exactly, while both differ from the uninterrupted checkpoint
 - [ ] Retrieval evaluation from the selected converged catalog checkpoint
-- [ ] Fresh continuous epoch-60 catalog convergence and retrieval evaluation
+- [x] Fresh continuous epoch-60 catalog convergence and endpoint retrieval evaluation
+- [ ] Fresh continuous epoch-120 catalog convergence and selected-checkpoint retrieval evaluation
 - [x] Reviewer required? no; structured local semantic review completed
 
 ## Result / Notes
@@ -114,3 +118,7 @@ Metrics: pending
 - `tide-chenyufei03-10389-crpnr` completed the comparison. Resume-A and resume-B are bitwise identical across 299,290,626 model elements and 448,962,832 optimizer elements. Their model/optimizer relative-L2 drift is exactly zero, and their 14,551-row teacher-forced CE/SID exact metrics are both 0.0476795566/0.958078483 under bf16, world size 8, per-rank batch size 2, and max source length 2048. Relative to the original continuous epoch-30 checkpoint, both resumes have model relative-L2 0.00108570, teacher-forced CE delta -0.00185700, and SID-exact delta +0.000549790 under the same catalog evaluation. The resumed epoch-60 trajectory is therefore quarantined; the convergence experiment will use a fresh continuous epoch-60 run from T5-base.
 - `tide-chenyufei03-10391-thtig`: submitted to `rudder-exper` from detached commit `c5aa808` for the fresh continuous 60-epoch catalog run using 1 node / 8 A800 GPUs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626. Log: `logs/catalog_fresh_e60.log`.
 - `tide-chenyufei03-10391-thtig` completed all 60 fresh continuous catalog epochs with exactly 72,755 effective CE tokens per epoch under global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, and seed 20260626. Epoch-60 teacher-forced CE/SID exact is 0.0151258409/0.979245413 on 14,551 catalog rows under bf16, world size 8, per-rank batch size 2, and max source length 2048. The registered three-interval criterion remains unsatisfied at epoch 60 because the epoch-57-to-60 CE relative change is 0.0691302, although SID-exact absolute change is 0.00116830. The endpoint query arm is explicitly labeled non-converged.
+- `tide-chenyufei03-10406-jbheo`: submitted to `rudder` from detached commit `6ebb564` for the non-converged fresh epoch-60 endpoint query arm using 1 node / 8 A800 GPUs, 5 query epochs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, max source length 2048, seed 20260626, and beam 50 retrieval evaluation.
+- `tide-chenyufei03-10406-jbheo` completed all 5 query epochs with exactly 646,705 effective CE tokens per epoch. With fresh catalog epoch 60 initialization, beam=50, beam-order aggregation, and macro recall, private overall R@1/R@10/R@50 is 0.240667/0.778000/0.909333 on 1,000 queries; private multi-skill is 0.219494/0.782366/0.916667 on 896 queries; Official core75 overall is 0.262571/0.641429/0.718889 on 75 queries; Official multi-skill is 0.209664/0.727591/0.821895 on 51 queries.
+- Against catalog epoch 3 plus expanded CE under the same 5 query epochs, global batch size 16 (8 ranks x 2), constant lr 3e-4, bf16, seed 20260626, beam 50, beam-order aggregation, and identical splits, fresh catalog epoch 60 changes private overall R@1/R@10/R@50 by +0.020250/+0.034583/+0.022583 and private multi-skill by +0.014788/+0.029669/+0.019625. On Official core75 overall, the changes are +0.009683/-0.033651/-0.042857.
+- The fresh epoch-120 stage preserves the epoch-60 training protocol and restarts from T5-base because cross-job resume changed the continuous trajectory. Before evaluation, its epoch-60 model state must exactly match the completed fresh epoch-60 final model across all 299,290,626 T5-base parameters. It evaluates teacher-forced CE and SID exact every 3 epochs under the same criterion, then runs constrained greedy at the earliest selected checkpoint or at epoch 120 when the criterion remains unmet. Query training is enabled only when the convergence summary selects a checkpoint.
