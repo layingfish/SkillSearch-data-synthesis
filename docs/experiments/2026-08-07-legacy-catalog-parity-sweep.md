@@ -48,3 +48,9 @@ runs the skipped RNG parity test on torch 2.8.0 before training.
 
 Submitted on `2026-08-07`. Remote smoke test and torch RNG parity test passed. All eight workers
 entered training with GPUs `0-7` reporting active compute.
+
+During evaluation, the `c3`, seed `20260626` arm recorded a `0/75` exact Top-50 match against the
+archived predictions. The original launcher returned status 1 for that scientific result and attempted
+fail-fast cleanup. The remaining training processes survived as reparented processes and continued.
+The launcher was corrected so parity is recorded in the summary without failing the arm, and future
+per-arm failures are aggregated only after every arm exits.

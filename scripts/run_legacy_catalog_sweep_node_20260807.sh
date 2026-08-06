@@ -59,18 +59,23 @@ launch_arm 6 6 20260627
 launch_arm 7 12 20260627
 
 remaining=${#PIDS[@]}
+failures=0
 while (( remaining > 0 )); do
   finished_pid=""
   if wait -n -p finished_pid; then
     echo "completed ${LABEL_BY_PID[${finished_pid}]}"
-    unset 'LABEL_BY_PID[$finished_pid]'
-    remaining=$((remaining - 1))
   else
     status=$?
     echo "failed ${LABEL_BY_PID[${finished_pid}]:-${finished_pid:-unknown}} with status ${status}" >&2
-    terminate_children
-    exit "${status}"
+    failures=$((failures + 1))
   fi
+  if [[ -n "${finished_pid}" ]]; then
+    unset 'LABEL_BY_PID[$finished_pid]'
+  fi
+  remaining=$((remaining - 1))
 done
 
 trap - INT TERM
+if (( failures > 0 )); then
+  exit 1
+fi
