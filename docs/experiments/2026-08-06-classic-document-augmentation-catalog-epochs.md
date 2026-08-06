@@ -1,5 +1,5 @@
 # Experiment: Classic document augmentation catalog exposure
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -58,6 +58,13 @@ constant lr `3e-4`, weight decay `0`, warmup ratio `0`, bf16, max source length
 Eval: private `1,000` rows and Official core75 `75` rows, beam `50`,
 `beam_order`, macro `R@1/R@10/R@50`; recompute overall/single/multi from the
 same predictions.
+
+Rudder jobs (`1` node and `8` A800 GPUs per arm, queue `rudder`):
+
+- `mixed-c12`: `tide-chenyufei03-10462-pugkd`
+- `mixed-c6`: `tide-chenyufei03-10463-dbali`
+- `mixed-c3`: `tide-chenyufei03-10464-xkosp`
+- `query-only`: `tide-chenyufei03-10465-qjgik`
 
 ## Outputs
 
