@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CATALOG_EPOCHS="${1:?usage: $0 0|3|6|12}"
+CATALOG_EPOCHS="${1:?usage: $0 0|3|6|12 [seed]}"
+RUN_SEED="${2:-20260626}"
 case "${CATALOG_EPOCHS}" in
   0|3|6|12) ;;
   *) echo "catalog epochs must be one of 0, 3, 6, 12" >&2; exit 2 ;;
 esac
+[[ "${RUN_SEED}" =~ ^[0-9]+$ ]] || { echo "seed must be an integer" >&2; exit 2; }
 
-ARM="legacy-c${CATALOG_EPOCHS}-q5"
-PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260807_v1
+ARM="legacy-c${CATALOG_EPOCHS}-q5-seed${RUN_SEED}"
+PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260807_v2
 mkdir -p "${PHYSICAL_OUTPUT_ROOT}/logs"
 exec > >(tee -a "${PHYSICAL_OUTPUT_ROOT}/logs/${ARM}.log") 2>&1
 
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
-bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
+if [[ "${SKILLGR_NODE_PREFLIGHT_DONE:-0}" != 1 ]]; then
+  bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
+fi
 
 ROOT_DIR="${SKILLGR_CODE_ROOT:-/workspace/SkillSearch-data-synthesis}"
-git config --global --add safe.directory "${ROOT_DIR}"
-git config --global --add safe.directory "$(readlink -f "${ROOT_DIR}")"
+if [[ "${SKILLGR_NODE_PREFLIGHT_DONE:-0}" != 1 ]]; then
+  git config --global --add safe.directory "${ROOT_DIR}"
+  git config --global --add safe.directory "$(readlink -f "${ROOT_DIR}")"
+fi
 cd "${ROOT_DIR}"
 
 set -a
 source configs/legacy_catalog_sweep_20260807.env
 set +a
+SKILLGR_SEED="${RUN_SEED}"
+export SKILLGR_SEED
 
 export TOKENIZERS_PARALLELISM=false
 export TRANSFORMERS_OFFLINE=1
@@ -51,7 +59,7 @@ for required in \
   "${SKILLGR_MODEL}/config.json"; do
   require_file "${required}"
 done
-if [[ "${CATALOG_EPOCHS}" == 3 ]]; then
+if [[ "${CATALOG_EPOCHS}" == 3 && "${SKILLGR_SEED}" == 20260626 ]]; then
   require_file "${SKILLGR_ARCHIVED_OFFICIAL}"
 fi
 require_absent "${OUTPUT_DIR}"
@@ -59,15 +67,17 @@ require_absent "${EVAL_DIR}"
 require_absent "${DONE_MARKER}"
 mkdir -p "${SKILLGR_OUTPUT_ROOT}" "$(dirname "${EVAL_DIR}")"
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "legacy sweep requires a clean immutable checkout" >&2
-  git status --short
-  exit 1
+if [[ "${SKILLGR_NODE_PREFLIGHT_DONE:-0}" != 1 ]]; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "legacy sweep requires a clean immutable checkout" >&2
+    git status --short
+    exit 1
+  fi
+  git rev-parse HEAD
+  python3 docker/smoke_test.py
+  python3 -m unittest \
+    tests.test_skill_gr_pipeline.SkillGRPipelineTest.test_ripor_head_initialization_preserves_legacy_ce_rng_and_parameters
 fi
-git rev-parse HEAD
-python3 docker/smoke_test.py
-python3 -m unittest \
-  tests.test_skill_gr_pipeline.SkillGRPipelineTest.test_ripor_head_initialization_preserves_legacy_ce_rng_and_parameters
 
 python3 scripts/skill_gr_pipeline.py train-single-sid-decoder \
   --rows "${SKILLGR_ROWS}" \
@@ -158,6 +168,7 @@ eval_split official_core75 "${SKILLGR_OFFICIAL_ROWS}"
 python3 - \
   "${ARM}" \
   "${CATALOG_EPOCHS}" \
+  "${SKILLGR_SEED}" \
   "${OUTPUT_DIR}" \
   "${EVAL_DIR}" \
   "${SKILLGR_ARCHIVED_OFFICIAL}" <<'PY'
@@ -167,9 +178,10 @@ from pathlib import Path
 
 arm = sys.argv[1]
 catalog_epochs = int(sys.argv[2])
-output = Path(sys.argv[3])
-eval_dir = Path(sys.argv[4])
-archive = Path(sys.argv[5])
+seed = int(sys.argv[3])
+output = Path(sys.argv[4])
+eval_dir = Path(sys.argv[5])
+archive = Path(sys.argv[6])
 
 metrics = {}
 for split, expected_rows in (("private_test_1000", 1000), ("official_core75", 75)):
@@ -196,13 +208,13 @@ summary = {
         "lr": 0.0003,
         "scheduler": "constant",
         "warmup_ratio": 0.0,
-        "seed": 20260626,
+        "seed": seed,
         "selected_checkpoint": "dev_best",
     },
     "metrics": metrics,
 }
 
-if catalog_epochs == 3:
+if catalog_epochs == 3 and seed == 20260626:
     archived = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()]
     current = [
         json.loads(line)
@@ -228,7 +240,7 @@ if catalog_epochs == 3:
     encoding="utf-8",
 )
 print(json.dumps(summary, sort_keys=True))
-if catalog_epochs == 3 and mismatches:
+if catalog_epochs == 3 and seed == 20260626 and mismatches:
     raise SystemExit(f"Notion cat3 top-50 parity failed on {len(mismatches)} / {len(archived)} rows")
 PY
 
