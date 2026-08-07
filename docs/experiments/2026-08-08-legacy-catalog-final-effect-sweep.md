@@ -1,5 +1,5 @@
 # Experiment: Legacy catalog final retrieval effect sweep
-Status: done
+Status: failed
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -44,6 +44,11 @@ Job: `tide-chenyufei03-10506-kiheo` (`rudder-exper`, one 8xA800 node, launch com
 
 ## Result / Notes
 
+This sweep did not reproduce the archived `c3`, seed `20260626` baseline under the Official core75
+protocol below. Its cross-arm catalog deltas are therefore not valid evidence about catalog exposure.
+The raw results remain recorded for diagnosis only. See
+`docs/experiments/2026-08-08-legacy-baseline-last-checkpoint-parity.md`.
+
 All eight arms completed training and Official core75 evaluation. The final artifact is
 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260808_v3/sweep_summary.json`.
 Every arm contains 75 unique query rankings and reports 200 total gold-skill mentions.
@@ -75,13 +80,10 @@ Per-seed Official core75 Overall macro recall under the same condition:
 The archived Notion predictions score `29.32/69.04/78.56` for Overall `R@1/R@10/R@50` under the
 same Official core75 rescorer (75 queries, beam `50`, archived prediction set). The new `c3`, seed
 `20260626` arm scores `27.92/67.65/72.56` under the A800 run and has `0/75` exact Top-50 ranking rows
-against that archived prediction set. Absolute parity therefore remains runtime-sensitive; the catalog
-comparison itself is controlled because all eight new arms share one runtime and protocol.
+against that archived prediction set. This checkpoint mismatch invalidates the intended historical
+baseline comparison.
 
-Catalog epoch `3` is effectively neutral at `R@1/R@50` and adds `1.13` points at `R@10` relative to no
-catalog, averaged over the two registered seeds. Catalog epoch `6` adds no retrieval value. Catalog epoch
-`12` reduces all three metrics and lowers `R@1/R@10` for both seeds. Catalog pretraining is therefore a
-minor lever in this setup; longer catalog exposure is harmful.
+No catalog-effect conclusion is drawn from these arms because the archived baseline parity check failed.
 
 The launch-commit aggregator used an obsolete flat metric key and exited after all per-arm evaluations
 were complete. Commit `8b294c1` fixes the nested metric lookup. The validated summary was regenerated
