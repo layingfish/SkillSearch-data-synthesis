@@ -2,10 +2,12 @@
 set -euo pipefail
 
 LEGACY_COMMIT=15f6c51
-PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_torch_runtime_matrix_20260807_v1
+PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_torch_runtime_matrix_20260807_v2
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
 RUNTIME_ARCHIVE=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py311-v1/site.tar.zst
 RUNTIME_ARCHIVE_SHA256=c6ac264c8519eec039614af6e5357b56434ca4d2981d34bfdbdde5fe9272d2b2
+COMPAT_ARCHIVE=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py311-v1/compat-overlay.tar.zst
+COMPAT_ARCHIVE_SHA256=a6b2f56bb9b4496caa4be225b1c2630270cef1b9a23f82013eea72632bda6b20
 
 if [[ -e "${PHYSICAL_OUTPUT_ROOT}" ]]; then
   echo "refusing to overwrite torch runtime matrix output: ${PHYSICAL_OUTPUT_ROOT}" >&2
@@ -46,20 +48,52 @@ if [[ "${archive_sha256}" != "${RUNTIME_ARCHIVE_SHA256}" ]]; then
   echo "torch-2.10 runtime archive mismatch: ${archive_sha256}" >&2
   exit 1
 fi
+if [[ ! -f "${COMPAT_ARCHIVE}" ]]; then
+  echo "registered torch-2.10 compatibility archive is missing: ${COMPAT_ARCHIVE}" >&2
+  exit 1
+fi
+compat_archive_sha256="$(sha256sum "${COMPAT_ARCHIVE}" | cut -d' ' -f1)"
+if [[ "${compat_archive_sha256}" != "${COMPAT_ARCHIVE_SHA256}" ]]; then
+  echo "torch-2.10 compatibility archive mismatch: ${compat_archive_sha256}" >&2
+  exit 1
+fi
 tar --zstd -xf "${RUNTIME_ARCHIVE}" -C "${TEMP_ROOT}"
 RUNTIME_SITE="${TEMP_ROOT}/site"
 if [[ ! -d "${RUNTIME_SITE}/torch" || ! -d "${RUNTIME_SITE}/transformers" ]]; then
   echo "torch-2.10 runtime archive is incomplete after extraction" >&2
   exit 1
 fi
+tar --zstd -xf "${COMPAT_ARCHIVE}" -C "${RUNTIME_SITE}"
 export PYTHONPATH="${RUNTIME_SITE}:${PYTHONPATH:-}"
 
 python3 - <<'PY'
+import scipy
+import sklearn
 import torch
+import torchvision
 import transformers
+from transformers import T5ForConditionalGeneration
 
-expected = ("2.10.0+cu128", "12.8", 91002, "5.3.0")
-actual = (torch.__version__, torch.version.cuda, torch.backends.cudnn.version(), transformers.__version__)
+expected = (
+    "2.10.0+cu128",
+    "12.8",
+    91002,
+    "5.3.0",
+    "0.25.0+cu128",
+    "1.15.3",
+    "1.7.2",
+    "T5ForConditionalGeneration",
+)
+actual = (
+    torch.__version__,
+    torch.version.cuda,
+    torch.backends.cudnn.version(),
+    transformers.__version__,
+    torchvision.__version__,
+    scipy.__version__,
+    sklearn.__version__,
+    T5ForConditionalGeneration.__name__,
+)
 if actual != expected:
     raise SystemExit(f"torch-2.10 image mismatch: expected={expected}, actual={actual}")
 if torch.cuda.device_count() != 8:
@@ -96,14 +130,23 @@ import safetensors
 import tokenizers
 import torch
 import transformers
+from transformers import T5ForConditionalGeneration
 
-expected = ("2.10.0+cu128", "4.57.6", "0.22.2", "0.36.2", "0.8.0")
+expected = (
+    "2.10.0+cu128",
+    "4.57.6",
+    "0.22.2",
+    "0.36.2",
+    "0.8.0",
+    "T5ForConditionalGeneration",
+)
 actual = (
     torch.__version__,
     transformers.__version__,
     tokenizers.__version__,
     huggingface_hub.__version__,
     safetensors.__version__,
+    T5ForConditionalGeneration.__name__,
 )
 if actual != expected:
     raise SystemExit(f"Transformers 4.57 overlay mismatch: expected={expected}, actual={actual}")
