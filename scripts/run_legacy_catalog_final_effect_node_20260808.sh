@@ -116,8 +116,11 @@ averages = {}
 for catalog_epochs in epochs:
     selected = [row for row in arms if row["catalog_epochs"] == catalog_epochs]
     averages[str(catalog_epochs)] = {
-        key: statistics.fmean(float(row["overall"][key]) for row in selected)
-        for key in ("recall@1", "recall@10", "recall@50")
+        f"recall@{cutoff}": statistics.fmean(
+            float(row["overall"][f"@{cutoff}"]["recall"])
+            for row in selected
+        )
+        for cutoff in (1, 10, 50)
     }
 
 summary = {
