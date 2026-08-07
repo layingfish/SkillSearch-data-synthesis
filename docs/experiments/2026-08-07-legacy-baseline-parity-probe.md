@@ -1,5 +1,5 @@
 # Experiment: Legacy baseline parity probe
-Status: running
+Status: failed
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -41,8 +41,8 @@ single-process parity, commit `77d0b7c6e37d5b29808e5d131c51e275f143c194`)
 
 - [x] Minimal local check: shell syntax, Python compile, and 135-test suite (17 torch-only skips)
 - [x] Batch-order and incomplete-tail invariant tests
-- [ ] Initial CE parameter parity test
-- [ ] Single-GPU step `1/50/900/950` probe
+- [ ] Initial CE parameter parity test (the historical run did not persist its initial state)
+- [x] Single-GPU step `1/50/900/950` probe
 - [x] Reviewer required? yes; no remaining CRITICAL/HIGH findings
 
 ## Result / Notes
@@ -54,3 +54,20 @@ Frozen input byte hashes already match the published handoff: enhanced query row
 
 Runtime preflight passed with Python `3.11.13`, torch `2.8.0+cu128`, CUDA `12.8`, cuDNN `91002`,
 Transformers `4.57.6`, Tokenizers `0.22.2`, and one NVIDIA A800-SXM4-80GB selected from the node.
+
+The probe completed all `950` catalog steps but failed the six-decimal parity gate:
+
+```text
+step  observed   archived   delta
+50    4.188124   4.203789   -0.015665
+900   4.090215   4.091409   -0.001194
+950   4.084387   4.072384   +0.012003
+```
+
+The archived incomplete-batch boundary was reproduced without padding: step `910` used the final `7`
+catalog rows and had loss `4.100275`; step `911` used the first batch after the second in-place shuffle
+and had loss `4.114972`. The next probe must isolate the remaining model-initialization/runtime drift.
+The strongest recorded historical environment candidate is Python `3.10.12`, torch `2.10.0+cu128`,
+Transformers `5.3.0`, Tokenizers version still to recover, and an NVIDIA RTX PRO 6000 Blackwell GPU.
+The archived log's `Loading weights: 257 tensors` path is also absent under the current Transformers
+`4.57.6` runtime, so Transformers `5.3.0` model construction is the first variable to test.
