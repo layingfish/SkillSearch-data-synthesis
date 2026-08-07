@@ -89,9 +89,9 @@ same current rescorer. The strict `c3`, seed `20260626` arm scores `19.73/58.17/
 scores are `25.00/45.83/54.17`. Archived multi-skill scores are `17.63/74.08/86.11`; current strict
 `c3` scores are `17.25/63.98/76.80`.
 
-The parity protocol still differed in sampler tail handling. This launcher passed
-`--no-padding-distributed-sampler`; the archived legacy run predates that option and used padded epoch
-batches. At batch `16`, the current run omitted nine padded catalog examples per epoch (`14,551` rows)
-and three padded query examples per epoch (`129,341` rows). Optimizer-step counts stayed equal, but the
-last batch shape and subsequent dropout RNG stream changed. Commit `9b555bf` introduced the no-padding
-option after the archived run. A padded-sampler rerun is required before treating Notion parity as closed.
+The first confirmed protocol mismatch is epoch shuffle state. The archived single-process code used one
+persistent `random.Random(seed)` for the initial catalog shuffle and every later catalog/query epoch. The
+current DDP-capable loop independently seeds catalog epochs with `seed + 10,000 + epoch` and query epochs
+with `seed + epoch`, so its first catalog batch already differs. The archived loop also kept the final
+incomplete batch; `--no-padding-distributed-sampler` was therefore correct for single-GPU tail handling.
+A short continuous-RNG probe is required before treating Notion parity as closed.
