@@ -1,5 +1,5 @@
 # Experiment: Legacy catalog final retrieval effect sweep
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -30,13 +30,15 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_202
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260808_v3/sweep_summary.json`
 
-Job: pending submission to `rudder-exper`, one 8xA800 node
+Job: `tide-chenyufei03-10506-kiheo` (`rudder-exper`, one 8xA800 node, launch commit
+`44cf0eea862003a194943ae5c6741d1cf447bd6d`)
 
 ## Verification
 
 - [x] Minimal local check: shell syntax, focused RNG test, and launch matrix audit
 - [x] Archived trainer source commit and SHA-256 verified before launch
 - [x] Eight unique GPU assignments and output directories verified
+- [x] Remote preflight passed and all eight single-GPU training processes started
 - [ ] Each arm produces 75 Official core75 rankings and a validated training manifest
 - [ ] Reviewer required? no; focused local semantic review required before submission
 
