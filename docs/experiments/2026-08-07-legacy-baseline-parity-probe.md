@@ -1,5 +1,5 @@
 # Experiment: Legacy baseline parity probe
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -34,6 +34,9 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_baseline_parity_p
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_baseline_parity_probe_20260807_v1/parity_probe.json`
 
+Job: `tide-chenyufei03-10493-gekph` (`rudder`, one 8xA800 node, one GPU used for archived
+single-process parity, commit `77d0b7c6e37d5b29808e5d131c51e275f143c194`)
+
 ## Verification
 
 - [x] Minimal local check: shell syntax, Python compile, and 135-test suite (17 torch-only skips)
@@ -48,3 +51,6 @@ Frozen input byte hashes already match the published handoff: enhanced query row
 `55b6539c3379523f78c2326580fa690500f9b213d1d620b250ba333b65bcba08`, catalog
 `1a3d1b503311bf7760110dbf0db9d2ba7c1d9fdf9ce5ebd3ad2a56182e2c40d3`, and semantic IDs
 `084cccd5033d0aee8fb7bfbf05d55508744376c50a3c9bef95803ee69b41fa61`.
+
+Runtime preflight passed with Python `3.11.13`, torch `2.8.0+cu128`, CUDA `12.8`, cuDNN `91002`,
+Transformers `4.57.6`, Tokenizers `0.22.2`, and one NVIDIA A800-SXM4-80GB selected from the node.
