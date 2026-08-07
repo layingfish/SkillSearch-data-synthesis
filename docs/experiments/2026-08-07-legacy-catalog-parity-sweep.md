@@ -1,5 +1,5 @@
 # Experiment: Legacy catalog parity and exposure sweep
-Status: running
+Status: failed
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -37,8 +37,8 @@ Job: `tide-chenyufei03-10489-pwucc` (`rudder`, one 8xA800 node, commit `1268740e
 
 - [x] Minimal local check: shell syntax, Python compile, input-path audit, and local unit suite
 - [x] RIPOR auxiliary initialization preserves legacy CE RNG and parameters
-- [ ] Each arm uses one process, global batch 16, and exact catalog/query exposure
-- [ ] `c3`, seed `20260626` reproduces all 75 archived Official top-50 rankings
+- [x] Each arm uses one process, global batch 16, and exact catalog/query exposure
+- [x] `c3`, seed `20260626` parity checked: 0 of 75 archived Official Top-50 rankings matched
 - [x] Reviewer required? no; focused local semantic review completed before submission
 
 ## Result / Notes
@@ -54,3 +54,44 @@ archived predictions. The original launcher returned status 1 for that scientifi
 fail-fast cleanup. The remaining training processes survived as reparented processes and continued.
 The launcher was corrected so parity is recorded in the summary without failing the arm, and future
 per-arm failures are aggregated only after every arm exits.
+
+All eight training manifests passed: `ddp_world_size=1`, global batch `16`, query steps `40,420`,
+catalog steps `0/2,730/5,460/10,920`, frozen RIPOR heads, and RNG-preserving auxiliary initialization.
+Interrupted post-training evaluation was completed with the idempotent arm finalizer; no checkpoint was
+retrained or modified.
+
+Official core75 macro recall, averaged across seeds `20260626/20260627` (75 queries, 24 single-skill,
+51 multi-skill, beam `50`, beam-order aggregation, dev-best checkpoint):
+
+| Catalog epochs | All R@1 | All R@10 | All R@50 | Single R@1 | Single R@10 | Single R@50 | Multi R@1 | Multi R@10 | Multi R@50 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 27.98 | 65.68 | 71.72 | 39.58 | 50.00 | 52.08 | 22.52 | 73.06 | 80.96 |
+| 3 | 20.55 | 59.94 | 70.17 | 27.08 | 45.83 | 52.08 | 17.48 | 66.57 | 78.68 |
+| 6 | 22.98 | 58.92 | 71.50 | 33.33 | 43.75 | 52.08 | 18.11 | 66.06 | 80.64 |
+| 12 | 18.35 | 57.18 | 68.61 | 27.08 | 45.83 | 52.08 | 14.23 | 62.52 | 76.39 |
+
+Per-seed Official core75 all-query macro recall under the same evaluation condition:
+
+| Catalog epochs | Seed | R@1 | R@10 | R@50 |
+|---:|---:|---:|---:|---:|
+| 0 | 20260626 | 26.26 | 68.11 | 73.67 |
+| 0 | 20260627 | 29.70 | 63.25 | 69.78 |
+| 3 | 20260626 | 19.73 | 58.17 | 69.56 |
+| 3 | 20260627 | 21.37 | 61.70 | 70.78 |
+| 6 | 20260626 | 20.37 | 55.59 | 69.89 |
+| 6 | 20260627 | 25.59 | 62.25 | 73.11 |
+| 12 | 20260626 | 15.10 | 55.56 | 68.00 |
+| 12 | 20260627 | 21.59 | 58.81 | 69.22 |
+
+The archived Notion predictions score `29.32/69.04/78.56` on all-query R@1/R@10/R@50 under the
+same current rescorer. The strict `c3`, seed `20260626` arm scores `19.73/58.17/69.56`, lower by
+`9.59/10.87/9.00` points. Archived single-skill scores are `54.17/58.33/62.50`; current strict `c3`
+scores are `25.00/45.83/54.17`. Archived multi-skill scores are `17.63/74.08/86.11`; current strict
+`c3` scores are `17.25/63.98/76.80`.
+
+The parity protocol still differed in sampler tail handling. This launcher passed
+`--no-padding-distributed-sampler`; the archived legacy run predates that option and used padded epoch
+batches. At batch `16`, the current run omitted nine padded catalog examples per epoch (`14,551` rows)
+and three padded query examples per epoch (`129,341` rows). Optimizer-step counts stayed equal, but the
+last batch shape and subsequent dropout RNG stream changed. Commit `9b555bf` introduced the no-padding
+option after the archived run. A padded-sampler rerun is required before treating Notion parity as closed.
