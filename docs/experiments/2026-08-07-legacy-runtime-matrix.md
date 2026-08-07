@@ -1,5 +1,5 @@
 # Experiment: Legacy runtime matrix
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -35,6 +35,9 @@ after loss/manifest validation.
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_runtime_matrix_20260807_v1/logs/`
 
 Metrics: one `runtime_probe.json` per arm and a root `matrix_summary.json`
+
+Job: `tide-chenyufei03-10494-hsosv` (`rudder`, one 8xA800 node, eight single-GPU arms,
+commit `5d32b0c8770819d911ef6424ba485bd91fa88fd8f`)
 
 ## Verification
 
