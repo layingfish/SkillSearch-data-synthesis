@@ -1,5 +1,5 @@
 # Experiment: Legacy runtime matrix
-Status: running
+Status: planned
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -32,12 +32,11 @@ archived step-50 loss `4.203789` under the archived training configuration above
 Checkpoint: none; archived trainer checkpoints are written to arm-local `/tmp` directories and removed
 after loss/manifest validation.
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_runtime_matrix_20260807_v1/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_runtime_matrix_20260807_v2/logs/`
 
 Metrics: one `runtime_probe.json` per arm and a root `matrix_summary.json`
 
-Job: `tide-chenyufei03-10494-hsosv` (`rudder`, one 8xA800 node, eight single-GPU arms,
-commit `5d32b0c8770819d911ef6424ba485bd91fa88fd8f`)
+Job: pending resubmission to `rudder` on one 8xA800 node.
 
 ## Verification
 
@@ -48,4 +47,6 @@ commit `5d32b0c8770819d911ef6424ba485bd91fa88fd8f`)
 
 ## Result / Notes
 
-Pending.
+The first submission, `tide-chenyufei03-10494-hsosv`, exited before launching any GPU arm because the
+experiment-note commit was still writing to CFS and the immutable-checkout preflight observed that staged
+file. Its `v1` output is retained. The resubmission uses a fresh `v2` output root and job name.

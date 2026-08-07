@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LEGACY_COMMIT=15f6c51
-PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_runtime_matrix_20260807_v1
+PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_runtime_matrix_20260807_v2
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
 
 if [[ -e "${PHYSICAL_OUTPUT_ROOT}" ]]; then
