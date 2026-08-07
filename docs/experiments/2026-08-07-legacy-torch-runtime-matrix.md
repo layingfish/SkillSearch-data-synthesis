@@ -1,5 +1,5 @@
 # Experiment: Legacy torch runtime matrix
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -40,6 +40,9 @@ and are then removed.
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_torch_runtime_matrix_20260807_v1/logs/`
 
 Metrics: one `runtime_probe.json` per arm and a root `matrix_summary.json`
+
+Job: `tide-chenyufei03-10498-kbvoj` (`rudder`, one 8xA800 node, eight single-GPU arms,
+commit `7ff6d3196b51e478073e25e921db6b6f26cad11c`)
 
 ## Verification
 
