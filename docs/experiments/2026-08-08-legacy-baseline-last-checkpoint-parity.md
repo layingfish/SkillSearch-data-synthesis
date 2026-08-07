@@ -22,8 +22,8 @@ bash scripts/run_legacy_last_checkpoint_parity_20260808.sh
 Evaluation: T5-base, catalog epochs `3`, query epochs `5`, seed `20260626`, last query step `40420`,
 Official core75 with `75` queries, beam `50`, beam-order aggregation, CE log-prob scoring, and distributed
 evaluation on one 8xA800 node. Tokenizer audit uses max source length `2048`, train batch `16`, dev batch
-`128`, and retrieval batch `1` under the same training image. It compares padded `input_ids` and
-`attention_mask` in addition to unpadded token sequences.
+`128`, and retrieval batch `1` with matching Transformers and Tokenizers versions. It compares padded
+`input_ids` and `attention_mask` in addition to unpadded token sequences.
 
 ## Outputs
 
