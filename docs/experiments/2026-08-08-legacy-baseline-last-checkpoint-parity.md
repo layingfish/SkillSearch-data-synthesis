@@ -1,5 +1,5 @@
 # Experiment: Legacy baseline last-checkpoint parity
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -32,6 +32,8 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_sw
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_last_parity_20260808_v1/logs/job.log`
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_last_parity_20260808_v1/summary.json`
+
+Job: `tide-chenyufei03-10529-cwknk` (`rudder-exper`, one 8xA800 node, launch commit `9d9f6e6`)
 
 ## Verification
 
