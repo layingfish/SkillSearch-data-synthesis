@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -41,6 +42,29 @@ def load_pipeline(path: Path) -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_saved_tokenizer(path: Path) -> Any:
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(path, local_files_only=True)
+    except AttributeError as exc:
+        tokenizer_config_path = path / "tokenizer_config.json"
+        tokenizer_config = (
+            json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+            if tokenizer_config_path.is_file()
+            else {}
+        )
+        if not isinstance(tokenizer_config.get("extra_special_tokens"), list):
+            raise
+        if "object has no attribute 'keys'" not in str(exc):
+            raise
+        return AutoTokenizer.from_pretrained(
+            path,
+            local_files_only=True,
+            extra_special_tokens={},
+        )
 
 
 def file_sha256(path: Path) -> str | None:
@@ -197,14 +221,16 @@ def compare_split(
 
 
 def main() -> None:
-    from transformers import AutoTokenizer
-
     args = parse_args()
     batch_sizes = (args.train_batch_size, args.eval_batch_size, args.official_batch_size)
     if any(batch_size <= 0 for batch_size in batch_sizes):
         raise ValueError("batch sizes must be positive")
     if args.max_source_length <= 0:
         raise ValueError("max source length must be positive")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    write_probe = args.output.parent / f".{args.output.name}.write-probe-{os.getpid()}"
+    write_probe.write_text("probe\n", encoding="utf-8")
+    write_probe.unlink()
 
     pipeline = load_pipeline(args.pipeline)
     semantic_ids, _ = pipeline.load_semantic_ids_with_mode(args.semantic_ids)
@@ -221,10 +247,8 @@ def main() -> None:
     )
     official_rows = pipeline.load_jsonl(args.official_rows)
 
-    archived_tokenizer = AutoTokenizer.from_pretrained(
-        args.archived_tokenizer, local_files_only=True
-    )
-    new_tokenizer = AutoTokenizer.from_pretrained(args.new_tokenizer, local_files_only=True)
+    archived_tokenizer = load_saved_tokenizer(args.archived_tokenizer)
+    new_tokenizer = load_saved_tokenizer(args.new_tokenizer)
     split_rows = (
         ("query_train", query_train_rows, args.train_batch_size),
         ("query_dev", query_dev_rows, args.eval_batch_size),
@@ -299,7 +323,6 @@ def main() -> None:
             and truncation_side_exact
         ),
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True), flush=True)
 
