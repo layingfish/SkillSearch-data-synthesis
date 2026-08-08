@@ -1,5 +1,5 @@
 # Experiment: Legacy base exact-runtime catalog sweep
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -29,6 +29,8 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_exac
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_exact_runtime_20260808_v1/sweep_summary.json`
 
+Job: `tide-chenyufei03-10553-hpwia` (`rudder-exper`, one 8xA800 node, launch commit `5a1968f`)
+
 ## Verification
 
 - [ ] Runtime and eight-GPU preflight
@@ -40,4 +42,4 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_
 
 ## Result / Notes
 
-Pending.
+Submitted on `2026-08-08`; waiting for the worker pod to be scheduled.
