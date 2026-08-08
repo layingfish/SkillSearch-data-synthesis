@@ -1,0 +1,46 @@
+{
+  "catalog_step_1": {
+    "conditions": "random.Random(20260626); initial catalog shuffle; catalog epoch-1 shuffle; batch_size=16",
+    "row_ids_sha256": "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443",
+    "row_ids": [
+      "catalog:other/services-layer",
+      "catalog:other/go-oss-maintainer",
+      "catalog:other/album-conceptualizer",
+      "catalog:other/early-stopping-callback-jeremylongshore-claude-code-plugins-",
+      "catalog:development/meta",
+      "catalog:other/osc52-clipboard",
+      "catalog:other/vendix-frontend-module-rzyfront-vendix-2",
+      "catalog:other/typescript-api",
+      "catalog:other/gpu-memory-analysis",
+      "catalog:data/dbt-model-generator",
+      "catalog:other/solid-nextjs-fusengine-agents",
+      "catalog:development/recursive-improvement",
+      "catalog:other/file-validator-cisco-ai-defense-skill-scanner",
+      "catalog:other/terraform-dralgorhythm-claude-agentic-frame",
+      "catalog:development/communication-protocols-pluginagentmarketpla-custom-plugin-server",
+      "catalog:other/read-github"
+    ]
+  },
+  "query_step_1": {
+    "conditions": "same random.Random object after initial catalog shuffle and 3 catalog epoch shuffles; query epoch-1 shuffle; batch_size=16",
+    "row_ids_sha256": "56995788f5f03f084be7ac3ea36848206aa09943ba41dbc6dbf68b0000fefb85",
+    "row_ids": [
+      "pseudo:catalog_task:other/read-inspect-eval:4|other/read-inspect-eval",
+      "pseudo:catalog_task:other/replit-incident-runbook:3|other/replit-incident-runbook",
+      "15784|other/supabase-patterns",
+      "pseudo:catalog_task:other/serena-takeaki0817-hibioru:3|other/serena-takeaki0817-hibioru",
+      "pseudo:catalog_task:development/app-accessibility:4|development/app-accessibility",
+      "12963|data/chroma-client",
+      "pseudo:catalog_task:other/subagent-best-practices-opensourcesam-v2-heras-garden:3|other/subagent-best-practices-opensourcesam-v2-heras-garden",
+      "pseudo:catalog_task:other/hook-development-aiskillstore-marketplace:4|other/hook-development-aiskillstore-marketplace",
+      "pseudo:catalog_task:other/regulatory-deadline-tracker:1|other/regulatory-deadline-tracker",
+      "10969|other/frontend-design-grupous-gpus-2",
+      "19366|other/ui-ux-pro-max",
+      "8626|other/animation-review",
+      "8567|marketing/heading-tree",
+      "pseudo:catalog_task:development/long-prompt-guide-rfxlamia-flow:3|development/long-prompt-guide-rfxlamia-flow",
+      "14816|other/cell-segmentation-gptomics-bioskills",
+      "pseudo:catalog_task:other/designer:4|other/designer"
+    ]
+  }
+}
