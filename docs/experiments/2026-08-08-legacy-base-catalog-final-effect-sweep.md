@@ -25,13 +25,13 @@ to match the archived prediction file exactly.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v2/legacy-c{0,3,6,12}-q5-seed{20260626,20260627}/final`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v3/legacy-c{0,3,6,12}-q5-seed{20260626,20260627}/final`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v2/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v3/logs/`
 
-Bootstrap log: `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_catalog_base_sweep_20260808_v2.log`
+Bootstrap log: `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_catalog_base_sweep_20260808_v3.log`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v2/sweep_summary.json`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v3/sweep_summary.json`
 
 ## Verification
 
