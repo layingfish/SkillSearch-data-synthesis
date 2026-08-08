@@ -51,7 +51,7 @@ fi
 python3 -m py_compile \
   "${LEGACY_SOURCE_ROOT}/scripts/skill_gr_pipeline.py" \
   scripts/skill_gr_pipeline.py
-python3 -m unittest tests.test_legacy_baseline_parity_probe
+python3 -m unittest discover -s tests -p test_legacy_baseline_parity_probe.py
 
 export TOKENIZERS_PARALLELISM=false
 export TRANSFORMERS_OFFLINE=1
