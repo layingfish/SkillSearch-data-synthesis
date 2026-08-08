@@ -1,0 +1,12 @@
+{"epoch":0.054945054945054944,"event":"train","lr":0.0003,"stage":"catalog","step":50,"train_loss":4.203788757324219}
+{"epoch":0.989010989010989,"event":"train","lr":0.0003,"stage":"catalog","step":900,"train_loss":4.091408729553223}
+{"epoch":1.043956043956044,"event":"train","lr":0.0003,"stage":"catalog","step":950,"train_loss":4.072384357452393}
+{"epoch":3.0,"event":"train","lr":0.0003,"stage":"catalog","step":2730,"train_loss":4.044649600982666}
+{"epoch":0.025769875016106173,"event":"train","lr":0.0003,"stage":"query","step":200,"train_loss":3.962428331375122}
+{"dev_loss":3.7965545721027385,"epoch":0.025769875016106173,"event":"eval","stage":"query","step":200}
+{"epoch":0.12884937508053085,"event":"train","lr":0.0003,"stage":"query","step":1000,"train_loss":3.7825965881347656}
+{"dev_loss":3.3352677041366072,"epoch":0.12884937508053085,"event":"eval","stage":"query","step":1000}
+{"epoch":4.999355753124597,"event":"train","lr":0.0003,"stage":"query","step":38800,"train_loss":0.6922861933708191}
+{"dev_loss":0.7821362744041177,"epoch":4.999355753124597,"event":"eval","stage":"query","step":38800}
+{"epoch":5.0,"event":"train","lr":0.0003,"stage":"query","step":38805,"train_loss":0.41363900899887085}
+{"dev_loss":0.7822972546096613,"epoch":5.0,"event":"eval","stage":"query","step":38805}
