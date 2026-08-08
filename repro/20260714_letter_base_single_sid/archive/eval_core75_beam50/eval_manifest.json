@@ -1,0 +1,53 @@
+{
+  "allow_source_truncation": false,
+  "batch_size": 1,
+  "codebook_size": 256,
+  "dedup_size": 0,
+  "depth": 4,
+  "gold_coverage": {
+    "gold_skill_mentions": 200,
+    "max_gold_skills": 7,
+    "missing_gold_mentions": 0,
+    "rows_over_max_skills": 51,
+    "rows_with_missing_gold": 0,
+    "unique_missing_gold_skill_ids": []
+  },
+  "k_values": [
+    1,
+    10,
+    50
+  ],
+  "max_rank": 50,
+  "max_skills": 1,
+  "max_source_length": 2048,
+  "max_source_length_source": "cli",
+  "metrics": "top-1 constrained structured SID generated set; hit_count=|pred∩gold|; recall=hit_count/|gold|",
+  "model_dir": "outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/single_sid_d4_lightgcn_d32_letterofficial_task5_core75_gt2_t5base_cat3_querye5_b16/final",
+  "num_beams": 50,
+  "rank_aggregation": "beam_order",
+  "ranked_length_audit": {
+    "max_ranked_skills": 50,
+    "min_ranked_skills": 50,
+    "rows_below_max_rank": 0
+  },
+  "rows": "outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_core75_learned_d4_inputs/rows_003.skillsbench_core75.rows.jsonl",
+  "semantic_id_mode": "learned_codes",
+  "semantic_ids": "outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/letter_d4_lightgcn_d32_official_vecdiv_v1_seed42_core75_gt2/semantic_ids.jsonl",
+  "semantic_ids_sha256": "da2fff997b1979f7d51996c5ddbe4593a18d23bdfd546c61dd61fb783567349c",
+  "semantic_ids_verified": true,
+  "source_length_audit": {
+    "max_source_length": 2048,
+    "max_tokens": 678,
+    "mean_tokens": 375.493,
+    "min_tokens": 109,
+    "over_limit_fraction": 0.0,
+    "over_limit_rows": 0,
+    "p50_tokens": 375,
+    "p95_tokens": 577,
+    "p99_tokens": 678,
+    "rows": 75
+  },
+  "source_text_policy": "skillrouter_query_1500_chars_with_instruction_v1",
+  "source_text_policy_verified": true,
+  "split": "skillsbench_core75"
+}

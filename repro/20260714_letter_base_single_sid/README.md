@@ -1,6 +1,6 @@
 # 2026-07-14 LETTER base single-SID 训练取证包
 
-更新时间：2026-08-08（Asia/Shanghai）
+更新时间：2026-08-09（Asia/Shanghai）
 
 本目录用于复现以下 run：
 
@@ -37,6 +37,13 @@ catalog step 50 loss      = 4.203788757324219
 | `batch_order_reference.json` | catalog/query 首批 row IDs 与顺序 hash |
 | `loss_reference.jsonl` | 原始 loss history 的关键行，保留完整浮点精度 |
 | `requirements.nearest_20260716.txt` | 同一服务器在 2026-07-16 由 W&B 保存的最近环境快照；不冒充 2026-07-14 原始 `pip freeze` |
+| `archive/train/single_sid_decoder_train_manifest.json` | 原 run 的完整训练 manifest |
+| `archive/train/loss_history.jsonl` | 原 run 的完整 loss history |
+| `archive/train/train.log` | 原 run 的完整 stdout/stderr 日志 |
+| `archive/eval_core75_beam50/eval_manifest.json` | Official core75 最终评测的完整 manifest |
+| `archive/eval_core75_beam50/eval_metrics.json` | 生成集合口径的原始评测指标 |
+| `archive/eval_core75_beam50/predictions.jsonl` | Official core75 的 75 条原始 beam-order Top-50 排序 |
+| `archive/eval_core75_beam50/ranked_metrics*.json` | Overall、Single、Multi 的原始 macro Recall@K |
 
 ## 2. 原始 Git 状态与源码
 
@@ -133,7 +140,7 @@ echo $! > "$out/train.pid"
 GitHub code:
   https://github.com/layingfish/SkillSearch-data-synthesis
   visibility: private
-  current handoff commit: 5807397dfa69159bed0802fe9367b292688b25b7
+  baseline before adding the raw train/eval archive: 150a822ad91bf44b6c48468fafebf69b216bd5c7
 
 ModelScope dataset:
   https://modelscope.ai/datasets/Yufie-Chen/SkillGR-Task5-Assets
@@ -159,7 +166,30 @@ ModelScope model:
 
 checkpoint 中保存的 `semantic_ids_sha256=da2fff997b1979f7d51996c5ddbe4593a18d23bdfd546c61dd61fb783567349c` 是排序后逻辑映射的 fingerprint。它与文件字节 SHA256 的定义不同。
 
-### 4.3 T5-base cache
+`rows_000.decoder_rows.base_plus_task5_gt2.jsonl` 的 94,912 条 source rows 由两部分组成：
+
+| 组成 | source rows | 展开后的 single-positive rows | 条件 |
+|---|---:|---:|---|
+| 原 base 部分 | 19,487 | 48,750 | `source` 字段缺失；按每行去重、排序后的正例展开 |
+| Task5 task-style pseudo query | 75,425 | 75,425 | `source=full_catalog_task_style_pseudo_query`；每行一个正例 |
+| 合计 | 94,912 | 124,175 | 即实际传给 `--rows` 的完整文件 |
+
+这里的“base 94,912 rows”已经包含 75,425 条 Task5 task-style pseudo query。它没有混入后续 5,166 条 mode3 augment，也没有混入其他 replay 文件。若加入 mode3，输入应为 100,078 source rows、展开后 129,341 rows；这与原 manifest 的 `source_train_rows=94912`、`query_train_rows=124175` 不符。
+
+multi-skill source row 的处理规则固定：先对 `selected_skill_ids` 保序去重，再按 skill ID 排序，随后复制成每个正例一条 single-SID row。训练没有跨 source row 去重、sample、权重调整或每 epoch 重新展开；5 个 query epoch 只对同一份 124,175-row list 原地 shuffle。
+
+### 4.3 query 输入字段与模板
+
+94,912 条训练 source rows 均含 `query` 和 `query_text`，均不含 `decoder_input`；`query` 也没有预置 instruction。实际输入始终使用 `query`，先截取前 1,500 个字符，再拼接：
+
+```text
+Instruct: Given a task description, retrieve the most relevant skill document that would help an agent complete the task
+Query:{query[:1500]}
+```
+
+随后 tokenizer 以 `max_source_length=2048` 做 token 截断。训练集审计最大为 747 tokens（124,175 expanded rows），所以实际没有发生 token 截断。没有额外字段拼接或 task description 格式转换。
+
+### 4.4 T5-base cache
 
 原始路径：
 
@@ -334,7 +364,109 @@ last dev loss = 0.7822972546096613 at step 38805
 
 ModelScope model revision `8e5b73e59d617e1d9b5ee893efe1ef4c6da0ce6d` 内保留 best/last/final、manifest、loss history 和 train log。
 
-## 10. 公司服务器的最短诊断路径
+## 10. 最终检索结果的原始证据链
+
+Notion 中的结果对应以下唯一路径：
+
+```text
+checkpoint:
+outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/
+single_sid_d4_lightgcn_d32_letterofficial_task5_core75_gt2_t5base_cat3_querye5_b16/final
+
+evaluation directory:
+outputs/eval/skill_gr_d4_lightgcn_letterofficial_task5_core75_gt2_20260714/core75_beam50
+
+predictions:
+outputs/eval/skill_gr_d4_lightgcn_letterofficial_task5_core75_gt2_20260714/
+core75_beam50/predictions.jsonl
+```
+
+原始评测命令：
+
+```bash
+cd /root/workplace/SkillSearch-data-synthesis
+root=outputs/eval/skill_gr_d4_lightgcn_letterofficial_task5_core75_gt2_20260714
+model=outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/single_sid_d4_lightgcn_d32_letterofficial_task5_core75_gt2_t5base_cat3_querye5_b16/final
+sem=outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/letter_d4_lightgcn_d32_official_vecdiv_v1_seed42_core75_gt2/semantic_ids.jsonl
+rows=outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_core75_learned_d4_inputs
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
+python3 scripts/skill_gr_pipeline.py eval-single-sid-decoder \
+  --rows "$rows/rows_003.skillsbench_core75.rows.jsonl" \
+  --model-dir "$model" \
+  --semantic-ids "$sem" \
+  --output-dir "$root/core75_beam50" \
+  --split-name skillsbench_core75 \
+  --max-source-length 2048 \
+  --num-beams 50 \
+  --k-values 1,10,50 \
+  --rank-aggregation beam_order \
+  --log-every 10
+```
+
+原始 `eval_manifest.json` 记录 `model_dir=.../final`、`num_beams=50`、`rank_aggregation=beam_order`、`max_rank=50`、`max_skills=1`。Official core75 含 75 queries、200 个 gold mentions，其中 Single 24 queries、Multi 51 queries。
+
+| subset | R@1 | R@10 | R@50 | 评测条件 |
+|---|---:|---:|---:|---|
+| Overall | 28.3683% | 69.0000% | 75.0000% | Official core75 75 queries；beam=50；beam-order；macro Recall |
+| Single | 41.6667% | 45.8333% | 50.0000% | Official core75 24 single-skill queries；同上 |
+| Multi | 22.1102% | 79.9020% | 86.7647% | Official core75 51 multi-skill queries；同上 |
+
+这些数值直接来自归档的 `ranked_metrics.json`、`ranked_metrics.single.json` 和 `ranked_metrics.multi.json`，与 Notion 表完全一致。`predictions.jsonl` 含 75 行，并且公司侧已经确认归档 checkpoint 在当前代码下复现了全部 75 条 Top-50 排序。因此可以排除“Notion 指标抄自另一条 run”“评测误用了 best/last”“归档 checkpoint 与 predictions 不配套”三种可能。
+
+原始评测文件 SHA256：
+
+```text
+1fe070112bbac91272fbbd8f2a5d7a5d62e9e5f206aaf7f08e759ed365b03703  eval_manifest.json
+44cd1b3fe6fe0ac19fc154c21492a0fa620b29f0117312f9e66acad23492440d  eval_metrics.json
+167426964ab2938889526128a8119f39043a3d788d590105cd4a3be6cc31cf88  predictions.jsonl
+818e4f6df5a911943f003fc1d00911c0652e2cf4b8d28b67b912ca12dc24f6b0  ranked_metrics.json
+ff439b28465167e6ec71b5c2013214d7b6a040ecebda2f718306fe44b2b1ca15  ranked_metrics.single.json
+13bd5e8dc20fd7372d9953cb25a32d6c16ef632044333890d3779e8b999c6b9d  ranked_metrics.multi.json
+```
+
+## 11. 当前复现 manifest 的逐字段比较
+
+公司 manifest 路径为：
+
+```text
+/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_exact_runtime_20260808_v1/legacy-c3-q5-seed20260626/single_sid_decoder_train_manifest.json
+```
+
+该文件不在本地工作区，当前也无法从本机连接公司服务器，所以不能凭路径推测字段差异。原始 manifest 已放入 `archive/train/single_sid_decoder_train_manifest.json`。在公司服务器执行下面的只读比较，可只打印不同字段：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+old = json.loads(Path(
+    "repro/20260714_letter_base_single_sid/archive/train/"
+    "single_sid_decoder_train_manifest.json"
+).read_text())
+new = json.loads(Path(
+    "/models_rw/SkillSearch-data-synthesis/experiments/"
+    "legacy_catalog_base_exact_runtime_20260808_v1/"
+    "legacy-c3-q5-seed20260626/single_sid_decoder_train_manifest.json"
+).read_text())
+
+def diff(a, b, prefix=""):
+    if isinstance(a, dict) and isinstance(b, dict):
+        for key in sorted(set(a) | set(b)):
+            path = f"{prefix}.{key}" if prefix else key
+            if key not in a:
+                print(path, "<missing>", "=>", repr(b[key]))
+            elif key not in b:
+                print(path, repr(a[key]), "=>", "<missing>")
+            else:
+                diff(a[key], b[key], path)
+    elif a != b:
+        print(prefix, repr(a), "=>", repr(b))
+
+diff(old, new)
+PY
+```
+
+## 12. 公司服务器的最短诊断路径
 
 从私有 GitHub 拉取包含本目录的 commit，并从固定 ModelScope revision 恢复 assets。随后在 A800 环境运行：
 
@@ -357,4 +489,4 @@ python3 repro/20260714_letter_base_single_sid/catalog_50_probe.py \
 
 公司复现当前报告的 step 50 loss 为 `4.184667`（A800、batch=16、BF16、seed=20260626）。原 RTX step 50 为 `4.203788757324219`（默认 `foreach=None`，有效 foreach=true）。先让公司 probe 返回 initial hash、batch hash、step 1、`optimizer_param_group` 和 `inferred_foreach`，即可把原因定位到初始化、顺序、首步 forward 或累积 update 四层中的一层。
 
-当前证据不支持继续猜测“隐藏 shuffle”或“catalog 未收敛”。原 RTX 50-step probe 已复现归档值；A800 的差异需要通过上述四个锚点定位。
+当前归档已经闭环到原始 predictions。公司复现的问题是训练所得 checkpoint 的检索能力不同，评测口径和归档结果归属已被排除。原 RTX 50-step probe 仍可用于定位训练轨迹从哪里分叉，但 catalog loss 本身不能解释 Single R@1 的最终差距。
