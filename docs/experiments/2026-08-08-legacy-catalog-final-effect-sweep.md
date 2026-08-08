@@ -1,10 +1,11 @@
 # Experiment: Legacy catalog final retrieval effect sweep
-Status: failed
+Status: failed (wrong target: 100,078-row enhanced data)
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
 
-Measure the retrieval effect of catalog pretraining with the archived single-process trainer. Run catalog
+This run accidentally used the 100,078-row enhanced dataset and the enhanced archived checkpoint. It does
+not evaluate the 94,912-row `LETTER base single` target. Measure the retrieval effect of catalog pretraining with the archived single-process trainer. Run catalog
 epochs `0/3/6/12` at seeds `20260626/20260627`, followed by five query epochs. The archived trainer from
 commit `15f6c51131f3b6f3e8580aa4564b17cbe13a9790` preserves the original continuous shuffle RNG. The current
 pipeline is used only for one consistent Official core75 evaluation.

@@ -11,8 +11,12 @@ esac
 
 ROOT_DIR="${SKILLGR_CODE_ROOT:-/workspace/SkillSearch-data-synthesis}"
 LEGACY_ROOT="${SKILLGR_LEGACY_SOURCE_ROOT:?legacy source root is required}"
+CONFIG_PATH="${SKILLGR_CONFIG:-${ROOT_DIR}/configs/legacy_catalog_final_effect_20260808.env}"
+if [[ "${CONFIG_PATH}" != /* ]]; then
+  CONFIG_PATH="${ROOT_DIR}/${CONFIG_PATH}"
+fi
 set -a
-source "${ROOT_DIR}/configs/legacy_catalog_final_effect_20260808.env"
+source "${CONFIG_PATH}"
 set +a
 
 ARM="legacy-c${CATALOG_EPOCHS}-q${SKILLGR_QUERY_EPOCHS}-seed${RUN_SEED}"
@@ -44,6 +48,24 @@ require_absent "${OUTPUT_DIR}"
 require_absent "${EVAL_DIR}"
 require_absent "${DONE_MARKER}"
 
+check_sha256() {
+  local path="$1"
+  local expected="$2"
+  local observed
+  observed="$(sha256sum "${path}" | awk '{print $1}')"
+  if [[ "${observed}" != "${expected}" ]]; then
+    echo "SHA-256 mismatch for ${path}: expected ${expected}, observed ${observed}" >&2
+    exit 1
+  fi
+}
+
+check_sha256 "${SKILLGR_ROWS}" "${SKILLGR_ROWS_SHA256}"
+check_sha256 "${SKILLGR_DEV_ROWS}" "${SKILLGR_DEV_ROWS_SHA256}"
+check_sha256 "${SKILLGR_OFFICIAL_ROWS}" "${SKILLGR_OFFICIAL_ROWS_SHA256}"
+check_sha256 "${SKILLGR_SKILLS}" "${SKILLGR_SKILLS_SHA256}"
+check_sha256 "${SKILLGR_SEMANTIC_IDS}" "${SKILLGR_SEMANTIC_IDS_SHA256}"
+check_sha256 "${SKILLGR_ARCHIVED_OFFICIAL}" "${SKILLGR_ARCHIVED_OFFICIAL_SHA256}"
+
 observed_pipeline_sha256="$(sha256sum "${LEGACY_ROOT}/scripts/skill_gr_pipeline.py" | awk '{print $1}')"
 if [[ "${observed_pipeline_sha256}" != "${SKILLGR_LEGACY_PIPELINE_SHA256}" ]]; then
   echo "archived pipeline SHA-256 mismatch" >&2
@@ -69,12 +91,22 @@ python3 "${LEGACY_ROOT}/scripts/skill_gr_pipeline.py" train-single-sid-decoder \
   --lr "${SKILLGR_LR}" \
   --weight-decay "${SKILLGR_WEIGHT_DECAY}" \
   --logging-steps 50 \
-  --eval-steps 1000 \
+  --eval-steps "${SKILLGR_EVAL_STEPS}" \
   --seed "${RUN_SEED}" \
   --load-best-model-at-end \
   --bf16
 
-python3 - "${OUTPUT_DIR}" "${CATALOG_EPOCHS}" "${RUN_SEED}" <<'PY'
+python3 - \
+  "${OUTPUT_DIR}" \
+  "${CATALOG_EPOCHS}" \
+  "${RUN_SEED}" \
+  "${SKILLGR_EXPECTED_SOURCE_ROWS}" \
+  "${SKILLGR_EXPECTED_QUERY_TRAIN_ROWS}" \
+  "${SKILLGR_EXPECTED_QUERY_STEPS}" \
+  "${SKILLGR_EXPECTED_CATALOG_STEPS_PER_EPOCH}" \
+  "${SKILLGR_TRAIN_BATCH}" \
+  "${SKILLGR_EVAL_BATCH}" \
+  "${SKILLGR_EVAL_STEPS}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -82,12 +114,21 @@ from pathlib import Path
 output = Path(sys.argv[1])
 catalog_epochs = int(sys.argv[2])
 seed = int(sys.argv[3])
+source_rows = int(sys.argv[4])
+query_train_rows = int(sys.argv[5])
+query_steps = int(sys.argv[6])
+catalog_steps_per_epoch = int(sys.argv[7])
+train_batch_size = int(sys.argv[8])
+eval_batch_size = int(sys.argv[9])
+eval_steps = int(sys.argv[10])
 manifest = json.loads((output / "single_sid_decoder_train_manifest.json").read_text(encoding="utf-8"))
 expected = {
-    "batch_size": 16,
-    "eval_batch_size": 128,
-    "catalog_steps": 910 * catalog_epochs,
-    "query_steps": 40420,
+    "batch_size": train_batch_size,
+    "eval_batch_size": eval_batch_size,
+    "source_train_rows": source_rows,
+    "query_train_rows": query_train_rows,
+    "catalog_steps": catalog_steps_per_epoch * catalog_epochs,
+    "query_steps": query_steps,
     "max_source_length": 2048,
     "lr": 0.0003,
     "weight_decay": 0.0,
@@ -102,6 +143,25 @@ mismatches = {
 }
 if mismatches:
     raise SystemExit(f"training manifest mismatch: {mismatches}")
+events = [
+    json.loads(line)
+    for line in (output / "loss_history.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+actual_eval_steps = [
+    int(event["step"])
+    for event in events
+    if event.get("stage") == "query" and event.get("event") == "eval"
+]
+expected_eval_steps = list(range(eval_steps, query_steps + 1, eval_steps))
+if not expected_eval_steps or expected_eval_steps[-1] != query_steps:
+    expected_eval_steps.append(query_steps)
+if actual_eval_steps != expected_eval_steps:
+    raise SystemExit(
+        "query eval cadence mismatch: "
+        f"expected={expected_eval_steps[:3]}...{expected_eval_steps[-3:]}, "
+        f"actual={actual_eval_steps[:3]}...{actual_eval_steps[-3:]}"
+    )
 if not (output / "final" / "structured_decoder.pt").is_file():
     raise SystemExit("final checkpoint is missing")
 print(json.dumps({"catalog_epochs": catalog_epochs, "seed": seed, "manifest_verified": True}))
@@ -122,11 +182,13 @@ python3 scripts/skill_gr_pipeline.py eval-single-sid-decoder \
   --k-values 1,10,50 \
   --log-every 25
 
-python3 scripts/skill_gr_pipeline.py rescore-ranked \
-  --predictions "${EVAL_DIR}/predictions.jsonl" \
-  --subset all \
-  --k-values 1,10,50 \
-  --output "${EVAL_DIR}/ranked_metrics_all.json"
+for subset in all single multi; do
+  python3 scripts/skill_gr_pipeline.py rescore-ranked \
+    --predictions "${EVAL_DIR}/predictions.jsonl" \
+    --subset "${subset}" \
+    --k-values 1,10,50 \
+    --output "${EVAL_DIR}/ranked_metrics_${subset}.json"
+done
 
 python3 - \
   "${ARM}" \
@@ -135,7 +197,9 @@ python3 - \
   "${OUTPUT_DIR}" \
   "${EVAL_DIR}" \
   "${SKILLGR_LEGACY_COMMIT}" \
-  "${SKILLGR_ARCHIVED_OFFICIAL}" <<'PY'
+  "${SKILLGR_ARCHIVED_OFFICIAL}" \
+  "${SKILLGR_EVAL_BATCH}" \
+  "${SKILLGR_EVAL_STEPS}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -147,6 +211,8 @@ output = Path(sys.argv[4])
 eval_dir = Path(sys.argv[5])
 legacy_commit = sys.argv[6]
 archive = Path(sys.argv[7])
+eval_batch_size = int(sys.argv[8])
+eval_steps = int(sys.argv[9])
 
 predictions = [
     json.loads(line)
@@ -155,7 +221,12 @@ predictions = [
 ]
 if len(predictions) != 75:
     raise SystemExit(f"Official core75 prediction count mismatch: {len(predictions)}")
-metrics = json.loads((eval_dir / "ranked_metrics_all.json").read_text(encoding="utf-8"))["overall"]
+metrics = {
+    subset: json.loads(
+        (eval_dir / f"ranked_metrics_{metric_subset}.json").read_text(encoding="utf-8")
+    )["overall"]
+    for subset, metric_subset in (("overall", "all"), ("single", "single"), ("multi", "multi"))
+}
 summary = {
     "arm": arm,
     "catalog_epochs": catalog_epochs,
@@ -163,6 +234,8 @@ summary = {
     "source_commit": legacy_commit,
     "protocol": {
         "global_batch_size": 16,
+        "eval_batch_size": eval_batch_size,
+        "eval_steps": eval_steps,
         "query_epochs": 5,
         "lr": 0.0003,
         "scheduler": "constant",
@@ -171,7 +244,7 @@ summary = {
         "selected_checkpoint": "dev_best",
         "evaluation": "Official core75, beam=50, beam_order, CE log-prob",
     },
-    "overall": metrics,
+    **metrics,
 }
 if catalog_epochs == 3 and seed == 20260626 and archive.is_file():
     archived = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()]

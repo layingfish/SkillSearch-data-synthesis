@@ -1,10 +1,11 @@
 # Experiment: Legacy baseline last-checkpoint parity
-Status: done
+Status: done (wrong target diagnostic: 100,078-row enhanced data)
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
 
-Determine why the new catalog sweep does not reproduce the archived baseline. Evaluate the new `c3`,
+This diagnostic compares two enhanced-data checkpoints and does not test the 94,912-row `LETTER base
+single` target. Determine why the new catalog sweep does not reproduce the archived baseline. Evaluate the new `c3`,
 seed `20260626` last checkpoint at query step `40420`, matching the archived checkpoint's terminal query
 step. Compare the archived and new saved tokenizers on every expanded query-train row, query-dev row,
 catalog row, and Official core75 row. The launcher validates immutable artifact hashes, checkpoint

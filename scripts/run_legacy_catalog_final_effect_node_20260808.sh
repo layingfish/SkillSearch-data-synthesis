@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="${SKILLGR_CODE_ROOT:-/workspace/SkillSearch-data-synthesis}"
-PHYSICAL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260808_v3
+PHYSICAL_OUTPUT_ROOT="${SKILLGR_PHYSICAL_OUTPUT_ROOT:-/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_catalog_sweep_20260808_v3}"
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
 
 if [[ -e "${PHYSICAL_OUTPUT_ROOT}" ]]; then
@@ -17,6 +17,11 @@ git config --global --add safe.directory "${ROOT_DIR}"
 git config --global --add safe.directory "$(readlink -f "${ROOT_DIR}")"
 cd "${ROOT_DIR}"
 
+CONFIG_PATH="${SKILLGR_CONFIG:-configs/legacy_catalog_final_effect_20260808.env}"
+if [[ "${CONFIG_PATH}" != /* ]]; then
+  CONFIG_PATH="${ROOT_DIR}/${CONFIG_PATH}"
+fi
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "catalog sweep requires a clean immutable checkout" >&2
   git status --short
@@ -25,8 +30,15 @@ fi
 git rev-parse HEAD
 
 set -a
-source configs/legacy_catalog_final_effect_20260808.env
+source "${CONFIG_PATH}"
 set +a
+OUTPUT_ALIAS_PROBE="${PHYSICAL_OUTPUT_ROOT}/.output-root-alias-probe"
+touch "${OUTPUT_ALIAS_PROBE}"
+if [[ ! -f "${SKILLGR_OUTPUT_ROOT}/.output-root-alias-probe" ]]; then
+  echo "logical output root does not point to the physical experiment root" >&2
+  exit 1
+fi
+unlink "${OUTPUT_ALIAS_PROBE}"
 LEGACY_SOURCE_ROOT="$(mktemp -d /tmp/skillgr-legacy-15f6c51.XXXXXX)"
 git archive "${SKILLGR_LEGACY_COMMIT}" | tar -xf - -C "${LEGACY_SOURCE_ROOT}"
 export SKILLGR_LEGACY_SOURCE_ROOT="${LEGACY_SOURCE_ROOT}"
@@ -40,6 +52,65 @@ python3 -m py_compile \
   "${LEGACY_SOURCE_ROOT}/scripts/skill_gr_pipeline.py" \
   scripts/skill_gr_pipeline.py
 python3 -m unittest tests.test_legacy_baseline_parity_probe
+
+export TOKENIZERS_PARALLELISM=false
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+
+if [[ -n "${SKILLGR_ARCHIVED_RUN:-}" ]]; then
+  ARCHIVED_PARITY_DIR="${SKILLGR_OUTPUT_ROOT}/archived_base_final_parity"
+  CUDA_VISIBLE_DEVICES=0 python3 scripts/skill_gr_pipeline.py eval-single-sid-decoder \
+    --rows "${SKILLGR_OFFICIAL_ROWS}" \
+    --model-dir "${SKILLGR_ARCHIVED_RUN}/final" \
+    --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+    --output-dir "${ARCHIVED_PARITY_DIR}" \
+    --split-name official_core75 \
+    --max-source-length "${SKILLGR_MAX_SOURCE_LENGTH}" \
+    --num-beams "${SKILLGR_NUM_BEAMS}" \
+    --rank-aggregation beam_order \
+    --decoder-head ce \
+    --score-transform logprob \
+    --k-values 1,10,50 \
+    --log-every 25
+
+  for subset in all single multi; do
+    python3 scripts/skill_gr_pipeline.py rescore-ranked \
+      --predictions "${ARCHIVED_PARITY_DIR}/predictions.jsonl" \
+      --subset "${subset}" \
+      --k-values 1,10,50 \
+      --output "${ARCHIVED_PARITY_DIR}/ranked_metrics_${subset}.json"
+  done
+
+  python3 - \
+    "${SKILLGR_ARCHIVED_OFFICIAL}" \
+    "${ARCHIVED_PARITY_DIR}/predictions.jsonl" \
+    "${ARCHIVED_PARITY_DIR}/parity.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+archive_path = Path(sys.argv[1])
+current_path = Path(sys.argv[2])
+output_path = Path(sys.argv[3])
+
+def load(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+archive = load(archive_path)
+current = load(current_path)
+if len(archive) != 75 or len(current) != 75:
+    raise SystemExit(f"archived parity row mismatch: archive={len(archive)}, current={len(current)}")
+exact_rows = sum(
+    left.get("ranked_skill_ids") == right.get("ranked_skill_ids")
+    for left, right in zip(archive, current)
+)
+result = {"rows": len(current), "top50_exact_rows": exact_rows}
+output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+if exact_rows != len(current):
+    raise SystemExit(f"archived base evaluation parity failed: {result}")
+print(json.dumps(result, sort_keys=True))
+PY
+fi
 
 declare -a PIDS=()
 declare -A LABEL_BY_PID=()
@@ -116,11 +187,14 @@ averages = {}
 for catalog_epochs in epochs:
     selected = [row for row in arms if row["catalog_epochs"] == catalog_epochs]
     averages[str(catalog_epochs)] = {
-        f"recall@{cutoff}": statistics.fmean(
-            float(row["overall"][f"@{cutoff}"]["recall"])
-            for row in selected
-        )
-        for cutoff in (1, 10, 50)
+        subset: {
+            f"recall@{cutoff}": statistics.fmean(
+                float(row[subset][f"@{cutoff}"]["recall"])
+                for row in selected
+            )
+            for cutoff in (1, 10, 50)
+        }
+        for subset in ("overall", "single", "multi")
     }
 
 summary = {
