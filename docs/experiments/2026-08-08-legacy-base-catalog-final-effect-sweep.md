@@ -29,6 +29,8 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_ba
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v1/logs/`
 
+Bootstrap log: `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_catalog_base_sweep_20260808_v1.log`
+
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_catalog_base_sweep_20260808_v1/sweep_summary.json`
 
 ## Verification
