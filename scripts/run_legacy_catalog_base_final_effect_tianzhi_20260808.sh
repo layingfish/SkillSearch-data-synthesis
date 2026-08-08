@@ -10,6 +10,7 @@ mkdir -p "$(dirname "${BOOTSTRAP_LOG}")"
 exec > >(tee -a "${BOOTSTRAP_LOG}") 2>&1
 
 bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
+cd /mnt/cfs_algo_bj/workspace/chenyufei03/SkillSearch-data-synthesis
 rm -rf /usr/local/lib/python3.11/site-packages/torch*
 rm -rf /usr/local/lib/python3.11/site-packages/nvidia*
 python3 -m pip install "${TORCH_WHEEL}" --no-deps -q
