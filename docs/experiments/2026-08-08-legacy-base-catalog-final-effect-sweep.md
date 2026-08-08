@@ -13,7 +13,7 @@ by five query epochs. All arms use the archived single-process trainer from comm
 Train and evaluate eight independent arms on one 8xA800 node:
 
 ```text
-bash scripts/run_legacy_catalog_base_final_effect_node_20260808.sh
+bash scripts/run_legacy_catalog_base_final_effect_tianzhi_20260808.sh
 ```
 
 Configuration: task5 base source rows `94,912`, expanded query rows `124,175`, T5-base, per-arm global
