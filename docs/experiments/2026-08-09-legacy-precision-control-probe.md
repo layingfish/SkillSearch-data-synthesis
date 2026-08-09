@@ -52,7 +52,11 @@ eight single-GPU arms, launch commit `1b24d27fd9f97e615a600f70b1d2f2f1e8a392b1`)
 Phase-2 job: `tide-chenyufei03-10564-ekstg` (`rudder-exper`, one 8xA800 node,
 eight single-GPU BLAS/kernel arms, launch commit `d7ae8686bc7a3ceff1c71b3f93528c0337698840`).
 
-Phase-3 job: pending; one `rudder-exper` 8xA800 node. Four arms use Python `3.10.12`
+Phase-3 job: `tide-chenyufei03-10568-tartg` (`rudder-exper`, one 8xA800 node,
+launch commit `46094cd0dd12d25ce57ab78ab2c61e8af8f2fb04`) failed before runtime extraction.
+The pod started with cwd inside an empty `/workspace`; alias initialization replaced that directory,
+so the subsequent pip bootstrap could not resolve `os.getcwd()`. The retry changes cwd to `/tmp`
+before alias initialization. Four arms use Python `3.10.12`
 with the official cp310 torch `2.10.0+cu128` wheel, and four controls use Python `3.11.11`
 with the existing cp311 wheel. Every arm uses default BF16 controls, seed `20260626`, batch
 `16`, lr `3e-4`, weight decay `0`, and exactly 50 catalog optimizer steps. The cp310 runtime

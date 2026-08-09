@@ -7,6 +7,7 @@ BOOTSTRAP_LOG=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-s
 TORCH_BOOTSTRAP_WHEEL=/mnt/cfs_algo_bj/workspace/chenyufei03/SkillDelta/pip_cache/torch-2.3.1+cu121-cp311-cp311-linux_x86_64.whl
 LAUNCH_COMMIT="${SKILLGR_LAUNCH_COMMIT:?set SKILLGR_LAUNCH_COMMIT to the verified experiment commit}"
 
+cd /tmp
 mkdir -p "$(dirname "${BOOTSTRAP_LOG}")"
 exec > >(tee -a "${BOOTSTRAP_LOG}") 2>&1
 bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
