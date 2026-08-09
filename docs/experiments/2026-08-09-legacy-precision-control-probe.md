@@ -1,5 +1,5 @@
 # Experiment: Legacy precision-control probe
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -15,9 +15,11 @@ Transformers `5.3.0`，CUDA `12.8`，BF16 或显式 FP32。
 
 PyTorch 官方文档说明 BF16 GEMM 默认允许 reduced-precision reduction，并允许通过
 `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False` 关闭：
-<https://pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms>。
+<https://docs.pytorch.org/docs/2.10/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms>。
 跨平台不保证浮点结果逐 bit 一致：
-<https://pytorch.org/docs/stable/notes/randomness.html>。
+<https://docs.pytorch.org/docs/2.10/notes/randomness.html>。
+cuBLAS 只保证同 toolkit、同 GPU architecture、同 SM 数量时逐 bit 可复现：
+<https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility>。
 
 ## Commands
 
@@ -25,6 +27,7 @@ Train:
 
 ```text
 bash scripts/run_legacy_precision_control_matrix_20260809.sh
+bash scripts/run_legacy_python_abi_matrix_20260809.sh
 ```
 
 Eval: none. Compare step 1/50 losses, initialization hashes, RNG hashes, and runtime flags
@@ -40,7 +43,9 @@ Metrics phase 1: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_preci
 
 Metrics phase 2: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_blas_control_probe_20260809_v2/matrix_summary.json`.
 
-Metrics phase 3: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_python_abi_probe_20260809_v1/matrix_summary.json`.
+Raw metrics phase 3: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_python_abi_probe_20260809_v1/arms/cp310_r*/runtime_probe.json`.
+
+Cross-job summary phase 3: `docs/experiments/artifacts/2026-08-09-legacy-python-abi-cross-job-summary.json`.
 
 Phase-3 cp310 runtime: `/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py310-v1/runtime.tar.zst`,
 `1,019,567,918` bytes, SHA-256
@@ -56,10 +61,14 @@ Phase-3 job: `tide-chenyufei03-10568-tartg` (`rudder-exper`, one 8xA800 node,
 launch commit `46094cd0dd12d25ce57ab78ab2c61e8af8f2fb04`) failed before runtime extraction.
 The pod started with cwd inside an empty `/workspace`; alias initialization replaced that directory,
 so the subsequent pip bootstrap could not resolve `os.getcwd()`. The retry changes cwd to `/tmp`
-before alias initialization. Four arms use Python `3.10.12`
-with the official cp310 torch `2.10.0+cu128` wheel, and four controls use Python `3.11.11`
-with the existing cp311 wheel. Every arm uses default BF16 controls, seed `20260626`, batch
-`16`, lr `3e-4`, weight decay `0`, and exactly 50 catalog optimizer steps. The cp310 runtime
+before alias initialization. Retry job `tide-chenyufei03-10569-ctkdq` uses launch commit
+`ce86c87987ac428fc0062487235f7cc36018c54d` on one `rudder-exper` 8xA800 node.
+Four completed arms use Python `3.10.12` with the official cp310 torch `2.10.0+cu128` wheel.
+The four same-job Python `3.11.11` controls failed during model construction because the image-local
+apex extension was compiled against another torch ABI. The cp311 comparison therefore uses four
+completed Python `3.11.13` replicas from `tide-chenyufei03-10505-plfwk` and the matching contract
+arm from `tide-chenyufei03-10564-ekstg`. Every compared arm uses default BF16 controls,
+seed `20260626`, batch `16`, lr `3e-4`, weight decay `0`, and exactly 50 catalog optimizer steps. The cp310 runtime
 uses NetworkX `3.4.2`, the latest release compatible with Python `3.10`; the cp311 control uses
 NetworkX `3.6.1`. CUDA package versions remain cuBLAS `12.8.4.1`, cuDNN `9.10.2.21`, and
 CUDA runtime `12.8.90` in both conditions.
@@ -72,9 +81,11 @@ CUDA runtime `12.8.90` in both conditions.
 - [x] Precision controls are recorded by the training child before the first forward
 - [x] Phase-2 input/order and RNG hashes match the archived contract
 - [x] Phase-3 cp310 archive hash, relocation, ABI tags, and package metadata verified locally
-- [ ] Phase-3 cp310/cp311 imports and CUDA package versions pass GPU-node preflight
-- [ ] Four replicas agree within each Python ABI condition in phase 3
-- [ ] Reviewer required? no; diagnostic probe only
+- [x] Phase-3 cp310/cp311 imports and CUDA package versions pass GPU-node preflight
+- [x] Actual loaded cuBLAS/cuBLASLt/cuDNN libraries resolve inside the fixed runtime archive
+- [x] Four cp310 replicas and four prior cp311 replicas agree exactly within each condition
+- [x] Cross-condition initialization, input order, RNG hashes, and step-1/50 losses agree exactly
+- [x] Reviewer required? no; diagnostic probe only
 
 ## Result / Notes
 
@@ -103,3 +114,17 @@ default, explicit cuBLAS, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, deterministic algor
 Phase 3 isolates the remaining Python ABI and torch-wheel variable before attributing the
 first-forward split to GPU architecture or driver behavior. The cp310 wheel SHA-256 is
 `36368507b56eaa51acbd3c96ac8893bb9a86991ffcd0699fea3a1a74a2b8bdcb`.
+
+All four cp310 A800 replicas produced step-1/50 losses `4.546923637/4.184666634` exactly under
+the fixed protocol above. Their model fingerprint, CPU RNG-after-init, CUDA RNG-before-forward,
+and first catalog batch hash match the archived RTX probe and the prior cp311 A800 controls.
+The four prior cp311 A800 replicas also produced `4.546923637/4.184666634` under the same protocol.
+Python `3.10.12` versus `3.11.13` and the cp310 versus cp311 torch wheels therefore do not explain
+the RTX/A800 first-forward split.
+
+The remaining coupled variables are GPU architecture and driver: RTX PRO 6000 Blackwell with
+driver `580.126.09` versus A800 Ampere with driver `535.161.07`. The archived RTX step-1/50 losses
+remain `4.528710842/4.203788757` under the same input, initialization, RNG, BF16, optimizer, and
+50-step conditions. This is consistent with the cuBLAS guarantee above, which scopes bitwise
+reproducibility to GPUs with the same architecture and SM count. The current evidence does not
+separate GPU architecture from driver effects.

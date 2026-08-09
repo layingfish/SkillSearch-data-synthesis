@@ -93,7 +93,7 @@ import tokenizers
 import torch
 import torchvision
 import transformers
-from transformers import T5ForConditionalGeneration
+from transformers import T5Config, T5ForConditionalGeneration
 
 expected = {
     "python_prefix": os.environ["EXPECTED_PYTHON_PREFIX"],
@@ -130,6 +130,16 @@ actual = {
 matrix = torch.ones((8, 8), dtype=torch.bfloat16, device="cuda")
 torch.matmul(matrix, matrix)
 torch.cuda.synchronize()
+tiny_t5 = T5ForConditionalGeneration(T5Config(
+    vocab_size=32,
+    d_model=16,
+    d_kv=4,
+    d_ff=32,
+    num_layers=1,
+    num_decoder_layers=1,
+    num_heads=4,
+))
+del tiny_t5
 library_names = ("libcublas.so", "libcublasLt.so", "libcudnn.so")
 loaded_cuda_libraries = sorted({
     fields[-1]

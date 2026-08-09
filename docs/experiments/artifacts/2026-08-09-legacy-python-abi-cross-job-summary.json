@@ -1,0 +1,81 @@
+{
+  "artifact_format": "legacy_python_abi_cross_job_summary_v1",
+  "protocol": {
+    "batch_size": 16,
+    "catalog_optimizer_steps": 50,
+    "precision": "bf16",
+    "seed": 20260626,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "torch": "2.10.0+cu128",
+    "transformers": "5.3.0",
+    "cuda_runtime": "12.8",
+    "cublas_package": "12.8.4.1",
+    "cudnn_package": "9.10.2.21"
+  },
+  "archived_rtx_reference": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "driver": "580.126.09",
+    "python": "3.10.12",
+    "step_1": 4.528710842132568,
+    "step_50": 4.203788757324219,
+    "initial_model_fingerprint": "c219d07a2ac425cffd677cefc0792a81f47aa3ad9d0fa76a0bfa37cdf9f5ebde",
+    "cpu_rng_after_init_sha256": "c7674001d52ec9a441a446aa5bcea21926392ee15eee3d5ed578decde6118178",
+    "cuda_rng_before_forward_sha256": "87e7d790d0d53018bfaa5c17183bf79642be40bb0bd607387e1e875a19234ac8",
+    "first_catalog_batch_sha256": "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443"
+  },
+  "cp310_a800": {
+    "job_id": "tide-chenyufei03-10569-ctkdq",
+    "replicas": 4,
+    "replica_exact": true,
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "driver": "535.161.07",
+    "python": "3.10.12",
+    "python_abi": "cp310",
+    "torch_wheel_sha256": "36368507b56eaa51acbd3c96ac8893bb9a86991ffcd0699fea3a1a74a2b8bdcb",
+    "step_1": 4.546923637390137,
+    "step_50": 4.184666633605957,
+    "initial_model_fingerprint": "c219d07a2ac425cffd677cefc0792a81f47aa3ad9d0fa76a0bfa37cdf9f5ebde",
+    "cpu_rng_after_init_sha256": "c7674001d52ec9a441a446aa5bcea21926392ee15eee3d5ed578decde6118178",
+    "cuda_rng_before_forward_sha256": "87e7d790d0d53018bfaa5c17183bf79642be40bb0bd607387e1e875a19234ac8",
+    "first_catalog_batch_sha256": "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443"
+  },
+  "cp311_a800_reference": {
+    "replica_job_id": "tide-chenyufei03-10505-plfwk",
+    "contract_job_id": "tide-chenyufei03-10564-ekstg",
+    "replicas": 4,
+    "replica_exact": true,
+    "gpu": "NVIDIA A800-SXM4-80GB",
+    "driver": "535.161.07",
+    "python": "3.11.13",
+    "python_abi": "cp311",
+    "step_1": 4.546923637390137,
+    "step_50": 4.184666633605957,
+    "initial_model_fingerprint": "c219d07a2ac425cffd677cefc0792a81f47aa3ad9d0fa76a0bfa37cdf9f5ebde",
+    "cpu_rng_after_init_sha256": "c7674001d52ec9a441a446aa5bcea21926392ee15eee3d5ed578decde6118178",
+    "cuda_rng_before_forward_sha256": "87e7d790d0d53018bfaa5c17183bf79642be40bb0bd607387e1e875a19234ac8",
+    "first_catalog_batch_sha256": "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443"
+  },
+  "comparison": {
+    "cp310_vs_cp311_step_1_equal": true,
+    "cp310_vs_cp311_step_50_equal": true,
+    "cp310_vs_cp311_initialization_equal": true,
+    "cp310_vs_cp311_rng_equal": true,
+    "cp310_vs_cp311_batch_equal": true,
+    "cp310_delta_from_archived_rtx_step_1": 0.01821279525756836,
+    "cp310_delta_from_archived_rtx_step_50": -0.01912212371826172,
+    "python_abi_or_wheel_explains_rtx_split": false
+  },
+  "phase3_job_note": {
+    "status": "cp310_complete_cp311_duplicate_failed",
+    "cp310_arms_completed": 4,
+    "cp311_arms_completed": 0,
+    "cp311_failure": "System apex fused_layer_norm_cuda was ABI-incompatible with the overlaid torch 2.10.0 wheel.",
+    "interpretation": "The failed duplicate cp311 arms are replaced by the two prior exact cp311 controls listed above."
+  },
+  "sources": {
+    "cp310_arms": "/models_rw/SkillSearch-data-synthesis/experiments/legacy_python_abi_probe_20260809_v1/arms/cp310_r*/runtime_probe.json",
+    "cp311_replicas": "/models_rw/SkillSearch-data-synthesis/experiments/legacy_torch_runtime_matrix_20260807_v2/arms/torch210-tf53-r*/runtime_probe.json",
+    "cp311_contract": "/models_rw/SkillSearch-data-synthesis/experiments/legacy_blas_control_probe_20260809_v2/arms/default_bf16/runtime_probe.json"
+  }
+}

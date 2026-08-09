@@ -14,6 +14,8 @@ bash "${ALIAS_HELPER}" --with-dataset-rw || exit 1
 
 rm -rf /usr/local/lib/python3.11/site-packages/torch*
 rm -rf /usr/local/lib/python3.11/site-packages/nvidia*
+# Prevent Transformers from selecting image-local CUDA extensions built against another torch ABI.
+rm -rf /usr/local/lib/python3.11/site-packages/apex*
 python3 -m pip install "${TORCH_BOOTSTRAP_WHEEL}" --no-deps -q
 
 git config --global --add safe.directory "${PHYSICAL_REPO}"
