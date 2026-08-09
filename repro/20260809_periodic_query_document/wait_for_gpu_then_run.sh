@@ -34,7 +34,8 @@ while true; do
 
   if (( free_checks >= required_free_checks )); then
     echo "$timestamp gpu_confirmed_free launching_training output_dir=$output_dir"
-    exec bash "$launch_script" "$repo_root" "$output_dir"
+    mkdir -p "$output_dir"
+    exec bash "$launch_script" "$repo_root" "$output_dir" >"$output_dir/train.log" 2>&1
   fi
   sleep "$poll_seconds"
 done
