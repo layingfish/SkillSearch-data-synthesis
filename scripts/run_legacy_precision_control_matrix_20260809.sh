@@ -12,7 +12,7 @@ COMPAT_ARCHIVE_SHA256=a6b2f56bb9b4496caa4be225b1c2630270cef1b9a23f82013eea72632b
 BASE_MODEL=/models_rw/SkillSearch-data-synthesis/base_models/t5-base-a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1
 LEGACY_COMMIT=15f6c51131f3b6f3e8580aa4564b17cbe13a9790
 LEGACY_PIPELINE_SHA256=5d60624b704e3563f1893b021e15c2c6da3cdb28a18a1ac3018ca3884de04f67
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/legacy_precision_control_probe_20260809_v1"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/legacy_blas_control_probe_20260809_v2"
 
 if [[ -e "${OUTPUT_ROOT}" ]]; then
   echo "refusing to overwrite precision-control output: ${OUTPUT_ROOT}" >&2
@@ -136,6 +136,8 @@ trap 'terminate_children; cleanup; exit 130' INT TERM
 launch_arm() {
   local gpu="$1" label="$2" precision="$3" bf16_reduction="$4"
   local tf32_matmul="$5" tf32_cudnn="$6" fp32_matmul_precision="$7" foreach="$8"
+  local preferred_blas="${9}" deterministic_algorithms="${10}"
+  local cublas_workspace_config="${11}" cuda_module_loading="${12}"
   local output="${OUTPUT_ROOT}/arms/${label}"
   (
     exec > >(tee "${OUTPUT_ROOT}/logs/${label}.log") 2>&1
@@ -147,7 +149,10 @@ launch_arm() {
         --model "${MODEL_SAFE}" --output-dir "${output}" --steps 50 --seed 20260626 \
         --precision "${precision}" --bf16-reduction "${bf16_reduction}" \
         --tf32-matmul "${tf32_matmul}" --tf32-cudnn "${tf32_cudnn}" \
-        --float32-matmul-precision "${fp32_matmul_precision}" --foreach "${foreach}"
+        --float32-matmul-precision "${fp32_matmul_precision}" --foreach "${foreach}" \
+        --preferred-blas "${preferred_blas}" --deterministic-algorithms "${deterministic_algorithms}" \
+        --cublas-workspace-config "${cublas_workspace_config}" \
+        --cuda-module-loading "${cuda_module_loading}"
   ) &
   local pid=$!
   PIDS+=("${pid}")
@@ -155,14 +160,14 @@ launch_arm() {
   echo "launched ${label} on CUDA_VISIBLE_DEVICES=${gpu}, pid=${pid}"
 }
 
-launch_arm 0 default_bf16 bf16 auto auto auto auto auto
-launch_arm 1 bf16_reduction_off bf16 false auto auto auto auto
-launch_arm 2 tf32_matmul_on bf16 auto true auto auto auto
-launch_arm 3 tf32_cudnn_off bf16 auto auto false auto auto
-launch_arm 4 matmul_precision_highest bf16 auto auto auto highest auto
-launch_arm 5 bf16_reduction_off_tf32_on bf16 false true auto auto auto
-launch_arm 6 fp32_no_autocast fp32 auto auto auto auto auto
-launch_arm 7 foreach_off bf16 auto auto auto auto false
+launch_arm 0 default_bf16 bf16 auto auto auto auto auto auto auto auto auto
+launch_arm 1 blas_cublas bf16 auto auto auto auto auto cublas auto auto auto
+launch_arm 2 blas_cublaslt bf16 auto auto auto auto auto cublaslt auto auto auto
+launch_arm 3 workspace_4096 bf16 auto auto auto auto auto auto auto :4096:8 auto
+launch_arm 4 workspace_16 bf16 auto auto auto auto auto auto auto :16:8 auto
+launch_arm 5 deterministic_4096 bf16 auto auto auto auto auto auto true :4096:8 auto
+launch_arm 6 cublaslt_bf16_reduction_off bf16 false auto auto auto auto cublaslt auto auto auto
+launch_arm 7 cuda_module_eager bf16 auto auto auto auto auto auto auto auto EAGER
 
 remaining=${#PIDS[@]}
 failures=0
@@ -205,7 +210,7 @@ bad_batch = [a["arm"] for a in arms if a["first_catalog_batch"]["row_ids_sha256"
 if bad_batch:
     raise SystemExit(f"catalog batch-order mismatch in arms: {bad_batch}")
 summary = {
-    "artifact_format": "legacy_precision_control_matrix_v1",
+    "artifact_format": "legacy_blas_control_matrix_v2",
     "archived_rtx_reference": {
         "step_1": 4.528710842132568,
         "step_50": 4.203788757324219,

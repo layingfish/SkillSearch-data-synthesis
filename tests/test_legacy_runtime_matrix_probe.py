@@ -27,6 +27,8 @@ class LegacyRuntimeMatrixProbeTest(unittest.TestCase):
                 tf32_cudnn="false",
                 float32_matmul_precision="highest",
                 foreach="false",
+                preferred_blas="cublas",
+                deterministic_algorithms="true",
             )
         )
         compile(source, "<training-wrapper>", "exec")

@@ -64,11 +64,17 @@ def apply_precision_controls(torch, args: argparse.Namespace) -> dict[str, Any]:
         torch.backends.cudnn.allow_tf32 = tf32_cudnn
     if args.float32_matmul_precision != "auto":
         torch.set_float32_matmul_precision(args.float32_matmul_precision)
+    if args.preferred_blas != "auto":
+        torch.backends.cuda.preferred_blas_library(args.preferred_blas)
+    deterministic_algorithms = optional_bool(args.deterministic_algorithms)
+    if deterministic_algorithms is not None:
+        torch.use_deterministic_algorithms(deterministic_algorithms)
     return precision_snapshot(torch)
 
 
 def precision_snapshot(torch) -> dict[str, Any]:
     matmul = torch.backends.cuda.matmul
+    preferred_blas = getattr(torch.backends.cuda, "preferred_blas_library", None)
     return {
         "allow_bf16_reduced_precision_reduction": getattr(
             matmul, "allow_bf16_reduced_precision_reduction", None
@@ -83,6 +89,7 @@ def precision_snapshot(torch) -> dict[str, Any]:
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "preferred_blas_library": str(preferred_blas()) if preferred_blas else None,
     }
 
 
@@ -93,6 +100,8 @@ def training_wrapper_source(args: argparse.Namespace) -> str:
         "tf32_cudnn": optional_bool(args.tf32_cudnn),
         "float32_matmul_precision": args.float32_matmul_precision,
         "foreach": optional_bool(args.foreach),
+        "preferred_blas": args.preferred_blas,
+        "deterministic_algorithms": optional_bool(args.deterministic_algorithms),
     }
     return """
 import runpy
@@ -110,6 +119,10 @@ if controls["tf32_cudnn"] is not None:
     torch.backends.cudnn.allow_tf32 = controls["tf32_cudnn"]
 if controls["float32_matmul_precision"] != "auto":
     torch.set_float32_matmul_precision(controls["float32_matmul_precision"])
+if controls["preferred_blas"] != "auto":
+    torch.backends.cuda.preferred_blas_library(controls["preferred_blas"])
+if controls["deterministic_algorithms"] is not None:
+    torch.use_deterministic_algorithms(controls["deterministic_algorithms"])
 if controls["foreach"] is not None:
     original_adamw = torch.optim.AdamW
     def controlled_adamw(*optimizer_args, **optimizer_kwargs):
@@ -135,8 +148,13 @@ audit_payload = {
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "preferred_blas_library": str(torch.backends.cuda.preferred_blas_library()),
     },
     "foreach_override": controls["foreach"],
+    "environment": {
+        "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "CUDA_MODULE_LOADING": os.environ.get("CUDA_MODULE_LOADING"),
+    },
 }
 with open(audit_path, "w", encoding="utf-8") as handle:
     json.dump(audit_payload, handle, indent=2, sort_keys=True)
@@ -195,6 +213,17 @@ def runtime_snapshot(torch) -> dict[str, Any]:
             )
         },
     }
+
+
+def legacy_model_state_fingerprint(model) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        value = tensor.detach().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("utf-8"))
+        digest.update(str(tuple(value.shape)).encode("utf-8"))
+        digest.update(value.view(-1).cpu().numpy().tobytes())
+    return digest.hexdigest()
 
 
 def load_historical_pipeline(source_root: Path):
@@ -279,8 +308,9 @@ def command_run(args: argparse.Namespace) -> None:
         int(sid_config["depth"]),
         int(sid_config["dedup_size"]),
         semantic_id_mode,
-    )
+    ).to(torch.device("cuda"))
     state_hashes = _hash_tensor_state(model.state_dict())
+    legacy_state_fingerprint = legacy_model_state_fingerprint(model)
     torch_rng_after = _torch_rng_sha256(torch.get_rng_state())
     cuda_rng_after = _torch_rng_sha256(torch.cuda.get_rng_state())
     try:
@@ -293,6 +323,7 @@ def command_run(args: argparse.Namespace) -> None:
         inferred_fused, inferred_foreach = None, None
     del tokenizer, model
     gc.collect()
+    torch.cuda.empty_cache()
 
     with tempfile.TemporaryDirectory(prefix=f"skillgr-runtime-{args.arm}.", dir="/tmp") as directory:
         train_output = Path(directory) / "train"
@@ -341,6 +372,10 @@ def command_run(args: argparse.Namespace) -> None:
         child_audit_path = Path(directory) / "child_precision.json"
         child_environment = os.environ.copy()
         child_environment["SKILLGR_PRECISION_CONTROL_AUDIT"] = str(child_audit_path)
+        if args.cublas_workspace_config != "auto":
+            child_environment["CUBLAS_WORKSPACE_CONFIG"] = args.cublas_workspace_config
+        if args.cuda_module_loading != "auto":
+            child_environment["CUDA_MODULE_LOADING"] = args.cuda_module_loading
         subprocess.run(command, check=True, env=child_environment)
         child_precision = json.loads(child_audit_path.read_text(encoding="utf-8"))
         if child_precision["precision"] != configured_precision:
@@ -391,6 +426,10 @@ def command_run(args: argparse.Namespace) -> None:
                 "tf32_cudnn": args.tf32_cudnn,
                 "float32_matmul_precision": args.float32_matmul_precision,
                 "foreach": args.foreach,
+                "preferred_blas": args.preferred_blas,
+                "deterministic_algorithms": args.deterministic_algorithms,
+                "cublas_workspace_config": args.cublas_workspace_config,
+                "cuda_module_loading": args.cuda_module_loading,
             },
             "effective_precision": configured_precision,
             "child_effective_precision": child_precision,
@@ -408,6 +447,7 @@ def command_run(args: argparse.Namespace) -> None:
             "cuda_rng_before_model_sha256": cuda_rng_before,
             "cuda_rng_after_model_sha256": cuda_rng_after,
             "state_sha256": state_hashes,
+            "legacy_state_fingerprint": legacy_state_fingerprint,
         },
         "first_catalog_batch": {
             "row_ids": first_batch_ids,
@@ -449,6 +489,26 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--foreach", choices=OPTIONAL_BOOL_CHOICES, default="auto")
+    parser.add_argument(
+        "--preferred-blas",
+        choices=("auto", "default", "cublas", "cublaslt"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--deterministic-algorithms",
+        choices=OPTIONAL_BOOL_CHOICES,
+        default="auto",
+    )
+    parser.add_argument(
+        "--cublas-workspace-config",
+        choices=("auto", ":4096:8", ":16:8"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--cuda-module-loading",
+        choices=("auto", "LAZY", "EAGER"),
+        default="auto",
+    )
     parser.set_defaults(func=command_run)
     return parser
 

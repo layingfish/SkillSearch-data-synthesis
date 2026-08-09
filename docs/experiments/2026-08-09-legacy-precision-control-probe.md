@@ -1,5 +1,5 @@
 # Experiment: Legacy precision-control probe
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -36,18 +36,34 @@ Checkpoint: none; each arm uses an ephemeral catalog-only checkpoint and removes
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_precision_control_probe_20260809_v1/logs/`
 
-Metrics: one `runtime_probe.json` per arm and `matrix_summary.json` under the same root.
+Metrics phase 1: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_precision_control_probe_20260809_v1/matrix_summary.json`.
 
-Job: pending submission to `rudder-exper`, one node, eight single-GPU arms.
+Metrics phase 2: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_blas_control_probe_20260809_v2/matrix_summary.json`.
+
+Phase-1 job: `tide-chenyufei03-10562-ptvcn` (`rudder-exper`, one 8xA800 node,
+eight single-GPU arms, launch commit `1b24d27fd9f97e615a600f70b1d2f2f1e8a392b1`).
+
+Phase-2 job: pending; one `rudder-exper` 8xA800 node, eight single-GPU BLAS/kernel arms.
 
 ## Verification
 
 - [x] Shell syntax, Python compile, and focused unit tests (3 tests passed)
-- [ ] Eight unique GPU assignments
-- [ ] Input/order/model/RNG hashes match the archived contract
-- [ ] Precision controls are recorded before the first forward
+- [x] Eight unique GPU assignments in phase 1
+- [x] Input/order and RNG hashes match the archived contract in phase 1
+- [x] Precision controls are recorded by the training child before the first forward
 - [ ] Reviewer required? no; diagnostic probe only
 
 ## Result / Notes
 
-Pending.
+Phase 1 completed in 4 minutes 48 seconds with no pod restart. Under the fixed 50-step catalog
+protocol above, the A800 default BF16 arm reproduced step 1/50 losses
+`4.546923637/4.184666634`; the archived RTX reference is `4.528710842/4.203788757`.
+
+Closing BF16 reduced-precision reduction changed A800 step 1/50 to
+`4.546850681/4.178029537`. TF32 matmul, cuDNN TF32, and explicit highest FP32 matmul precision
+were bitwise identical to the default BF16 arm. Full FP32 without autocast produced
+`4.536283493/4.166709423`; explicit `foreach=False` produced
+`4.546923637/4.164748192`. None approached the archived RTX trajectory.
+
+Phase 2 tests cuBLAS/cuBLASLt preference, deterministic algorithms, and
+`CUBLAS_WORKSPACE_CONFIG={:4096:8,:16:8}` under the same fixed 50-step protocol.
