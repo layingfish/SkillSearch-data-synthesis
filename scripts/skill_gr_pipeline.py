@@ -15,6 +15,7 @@ import json
 import math
 import random
 import re
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,10 @@ def init_wandb_run(args: argparse.Namespace, config: dict[str, Any]):
     run.define_metric("query/*", step_metric="query/step")
     run.define_metric("catalog/step")
     run.define_metric("catalog/*", step_metric="catalog/step")
+    run.define_metric("document/step")
+    run.define_metric("document/*", step_metric="document/step")
+    run.define_metric("official/query_epoch")
+    run.define_metric("official/*", step_metric="official/query_epoch")
     return run
 
 
@@ -106,6 +111,9 @@ def log_training_event(wandb_run, row: dict[str, Any]) -> None:
         payload[f"{stage}/dev_loss"] = row["dev_loss"]
     if "lr" in row:
         payload["lr"] = row["lr"]
+    for key in ("epoch_train_loss", "elapsed_seconds", "steps_per_second", "peak_memory_gib"):
+        if key in row:
+            payload[f"{stage}/{key}"] = row[key]
     wandb_run.log(payload)
 
 
@@ -2408,7 +2416,451 @@ def structured_sid_batch(
     }
 
 
+def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
+    """Alternate full query epochs with document-indexing epochs and select on retrieval."""
+
+    import torch
+    from transformers import AutoTokenizer
+
+    if args.max_steps > 0 or args.catalog_max_steps > 0:
+        raise ValueError("periodic epoch training does not support max-step overrides")
+    if args.catalog_epochs != 0:
+        raise ValueError("set --catalog-epochs 0 when --periodic-document-epochs is enabled")
+    if not args.official_eval_rows:
+        raise ValueError("--official-eval-rows is required for periodic epoch training")
+    if args.official_eval_every_epochs < 1:
+        raise ValueError("--official-eval-every-epochs must be positive")
+    if args.epochs < 1 or args.periodic_document_epochs < 1:
+        raise ValueError("query and periodic document epochs must be positive")
+
+    query_batch_size = args.query_batch_size or args.batch_size
+    document_batch_size = args.document_batch_size or args.batch_size
+    if query_batch_size < 1 or document_batch_size < 1:
+        raise ValueError("query and document batch sizes must be positive")
+
+    semantic_ids, semantic_id_mode = load_semantic_ids_with_mode(args.semantic_ids)
+    sid_config = infer_structured_sid_config(
+        semantic_ids,
+        codebook_size=args.codebook_size,
+        dedup_size=args.dedup_size,
+        semantic_id_mode=semantic_id_mode,
+    )
+    codebook_size = sid_config["codebook_size"]
+    depth = sid_config["depth"]
+    dedup_size = sid_config["dedup_size"]
+    source_rows = load_jsonl(args.rows)
+    if args.disable_dev_eval:
+        if args.dev_rows:
+            raise ValueError("--dev-rows cannot be combined with --disable-dev-eval")
+        query_train_rows = expand_single_sid_query_rows(source_rows, semantic_ids)
+        query_dev_rows: list[dict[str, Any]] = []
+    elif args.dev_rows:
+        query_train_rows = expand_single_sid_query_rows(source_rows, semantic_ids)
+        query_dev_rows = expand_single_sid_query_rows(load_jsonl(args.dev_rows), semantic_ids)
+    else:
+        query_train_rows, query_dev_rows = split_and_expand_single_sid_query_rows(
+            source_rows,
+            semantic_ids,
+            args.dev_ratio,
+            args.seed,
+        )
+    document_rows = build_single_sid_catalog_rows(
+        load_jsonl(args.skills_jsonl),
+        semantic_ids,
+        args.catalog_input_prefix,
+    )
+    official_rows = load_jsonl(args.official_eval_rows)
+    k_values = parse_k_values(args.official_eval_k_values)
+    if args.official_selection_k not in k_values:
+        raise ValueError(
+            f"official selection K={args.official_selection_k} is absent from {k_values}"
+        )
+    validate_rank_capacity(args.official_eval_num_beams, 1, max(k_values))
+
+    rng = random.Random(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    query_train_length_audit = audit_source_token_lengths(
+        "query_train",
+        query_train_rows,
+        tokenizer,
+        args.max_source_length,
+        args.allow_source_truncation,
+    )
+    query_dev_length_audit = audit_source_token_lengths(
+        "query_dev",
+        query_dev_rows,
+        tokenizer,
+        args.max_source_length,
+        args.allow_source_truncation,
+    )
+    document_length_audit = audit_source_token_lengths(
+        "document",
+        document_rows,
+        tokenizer,
+        args.max_source_length,
+        args.allow_source_truncation,
+    )
+    official_length_audit = audit_source_token_lengths(
+        "official",
+        official_rows,
+        tokenizer,
+        args.max_source_length,
+        args.allow_source_truncation,
+    )
+    model = make_structured_t5_sid_model(
+        args.model,
+        codebook_size,
+        depth,
+        dedup_size,
+        semantic_id_mode,
+    ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loaded_optimizer_state = False
+    if args.init_model_dir:
+        init_checkpoint = load_structured_decoder_checkpoint(
+            model,
+            args.init_model_dir,
+            device,
+            optimizer=opt,
+            lr=args.lr,
+            semantic_id_mode=semantic_id_mode,
+        )
+        loaded_optimizer_state = "optimizer_state_dict" in init_checkpoint
+        validate_checkpoint_semantic_ids(init_checkpoint, semantic_ids, semantic_id_mode)
+        validate_checkpoint_source_length(
+            init_checkpoint,
+            args.max_source_length,
+            args.allow_checkpoint_config_mismatch,
+        )
+        validate_checkpoint_source_text_policy(
+            init_checkpoint,
+            args.allow_checkpoint_config_mismatch,
+        )
+
+    checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    loss_history_path = args.output_dir / "loss_history.jsonl"
+    if loss_history_path.exists():
+        loss_history_path.unlink()
+    training_config = {
+        "command": "train-single-sid-decoder",
+        "schedule": "query epoch followed by document epoch",
+        "model": args.model,
+        "source_train_rows": len(source_rows),
+        "query_train_rows": len(query_train_rows),
+        "query_dev_rows": len(query_dev_rows),
+        "document_rows": len(document_rows),
+        "query_epochs": args.epochs,
+        "document_epochs_after_each_query_epoch": args.periodic_document_epochs,
+        "query_batch_size": query_batch_size,
+        "document_batch_size": document_batch_size,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
+        "bf16": args.bf16,
+        "max_source_length": args.max_source_length,
+        "semantic_id_mode": semantic_id_mode,
+        "semantic_ids_sha256": checkpoint_metadata["semantic_ids_sha256"],
+        "official_eval_rows": str(args.official_eval_rows),
+        "official_eval_every_query_epochs": args.official_eval_every_epochs,
+        "official_eval_num_beams": args.official_eval_num_beams,
+        "official_eval_k_values": k_values,
+        "official_selection_subset": args.official_selection_subset,
+        "official_selection_k": args.official_selection_k,
+        "official_selection_metric": "macro_recall",
+        "checkpoint_selection_uses_test_set": True,
+        "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
+        "loaded_optimizer_state": loaded_optimizer_state,
+    }
+    wandb_run = init_wandb_run(args, training_config)
+    query_step = 0
+    document_step = 0
+    document_epoch = 0
+    last_query_loss = None
+    last_document_loss = None
+    best_official_score: float | None = None
+    best_query_epoch: int | None = None
+    best_checkpoint = args.output_dir / "best"
+    official_history: list[dict[str, Any]] = []
+
+    def train_one_epoch(
+        stage_name: str,
+        rows: list[dict[str, Any]],
+        batch_size: int,
+        epoch_number: int,
+        step_start: int,
+    ) -> tuple[int, float]:
+        model.train()
+        rng.shuffle(rows)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        loss_sum = 0.0
+        row_count = 0
+        step = step_start
+        steps_per_epoch = math.ceil(len(rows) / batch_size)
+        for start in range(0, len(rows), batch_size):
+            batch_rows = rows[start : start + batch_size]
+            batch = structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                semantic_id_mode,
+            )
+            opt.zero_grad()
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=bool(args.bf16 and device.type == "cuda"),
+            ):
+                loss = model(**batch)
+            loss.backward()
+            opt.step()
+            step += 1
+            last_loss = float(loss.detach().cpu())
+            loss_sum += last_loss * len(batch_rows)
+            row_count += len(batch_rows)
+            if (step - step_start) % args.logging_steps == 0 or start + batch_size >= len(rows):
+                event = {
+                    "stage": stage_name,
+                    "event": "train",
+                    "step": step,
+                    "epoch": epoch_number - 1 + (step - step_start) / steps_per_epoch,
+                    "train_loss": last_loss,
+                    "lr": opt.param_groups[0]["lr"],
+                }
+                print(
+                    f"{stage_name}_step={step} epoch={event['epoch']:.4f} train_loss={last_loss:.6f}",
+                    flush=True,
+                )
+                append_loss_history(loss_history_path, event)
+                log_training_event(wandb_run, event)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        mean_loss = loss_sum / max(1, row_count)
+        peak_memory_gib = (
+            float(torch.cuda.max_memory_reserved(device) / (1024**3)) if device.type == "cuda" else 0.0
+        )
+        epoch_event = {
+            "stage": stage_name,
+            "event": "epoch_end",
+            "step": step,
+            "epoch": epoch_number,
+            "epoch_train_loss": mean_loss,
+            "elapsed_seconds": elapsed,
+            "steps_per_second": steps_per_epoch / max(elapsed, 1e-9),
+            "peak_memory_gib": peak_memory_gib,
+            "lr": opt.param_groups[0]["lr"],
+        }
+        print(json.dumps(epoch_event, sort_keys=True), flush=True)
+        append_loss_history(loss_history_path, epoch_event)
+        log_training_event(wandb_run, epoch_event)
+        return step, mean_loss
+
+    def evaluate_official(query_epoch: int) -> None:
+        nonlocal best_official_score, best_query_epoch
+
+        eval_dir = args.output_dir / "official_eval" / f"query_epoch_{query_epoch:03d}"
+        decoded = decode_structured_rows(
+            model,
+            tokenizer,
+            official_rows,
+            semantic_ids,
+            semantic_id_mode,
+            codebook_size,
+            depth,
+            dedup_size,
+            args.max_source_length,
+            device,
+            args.official_eval_num_beams,
+            1,
+            "beam_order",
+            k_values,
+            args.official_eval_log_every,
+        )
+        subset_metrics = decoded["ranked_subset_metrics"]
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        write_jsonl(eval_dir / "predictions.jsonl", decoded["predictions"])
+        write_json(eval_dir / "eval_metrics.json", decoded["metrics"])
+        write_json(eval_dir / "ranked_metrics.json", subset_metrics["overall"])
+        write_json(eval_dir / "ranked_metrics.single.json", subset_metrics["single"])
+        write_json(eval_dir / "ranked_metrics.multi.json", subset_metrics["multi"])
+        score = float(
+            subset_metrics[args.official_selection_subset]["overall"][
+                f"@{args.official_selection_k}"
+            ]["macro_recall"]
+        )
+        record = {
+            "query_epoch": query_epoch,
+            "selection_score": score,
+            "selection_subset": args.official_selection_subset,
+            "selection_k": args.official_selection_k,
+            "metrics": {
+                subset: {
+                    f"R@{k}": metrics["overall"][f"@{k}"]["macro_recall"]
+                    for k in k_values
+                }
+                for subset, metrics in subset_metrics.items()
+            },
+            "output_dir": str(eval_dir),
+        }
+        official_history.append(record)
+        write_json(eval_dir / "summary.json", record)
+        print(json.dumps({"official_eval": record}, sort_keys=True), flush=True)
+        if wandb_run is not None:
+            payload: dict[str, Any] = {"official/query_epoch": query_epoch}
+            for subset, metrics in record["metrics"].items():
+                for metric_name, value in metrics.items():
+                    payload[f"official/{subset}_{metric_name.lower()}"] = value
+            payload["official/selection_score"] = score
+            wandb_run.log(payload)
+        if best_official_score is None or score > best_official_score:
+            best_official_score = score
+            best_query_epoch = query_epoch
+            save_structured_decoder_checkpoint(
+                best_checkpoint,
+                model,
+                tokenizer,
+                args.model,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.seed,
+                "periodic_query_then_document_single_sid",
+                {
+                    **checkpoint_metadata,
+                    "best_official_score": score,
+                    "best_query_epoch": query_epoch,
+                    "official_selection_subset": args.official_selection_subset,
+                    "official_selection_k": args.official_selection_k,
+                    "checkpoint_selection_uses_test_set": True,
+                },
+                optimizer=opt,
+                semantic_id_mode=semantic_id_mode,
+            )
+            if wandb_run is not None:
+                wandb_run.summary["best_official_score"] = score
+                wandb_run.summary["best_query_epoch"] = query_epoch
+
+    for query_epoch in range(1, args.epochs + 1):
+        query_step, last_query_loss = train_one_epoch(
+            "query",
+            query_train_rows,
+            query_batch_size,
+            query_epoch,
+            query_step,
+        )
+        for _ in range(args.periodic_document_epochs):
+            document_epoch += 1
+            document_step, last_document_loss = train_one_epoch(
+                "document",
+                document_rows,
+                document_batch_size,
+                document_epoch,
+                document_step,
+            )
+        if query_epoch % args.official_eval_every_epochs == 0 or query_epoch == args.epochs:
+            evaluate_official(query_epoch)
+
+    last_dir = args.output_dir / "last"
+    save_structured_decoder_checkpoint(
+        last_dir,
+        model,
+        tokenizer,
+        args.model,
+        codebook_size,
+        depth,
+        dedup_size,
+        args.seed,
+        "periodic_query_then_document_single_sid",
+        {
+            **checkpoint_metadata,
+            "last_query_epoch": args.epochs,
+            "last_query_step": query_step,
+            "last_document_epoch": document_epoch,
+            "last_document_step": document_step,
+            "last_query_loss": last_query_loss,
+            "last_document_loss": last_document_loss,
+        },
+        optimizer=opt,
+        semantic_id_mode=semantic_id_mode,
+    )
+    selected_checkpoint = "last"
+    if best_official_score is not None and args.load_best_model_at_end:
+        load_structured_decoder_checkpoint(
+            model,
+            best_checkpoint,
+            device,
+            optimizer=opt,
+            lr=args.lr,
+            semantic_id_mode=semantic_id_mode,
+        )
+        selected_checkpoint = "best_official"
+    final_dir = args.output_dir / "final"
+    save_structured_decoder_checkpoint(
+        final_dir,
+        model,
+        tokenizer,
+        args.model,
+        codebook_size,
+        depth,
+        dedup_size,
+        args.seed,
+        "periodic_query_then_document_single_sid",
+        {
+            **checkpoint_metadata,
+            "selected_checkpoint": selected_checkpoint,
+            "best_official_score": best_official_score,
+            "best_query_epoch": best_query_epoch,
+            "checkpoint_selection_uses_test_set": True,
+        },
+        optimizer=opt,
+        semantic_id_mode=semantic_id_mode,
+    )
+    manifest = {
+        **training_config,
+        "rows": str(args.rows),
+        "semantic_ids": str(args.semantic_ids),
+        "skills_jsonl": str(args.skills_jsonl),
+        "query_steps": query_step,
+        "document_steps": document_step,
+        "last_query_loss": last_query_loss,
+        "last_document_loss": last_document_loss,
+        "best_official_score": best_official_score,
+        "best_query_epoch": best_query_epoch,
+        "best_checkpoint": str(best_checkpoint),
+        "last_checkpoint": str(last_dir),
+        "final_checkpoint": str(final_dir),
+        "selected_checkpoint": selected_checkpoint,
+        "loss_history": str(loss_history_path),
+        "official_history": official_history,
+        "query_train_length_audit": query_train_length_audit,
+        "query_dev_length_audit": query_dev_length_audit,
+        "document_length_audit": document_length_audit,
+        "official_length_audit": official_length_audit,
+    }
+    write_json(args.output_dir / "single_sid_decoder_train_manifest.json", manifest)
+    if wandb_run is not None:
+        wandb_run.finish()
+    print(f"saved periodic single-SID decoder to {final_dir}")
+
+
 def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
+    if args.periodic_document_epochs > 0:
+        command_train_periodic_single_sid_decoder(args)
+        return
+
     import torch
     from transformers import AutoTokenizer
 
@@ -3322,6 +3774,223 @@ def validate_rank_capacity(num_beams: int, max_skills: int, max_rank: int) -> No
         )
 
 
+def compute_ranked_subset_metrics(
+    rows: list[dict[str, Any]],
+    predictions: list[dict[str, Any]],
+    k_values: list[int],
+) -> dict[str, dict[str, Any]]:
+    """Compute the same macro Recall metrics for all, single-, and multi-skill rows."""
+
+    subsets = {
+        "overall": lambda row: True,
+        "single": lambda row: len(row.get("selected_skill_ids", [])) == 1,
+        "multi": lambda row: len(row.get("selected_skill_ids", [])) > 1,
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for name, keep in subsets.items():
+        indices = [index for index, row in enumerate(rows) if keep(row)]
+        subset_rows = [rows[index] for index in indices]
+        subset_predictions = [predictions[index] for index in indices]
+        result[name] = compute_at_k_metrics(subset_rows, subset_predictions, k_values)
+    return result
+
+
+def decode_structured_rows(
+    model,
+    tokenizer,
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    semantic_id_mode: str,
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    max_source_length: int,
+    device,
+    num_beams: int,
+    max_skills: int,
+    rank_aggregation: str,
+    k_values: list[int],
+    log_every: int = 10,
+) -> dict[str, Any]:
+    """Decode rows with an already-loaded model so training can evaluate in-place."""
+
+    import torch
+    import torch.nn.functional as F
+
+    max_rank = max(k_values)
+    validate_rank_capacity(num_beams, max_skills, max_rank)
+    trie, sequence_to_skill_id = _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)
+    was_training = model.training
+    model.eval()
+    predictions: list[dict[str, Any]] = []
+    bos_id = structured_sid_bos_id(codebook_size, depth, dedup_size, semantic_id_mode)
+    semantic_length = structured_sid_length(depth, semantic_id_mode)
+    steps_per_skill = semantic_length + 1
+    max_steps = max_skills * steps_per_skill
+    for row_index, row in enumerate(rows):
+        encoded = tokenizer(
+            [decoder_source_text(row)],
+            padding=True,
+            truncation=True,
+            max_length=max_source_length,
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        with torch.no_grad():
+            encoder_hidden_states = model.encode_source(input_ids, attention_mask)
+        beams = [
+            {
+                "decoder_input_ids": [bos_id],
+                "current_prefix": [],
+                "completed": [],
+                "score": 0.0,
+                "stopped": False,
+            }
+        ]
+        for step in range(max_steps):
+            candidates = []
+            target_type = step % steps_per_skill
+            active_items = []
+            for beam in beams:
+                if beam["stopped"]:
+                    candidates.append(beam)
+                    continue
+                allowed = structured_allowed_values(
+                    beam["current_prefix"],
+                    beam["completed"],
+                    target_type,
+                    trie,
+                    depth,
+                    max_skills,
+                    semantic_id_mode,
+                )
+                if not allowed:
+                    candidates.append({**beam, "stopped": True})
+                    continue
+                active_items.append((beam, allowed))
+            if active_items:
+                max_decoder_length = max(len(beam["decoder_input_ids"]) for beam, _ in active_items)
+                decoder_input_rows = []
+                decoder_mask_rows = []
+                for beam, _ in active_items:
+                    decoder_ids = list(beam["decoder_input_ids"])
+                    pad_length = max_decoder_length - len(decoder_ids)
+                    decoder_input_rows.append(decoder_ids + [bos_id] * pad_length)
+                    decoder_mask_rows.append([1] * len(decoder_ids) + [0] * pad_length)
+                active_batch_size = len(active_items)
+                decoder_input_ids = torch.tensor(decoder_input_rows, dtype=torch.long, device=device)
+                decoder_attention_mask = torch.tensor(decoder_mask_rows, dtype=torch.long, device=device)
+                logits_batch = model.logits_for_next_type_from_encoder(
+                    encoder_hidden_states.repeat(active_batch_size, 1, 1),
+                    attention_mask.repeat(active_batch_size, 1),
+                    decoder_input_ids,
+                    decoder_attention_mask,
+                    target_type,
+                )
+                log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+                for (beam, allowed), log_probs in zip(active_items, log_probs_batch):
+                    allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
+                    allowed_scores = log_probs.index_select(0, allowed_tensor)
+                    ranked = sorted(
+                        (
+                            (float(score), int(value))
+                            for score, value in zip(allowed_scores.detach().cpu().tolist(), allowed)
+                        ),
+                        reverse=True,
+                    )[:num_beams]
+                    for log_prob, value in ranked:
+                        candidates.append(
+                            advance_structured_beam(
+                                beam,
+                                target_type,
+                                value,
+                                log_prob,
+                                codebook_size,
+                                depth,
+                                dedup_size,
+                                semantic_id_mode,
+                            )
+                        )
+            beams = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)[:num_beams]
+            if all(beam["stopped"] for beam in beams):
+                break
+        best = max(beams, key=lambda item: float(item["score"]))
+        ranked_skill_scores = None
+        if rank_aggregation == "beam_order":
+            ranked_skill_ids = ranked_skill_ids_from_structured_beams(beams, sequence_to_skill_id, max_rank)
+        elif rank_aggregation == "marginal":
+            ranked_skill_ids, ranked_skill_scores = ranked_skill_ids_from_marginal_structured_beams(
+                beams,
+                sequence_to_skill_id,
+                max_rank,
+                length_normalize=False,
+            )
+        elif rank_aggregation == "marginal_length_norm":
+            ranked_skill_ids, ranked_skill_scores = ranked_skill_ids_from_marginal_structured_beams(
+                beams,
+                sequence_to_skill_id,
+                max_rank,
+                length_normalize=True,
+            )
+        else:
+            raise ValueError(f"unknown rank aggregation: {rank_aggregation}")
+        predicted_ids = [
+            sequence_to_skill_id[tuple(values)]
+            for values in best["completed"]
+            if tuple(values) in sequence_to_skill_id
+        ]
+        unknown_sequences = [
+            list(values) for values in best["completed"] if tuple(values) not in sequence_to_skill_id
+        ]
+        gold_ids = [str(sid) for sid in row.get("selected_skill_ids", [])]
+        pred_set = set(predicted_ids)
+        gold_set = set(gold_ids)
+        hit_count = len(pred_set & gold_set)
+        predictions.append(
+            {
+                "index": row.get("index"),
+                "source_index": row.get("source_index"),
+                "target_skill_count": row.get("target_skill_count"),
+                "query": row.get("query"),
+                "gold_skill_ids": gold_ids,
+                "predicted_skill_ids": predicted_ids,
+                "ranked_skill_ids": ranked_skill_ids,
+                "ranked_skill_scores": ranked_skill_scores,
+                "predicted_semantic_ids": [list(values) for values in best["completed"]],
+                "decoder_input_sid_ids": best["decoder_input_ids"],
+                "score": best["score"],
+                "hit_count": hit_count,
+                "recall": float(hit_count / len(gold_set)) if gold_set else 0.0,
+                "hit_rate": 1.0 if hit_count > 0 else 0.0,
+                "exact_match": pred_set == gold_set,
+                "count_match": len(pred_set) == len(gold_set),
+                "invalid": bool(unknown_sequences),
+                "unknown_semantic_ids": unknown_sequences,
+            }
+        )
+        if (row_index + 1) % log_every == 0 or row_index + 1 == len(rows):
+            print(f"decoded {row_index + 1}/{len(rows)}", flush=True)
+    if was_training:
+        model.train()
+    metrics = compute_retrieval_metrics(
+        rows,
+        [{"predicted_skill_ids": pred["predicted_skill_ids"], "invalid": pred["invalid"]} for pred in predictions],
+    )
+    ranked_subset_metrics = compute_ranked_subset_metrics(rows, predictions, k_values)
+    ranked_lengths = [len(prediction["ranked_skill_ids"]) for prediction in predictions]
+    return {
+        "predictions": predictions,
+        "metrics": metrics,
+        "ranked_subset_metrics": ranked_subset_metrics,
+        "ranked_length_audit": {
+            "min_ranked_skills": min(ranked_lengths, default=0),
+            "max_ranked_skills": max(ranked_lengths, default=0),
+            "rows_below_max_rank": sum(length < max_rank for length in ranked_lengths),
+        },
+    }
+
+
 def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     import torch
     import torch.nn.functional as F
@@ -3737,10 +4406,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--catalog-input-prefix", default="skill document: ")
     p.add_argument("--catalog-epochs", type=int, default=3)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
+    p.add_argument("--periodic-document-epochs", type=int, default=0)
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
     p.add_argument("--allow-source-truncation", action="store_true")
     p.add_argument("--allow-checkpoint-config-mismatch", action="store_true")
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--query-batch-size", type=int)
+    p.add_argument("--document-batch-size", type=int)
     p.add_argument("--eval-batch-size", type=int)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=-1)
@@ -3754,6 +4426,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--step-offset", type=int, default=0)
     p.add_argument("--initial-best-dev-loss", type=float)
     p.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--disable-dev-eval", action="store_true")
+    p.add_argument("--official-eval-rows", type=Path)
+    p.add_argument("--official-eval-every-epochs", type=int, default=2)
+    p.add_argument("--official-eval-num-beams", type=int, default=DEFAULT_GR_NUM_BEAMS)
+    p.add_argument("--official-eval-k-values", default="1,10,50")
+    p.add_argument("--official-eval-log-every", type=int, default=10)
+    p.add_argument("--official-selection-subset", choices=["overall", "single", "multi"], default="overall")
+    p.add_argument("--official-selection-k", type=int, default=1)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--cpu", action="store_true")
     add_wandb_args(p)

@@ -35,6 +35,7 @@ from skill_gr_pipeline import (  # noqa: E402
     collect_query_skill_interactions,
     canonicalize_exact_skill_documents,
     compute_at_k_metrics,
+    compute_ranked_subset_metrics,
     compute_retrieval_metrics,
     command_rescore_ranked,
     deduplicate_code_tuples,
@@ -635,6 +636,24 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["by_target_skill_count"]["2"]["@3"]["fc"], 1.0)
         self.assertEqual(metrics["recall_aggregation"], "macro")
 
+    def test_compute_ranked_subset_metrics_reports_single_and_multi(self) -> None:
+        rows = [
+            {"selected_skill_ids": ["a"]},
+            {"selected_skill_ids": ["b", "c"]},
+        ]
+        predictions = [
+            {"ranked_skill_ids": ["a", "x"]},
+            {"ranked_skill_ids": ["b", "x"]},
+        ]
+
+        metrics = compute_ranked_subset_metrics(rows, predictions, [1, 2])
+
+        self.assertEqual(metrics["overall"]["overall"]["rows"], 2)
+        self.assertEqual(metrics["single"]["overall"]["rows"], 1)
+        self.assertEqual(metrics["multi"]["overall"]["rows"], 1)
+        self.assertAlmostEqual(metrics["single"]["overall"]["@1"]["macro_recall"], 1.0)
+        self.assertAlmostEqual(metrics["multi"]["overall"]["@1"]["macro_recall"], 0.5)
+
     def test_rescore_ranked_can_filter_multi_skill_predictions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -922,6 +941,15 @@ class SkillGRPipelineTest(unittest.TestCase):
                 "1.269171",
                 "--eval-batch-size",
                 "128",
+                "--periodic-document-epochs",
+                "1",
+                "--query-batch-size",
+                "32",
+                "--document-batch-size",
+                "16",
+                "--disable-dev-eval",
+                "--official-eval-rows",
+                "official.jsonl",
             ]
         )
         eval_args = parser.parse_args(
@@ -953,6 +981,14 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(train_args.step_offset, 10000)
         self.assertAlmostEqual(train_args.initial_best_dev_loss, 1.269171)
         self.assertEqual(train_args.eval_batch_size, 128)
+        self.assertEqual(train_args.periodic_document_epochs, 1)
+        self.assertEqual(train_args.query_batch_size, 32)
+        self.assertEqual(train_args.document_batch_size, 16)
+        self.assertTrue(train_args.disable_dev_eval)
+        self.assertEqual(train_args.official_eval_rows, Path("official.jsonl"))
+        self.assertEqual(train_args.official_eval_every_epochs, 2)
+        self.assertEqual(train_args.official_selection_subset, "overall")
+        self.assertEqual(train_args.official_selection_k, 1)
         self.assertEqual(eval_args.command, "eval-single-sid-decoder")
         self.assertEqual(eval_args.max_skills, 1)
         self.assertIsNone(eval_args.max_source_length)
