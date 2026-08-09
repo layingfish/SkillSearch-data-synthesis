@@ -1,5 +1,5 @@
 # Experiment: Legacy end-to-end numerical sensitivity
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -42,13 +42,13 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_e2e_numerical_sen
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_e2e_numerical_sensitivity_20260809_v1/matrix_summary.json`
 
-Job: pending (`rudder-r1`, one `8xA800` node)
+Job: `tide-chenyufei03-10576-epnfx` (`rudder-r1`, one `8xA800` node, launch commit `5989029`)
 
 ## Verification
 
 - [x] Shell syntax, Python compile, and control-wrapper unit test
 - [x] Archived checkpoint previously reproduced all `75/75` Official core75 Top-50 rankings under the fixed CUDA package runtime
-- [ ] Eight distinct arms bind to eight visible GPUs
+- [x] Eight distinct arms bind to GPUs `0-7`; all eight entered training
 - [ ] Training manifests match catalog `2,730` steps and query `38,805` steps
 - [ ] Every arm produces Overall, Single, and Multi Official core75 metrics
 - [ ] Reviewer required? no; focused local semantic review
@@ -56,3 +56,15 @@ Job: pending (`rudder-r1`, one `8xA800` node)
 ## Result / Notes
 
 Pending.
+
+The first submission, `tide-chenyufei03-10575-kpcpi`, failed in bootstrap
+before creating the output root because its command contained an invalid full
+commit hash. Tianzhi removed that pod. The corrected job uses commit
+`5989029c7a2bf37e0cc6e440d9865bab3abe449e`.
+
+The corrected job passed the Python `3.10.12`, torch `2.10.0+cu128`, CUDA
+`12.8`, cuDNN `9.10.2`, and eight-A800 preflight. All eight control audit files
+match their assigned GPU and requested backend settings. Their observed
+catalog step-50 losses reproduce the prior short-probe values exactly for the
+seven BF16 arms; the FP32 arm was still before its first 50-step log point at
+the time of this update.
