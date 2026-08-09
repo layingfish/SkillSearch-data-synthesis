@@ -68,3 +68,9 @@ match their assigned GPU and requested backend settings. Their observed
 catalog step-50 losses reproduce the prior short-probe values exactly for the
 seven BF16 arms; the FP32 arm was still before its first 50-step log point at
 the time of this update.
+
+The FP32 arm later failed with CUDA OOM at catalog step `650/2,730`. Under
+batch `16` on one 79.33-GiB A800, the process held 78.50 GiB and the next
+attention operation requested another 2.10 GiB with 838 MiB free. The seven
+BF16 arms continue under their registered settings. FP32 therefore has no
+comparable end-to-end retrieval result in this job.
