@@ -40,10 +40,25 @@ Metrics phase 1: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_preci
 
 Metrics phase 2: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_blas_control_probe_20260809_v2/matrix_summary.json`.
 
+Metrics phase 3: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_python_abi_probe_20260809_v1/matrix_summary.json`.
+
+Phase-3 cp310 runtime: `/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py310-v1/runtime.tar.zst`,
+`1,019,567,918` bytes, SHA-256
+`6102937effeaf983f44455c47adfce34ef2adc1afffcef6f5c6193288bb36b72`.
+
 Phase-1 job: `tide-chenyufei03-10562-ptvcn` (`rudder-exper`, one 8xA800 node,
 eight single-GPU arms, launch commit `1b24d27fd9f97e615a600f70b1d2f2f1e8a392b1`).
 
-Phase-2 job: pending; one `rudder-exper` 8xA800 node, eight single-GPU BLAS/kernel arms.
+Phase-2 job: `tide-chenyufei03-10564-ekstg` (`rudder-exper`, one 8xA800 node,
+eight single-GPU BLAS/kernel arms, launch commit `d7ae8686bc7a3ceff1c71b3f93528c0337698840`).
+
+Phase-3 job: pending; one `rudder-exper` 8xA800 node. Four arms use Python `3.10.12`
+with the official cp310 torch `2.10.0+cu128` wheel, and four controls use Python `3.11.11`
+with the existing cp311 wheel. Every arm uses default BF16 controls, seed `20260626`, batch
+`16`, lr `3e-4`, weight decay `0`, and exactly 50 catalog optimizer steps. The cp310 runtime
+uses NetworkX `3.4.2`, the latest release compatible with Python `3.10`; the cp311 control uses
+NetworkX `3.6.1`. CUDA package versions remain cuBLAS `12.8.4.1`, cuDNN `9.10.2.21`, and
+CUDA runtime `12.8.90` in both conditions.
 
 ## Verification
 
@@ -51,6 +66,10 @@ Phase-2 job: pending; one `rudder-exper` 8xA800 node, eight single-GPU BLAS/kern
 - [x] Eight unique GPU assignments in phase 1
 - [x] Input/order and RNG hashes match the archived contract in phase 1
 - [x] Precision controls are recorded by the training child before the first forward
+- [x] Phase-2 input/order and RNG hashes match the archived contract
+- [x] Phase-3 cp310 archive hash, relocation, ABI tags, and package metadata verified locally
+- [ ] Phase-3 cp310/cp311 imports and CUDA package versions pass GPU-node preflight
+- [ ] Four replicas agree within each Python ABI condition in phase 3
 - [ ] Reviewer required? no; diagnostic probe only
 
 ## Result / Notes
@@ -67,3 +86,16 @@ were bitwise identical to the default BF16 arm. Full FP32 without autocast produ
 
 Phase 2 tests cuBLAS/cuBLASLt preference, deterministic algorithms, and
 `CUBLAS_WORKSPACE_CONFIG={:4096:8,:16:8}` under the same fixed 50-step protocol.
+
+Phase 2 completed with no arm failure. Under the fixed 50-step catalog protocol above,
+default, explicit cuBLAS, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, deterministic algorithms plus
+`:4096:8`, and `CUDA_MODULE_LOADING=EAGER` all reproduced A800 step-1/50 losses
+`4.546923637/4.184666634` exactly. Explicit cuBLASLt produced
+`4.546899319/4.164062500`; cuBLASLt with BF16 reduction disabled produced
+`4.546899319/4.169090271`; and `CUBLAS_WORKSPACE_CONFIG=:16:8` produced
+`4.546948433/4.171227932`. None reproduced the archived RTX step-1/50 reference
+`4.528710842/4.203788757` under the same seed, batch, BF16, optimizer, and 50-step conditions.
+
+Phase 3 isolates the remaining Python ABI and torch-wheel variable before attributing the
+first-forward split to GPU architecture or driver behavior. The cp310 wheel SHA-256 is
+`36368507b56eaa51acbd3c96ac8893bb9a86991ffcd0699fea3a1a74a2b8bdcb`.
