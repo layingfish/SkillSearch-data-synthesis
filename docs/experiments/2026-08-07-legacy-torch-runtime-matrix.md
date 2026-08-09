@@ -89,3 +89,22 @@ Torch `2.10.0+cu128` moves both Transformers conditions farther from the archive
 `4.203789` than the prior torch `2.8.0+cu128` plus Transformers `4.57.6` reference. No new 950-step gate
 is warranted. That prior reference already failed the 950-step strict-parity probe. The historical RTX
 PRO 6000 Blackwell versus available A800 remains an unmatched hardware difference.
+
+## Cross-hardware interpretation (2026-08-09)
+
+The original-run evidence package adds a probe from the RTX PRO 6000 environment. Under the same
+50-step probe contract (original script SHA256 `7b883c...`, seed `20260626`, catalog batch `16`, BF16,
+lr `3e-4`, weight decay `0`, torch `2.10.0+cu128`, Transformers `5.3.0`), the RTX probe reports
+initial model fingerprint `c219d07a...`, CPU RNG-after-init `c7674001...`, CUDA RNG-before-forward
+`87e7d790...`, and catalog step-1/50 losses `4.528710842/4.203788757`.
+
+The A800 matrix with the same torch/Transformers condition reports the same CPU and CUDA RNG hashes,
+but step-1/50 losses `4.546923637/4.184666634`. The archived source/data/order and optimizer defaults
+are therefore accounted for; the first forward already follows a different GPU numerical path, and
+the difference is later amplified by the catalog-to-query optimization trajectory. The retrieval gap
+cannot be interpreted as a catalog-epoch effect until a same-hardware run or a controlled precision
+bridge is available.
+
+The original probe also confirms that the default AdamW setting is `foreach=None` (runtime inference:
+`foreach=true`). The explicit `foreach=False` control changes the RTX step-50 loss to `4.228314400`,
+so future probes must keep the default backend explicit in their manifest.

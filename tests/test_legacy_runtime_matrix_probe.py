@@ -1,12 +1,38 @@
+from argparse import Namespace
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.legacy_runtime_matrix_probe import catalog_loss_summary, selected_weight_file
+from scripts.legacy_runtime_matrix_probe import (
+    catalog_loss_summary,
+    optional_bool,
+    selected_weight_file,
+    training_wrapper_source,
+)
 
 
 class LegacyRuntimeMatrixProbeTest(unittest.TestCase):
+    def test_optional_bool_and_wrapper_controls(self):
+        self.assertIsNone(optional_bool("auto"))
+        self.assertIs(optional_bool("true"), True)
+        self.assertIs(optional_bool("false"), False)
+        with self.assertRaises(ValueError):
+            optional_bool("invalid")
+
+        source = training_wrapper_source(
+            Namespace(
+                bf16_reduction="false",
+                tf32_matmul="true",
+                tf32_cudnn="false",
+                float32_matmul_precision="highest",
+                foreach="false",
+            )
+        )
+        compile(source, "<training-wrapper>", "exec")
+        self.assertIn("'bf16_reduction': False", source)
+        self.assertIn("'foreach': False", source)
+
     def test_selected_weight_file_requires_exactly_one_format(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

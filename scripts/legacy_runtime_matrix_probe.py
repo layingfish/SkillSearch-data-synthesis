@@ -9,6 +9,8 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import platform
+import random
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,7 @@ except ModuleNotFoundError:
 
 
 EXPECTED_STEPS = 50
+OPTIONAL_BOOL_CHOICES = ("auto", "true", "false")
 
 
 def file_sha256(path: Path) -> str:
@@ -37,6 +40,161 @@ def package_version(name: str) -> str | None:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def optional_bool(value: str) -> bool | None:
+    if value == "auto":
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"unsupported optional boolean: {value}")
+
+
+def apply_precision_controls(torch, args: argparse.Namespace) -> dict[str, Any]:
+    bf16_reduction = optional_bool(args.bf16_reduction)
+    tf32_matmul = optional_bool(args.tf32_matmul)
+    tf32_cudnn = optional_bool(args.tf32_cudnn)
+    if bf16_reduction is not None:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = bf16_reduction
+    if tf32_matmul is not None:
+        torch.backends.cuda.matmul.allow_tf32 = tf32_matmul
+    if tf32_cudnn is not None:
+        torch.backends.cudnn.allow_tf32 = tf32_cudnn
+    if args.float32_matmul_precision != "auto":
+        torch.set_float32_matmul_precision(args.float32_matmul_precision)
+    return precision_snapshot(torch)
+
+
+def precision_snapshot(torch) -> dict[str, Any]:
+    matmul = torch.backends.cuda.matmul
+    return {
+        "allow_bf16_reduced_precision_reduction": getattr(
+            matmul, "allow_bf16_reduced_precision_reduction", None
+        ),
+        "allow_fp16_reduced_precision_reduction": getattr(
+            matmul, "allow_fp16_reduced_precision_reduction", None
+        ),
+        "allow_fp16_accumulation": getattr(matmul, "allow_fp16_accumulation", None),
+        "allow_tf32_matmul": matmul.allow_tf32,
+        "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
+
+
+def training_wrapper_source(args: argparse.Namespace) -> str:
+    controls = {
+        "bf16_reduction": optional_bool(args.bf16_reduction),
+        "tf32_matmul": optional_bool(args.tf32_matmul),
+        "tf32_cudnn": optional_bool(args.tf32_cudnn),
+        "float32_matmul_precision": args.float32_matmul_precision,
+        "foreach": optional_bool(args.foreach),
+    }
+    return """
+import runpy
+import json
+import os
+import sys
+import torch
+
+controls = __CONTROLS__
+if controls["bf16_reduction"] is not None:
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = controls["bf16_reduction"]
+if controls["tf32_matmul"] is not None:
+    torch.backends.cuda.matmul.allow_tf32 = controls["tf32_matmul"]
+if controls["tf32_cudnn"] is not None:
+    torch.backends.cudnn.allow_tf32 = controls["tf32_cudnn"]
+if controls["float32_matmul_precision"] != "auto":
+    torch.set_float32_matmul_precision(controls["float32_matmul_precision"])
+if controls["foreach"] is not None:
+    original_adamw = torch.optim.AdamW
+    def controlled_adamw(*optimizer_args, **optimizer_kwargs):
+        optimizer_kwargs["foreach"] = controls["foreach"]
+        return original_adamw(*optimizer_args, **optimizer_kwargs)
+    torch.optim.AdamW = controlled_adamw
+
+audit_path = os.environ["SKILLGR_PRECISION_CONTROL_AUDIT"]
+audit_payload = {
+    "precision": {
+        "allow_bf16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", None
+        ),
+        "allow_fp16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", None
+        ),
+        "allow_fp16_accumulation": getattr(
+            torch.backends.cuda.matmul, "allow_fp16_accumulation", None
+        ),
+        "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    },
+    "foreach_override": controls["foreach"],
+}
+with open(audit_path, "w", encoding="utf-8") as handle:
+    json.dump(audit_payload, handle, indent=2, sort_keys=True)
+    handle.write("\\n")
+
+script_path = sys.argv[1]
+sys.argv = sys.argv[1:]
+runpy.run_path(script_path, run_name="__main__")
+""".replace("__CONTROLS__", repr(controls))
+
+
+def runtime_snapshot(torch) -> dict[str, Any]:
+    try:
+        smi = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,compute_cap,uuid",
+                "--format=csv,noheader",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        smi = None
+    properties = torch.cuda.get_device_properties(0)
+    return {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "torch_file": str(Path(torch.__file__).resolve()),
+        "torch_file_sha256": file_sha256(Path(torch.__file__).resolve()),
+        "torch_config": torch.__config__.show(),
+        "cuda_runtime": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "transformers": package_version("transformers"),
+        "tokenizers": package_version("tokenizers"),
+        "huggingface_hub": package_version("huggingface-hub"),
+        "safetensors": package_version("safetensors"),
+        "triton": package_version("triton"),
+        "nvidia_cublas_cu12": package_version("nvidia-cublas-cu12"),
+        "nvidia_cudnn_cu12": package_version("nvidia-cudnn-cu12"),
+        "nvidia_cuda_runtime_cu12": package_version("nvidia-cuda-runtime-cu12"),
+        "nvidia_cuda_nvrtc_cu12": package_version("nvidia-cuda-nvrtc-cu12"),
+        "gpu": torch.cuda.get_device_name(0),
+        "compute_capability": list(torch.cuda.get_device_capability(0)),
+        "gpu_total_memory": int(properties.total_memory),
+        "nvidia_smi": smi,
+        "environment": {
+            key: os.environ.get(key)
+            for key in (
+                "CUBLAS_WORKSPACE_CONFIG",
+                "CUDA_MODULE_LOADING",
+                "NVIDIA_TF32_OVERRIDE",
+                "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+            )
+        },
+    }
 
 
 def load_historical_pipeline(source_root: Path):
@@ -88,12 +246,26 @@ def command_run(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"each runtime arm requires exactly one visible CUDA GPU, got {torch.cuda.device_count()}"
         )
+    configured_precision = apply_precision_controls(torch, args)
     historical = load_historical_pipeline(args.legacy_source)
     semantic_ids, semantic_id_mode = historical.load_semantic_ids_with_mode(args.semantic_ids)
     sid_config = historical.infer_structured_sid_config(
         semantic_ids,
         semantic_id_mode=semantic_id_mode,
     )
+    catalog_rows = historical.build_single_sid_catalog_rows(
+        historical.load_jsonl(args.skills_jsonl),
+        semantic_ids,
+        "skill document: ",
+    )
+    order_rng = random.Random(args.seed)
+    order_rng.shuffle(catalog_rows)
+    order_rng.shuffle(catalog_rows)
+    first_batch_ids = [str(row["index"]) for row in catalog_rows[:16]]
+    first_batch_sha256 = hashlib.sha256(
+        "".join(f"{row_id}\n" for row_id in first_batch_ids).encode("utf-8")
+    ).hexdigest()
+    del catalog_rows
     weight_file = selected_weight_file(args.model)
 
     torch.manual_seed(args.seed)
@@ -111,14 +283,22 @@ def command_run(args: argparse.Namespace) -> None:
     state_hashes = _hash_tensor_state(model.state_dict())
     torch_rng_after = _torch_rng_sha256(torch.get_rng_state())
     cuda_rng_after = _torch_rng_sha256(torch.cuda.get_rng_state())
+    try:
+        from torch.optim.optimizer import _default_to_fused_or_foreach
+
+        inferred_fused, inferred_foreach = _default_to_fused_or_foreach(
+            list(model.parameters()), differentiable=False, use_fused=False
+        )
+    except (ImportError, TypeError):
+        inferred_fused, inferred_foreach = None, None
     del tokenizer, model
     gc.collect()
 
     with tempfile.TemporaryDirectory(prefix=f"skillgr-runtime-{args.arm}.", dir="/tmp") as directory:
         train_output = Path(directory) / "train"
-        command = [
-            sys.executable,
-            str(args.legacy_source / "scripts" / "skill_gr_pipeline.py"),
+        pipeline_path = args.legacy_source / "scripts" / "skill_gr_pipeline.py"
+        pipeline_args = [
+            str(pipeline_path),
             "train-single-sid-decoder",
             "--rows",
             str(args.rows),
@@ -154,9 +334,20 @@ def command_run(args: argparse.Namespace) -> None:
             "1000",
             "--seed",
             str(args.seed),
-            "--bf16",
         ]
-        subprocess.run(command, check=True, env=os.environ.copy())
+        if args.precision == "bf16":
+            pipeline_args.append("--bf16")
+        command = [sys.executable, "-c", training_wrapper_source(args), *pipeline_args]
+        child_audit_path = Path(directory) / "child_precision.json"
+        child_environment = os.environ.copy()
+        child_environment["SKILLGR_PRECISION_CONTROL_AUDIT"] = str(child_audit_path)
+        subprocess.run(command, check=True, env=child_environment)
+        child_precision = json.loads(child_audit_path.read_text(encoding="utf-8"))
+        if child_precision["precision"] != configured_precision:
+            raise ValueError(
+                "parent/child precision control mismatch: "
+                f"parent={configured_precision}, child={child_precision['precision']}"
+            )
         losses = catalog_loss_summary(train_output / "loss_history.jsonl", args.steps)
         manifest = json.loads(
             (train_output / "single_sid_decoder_train_manifest.json").read_text(encoding="utf-8")
@@ -181,29 +372,35 @@ def command_run(args: argparse.Namespace) -> None:
         raise ValueError(f"training manifest mismatch: {mismatches}")
 
     payload: dict[str, Any] = {
-        "artifact_format": "legacy_runtime_matrix_arm_v1",
+        "artifact_format": "legacy_runtime_matrix_arm_v2",
         "arm": args.arm,
         "historical_source_commit": args.legacy_commit,
-        "runtime": {
-            "python": sys.version,
-            "torch": torch.__version__,
-            "cuda_runtime": torch.version.cuda,
-            "cudnn": torch.backends.cudnn.version(),
-            "transformers": package_version("transformers"),
-            "tokenizers": package_version("tokenizers"),
-            "huggingface_hub": package_version("huggingface-hub"),
-            "safetensors": package_version("safetensors"),
-            "gpu": torch.cuda.get_device_name(0),
-        },
+        "runtime": runtime_snapshot(torch),
         "condition": {
             "seed": args.seed,
             "steps": args.steps,
             "batch_size": 16,
-            "bf16": True,
+            "precision": args.precision,
             "lr": 3e-4,
             "weight_decay": 0.0,
             "weight_format": weight_file.name,
             "weight_sha256": file_sha256(weight_file),
+            "requested_controls": {
+                "bf16_reduction": args.bf16_reduction,
+                "tf32_matmul": args.tf32_matmul,
+                "tf32_cudnn": args.tf32_cudnn,
+                "float32_matmul_precision": args.float32_matmul_precision,
+                "foreach": args.foreach,
+            },
+            "effective_precision": configured_precision,
+            "child_effective_precision": child_precision,
+            "inferred_fused": inferred_fused,
+            "inferred_foreach": inferred_foreach,
+            "effective_foreach": (
+                optional_bool(args.foreach)
+                if args.foreach != "auto"
+                else inferred_foreach
+            ),
         },
         "initialization": {
             "torch_rng_before_model_sha256": torch_rng_before,
@@ -211,6 +408,10 @@ def command_run(args: argparse.Namespace) -> None:
             "cuda_rng_before_model_sha256": cuda_rng_before,
             "cuda_rng_after_model_sha256": cuda_rng_after,
             "state_sha256": state_hashes,
+        },
+        "first_catalog_batch": {
+            "row_ids": first_batch_ids,
+            "row_ids_sha256": first_batch_sha256,
         },
         "losses": losses,
     }
@@ -234,6 +435,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=EXPECTED_STEPS)
     parser.add_argument("--seed", type=int, default=20260626)
+    parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--bf16-reduction",
+        choices=OPTIONAL_BOOL_CHOICES,
+        default="auto",
+    )
+    parser.add_argument("--tf32-matmul", choices=OPTIONAL_BOOL_CHOICES, default="auto")
+    parser.add_argument("--tf32-cudnn", choices=OPTIONAL_BOOL_CHOICES, default="auto")
+    parser.add_argument(
+        "--float32-matmul-precision",
+        choices=("auto", "highest", "high", "medium"),
+        default="auto",
+    )
+    parser.add_argument("--foreach", choices=OPTIONAL_BOOL_CHOICES, default="auto")
     parser.set_defaults(func=command_run)
     return parser
 
