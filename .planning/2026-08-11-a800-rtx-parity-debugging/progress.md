@@ -191,3 +191,6 @@
 - archived parser contract test 发现原始 single-SID 命令不接受 `--eval-batch-size`；该无效参数已在提交 GPU 作业前移除。dev evaluation 实际沿用训练 batch=`16`。
 - 六个 legacy probe test modules 共 `34` 项将在 frozen Python=`3.10.12`、torch=`2.10.0+cu128` runtime 下做最终回归；focused test 当前 `8/8` 通过，`bash -n` 通过，本机没有 `shellcheck`。
 - structured local review 已覆盖 query transition、checkpoint load/save、dev call cadence、catalog invariant、replica/historical anchor 和八卡映射，未发现 CRITICAL/HIGH 问题。
+- full-query sweep 实现提交为 commit `e7f0f0f949c13d5ce122fd2a7cfc1e137b5cbe05`；提交后 worktree clean。
+- Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。
+- 正式作业已提交：job=`tide-chenyufei03-10598-otasq`。输出目录为 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_full_query_optimizer_lr_20260811_v1/`，当前等待 worker 创建。

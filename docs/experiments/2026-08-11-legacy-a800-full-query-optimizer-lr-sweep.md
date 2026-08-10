@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 full-query optimizer/lr sweep
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -10,7 +10,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: pending。目标 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
+Train: job=`tide-chenyufei03-10598-otasq`、queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`e7f0f0f949c13d5ce122fd2a7cfc1e137b5cbe05`。
 
 每个 arm：catalog=`2,730` updates、query=`38,805` updates、batch=`16`、eval batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query lr 按 arm、weight decay=`0`、betas=`(0.9,0.999)`、eps=`1e-8`、foreach=`None`、dropout=`0.1`、外层 BF16、每 `200` 个 query updates 评测 dev loss并选择 best。
 
@@ -18,11 +18,11 @@ Eval: Official core75=`75` queries、beam=`50`、beam-order aggregation、CE log
 
 ## Outputs
 
-Artifacts: pending
+Artifacts: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_full_query_optimizer_lr_20260811_v1/`
 
-Node log: pending
+Node log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_full_query_optimizer_lr_20260811_v1/logs/node.log`
 
-Bootstrap log: pending
+Bootstrap log: `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_a800_full_query_optimizer_lr_20260811_v1.log`
 
 Metrics: pending
 
