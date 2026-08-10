@@ -1,5 +1,5 @@
 # Experiment: Legacy BF16 Dropout-Zero Step-1 Probe
-Status: planned
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -29,12 +29,29 @@ Output root:
 
 ## Verification
 
-- [ ] Script and input SHA-256 checks pass
-- [ ] Initial model, CUDA RNG, and first catalog batch hashes match the archived contract
-- [ ] Child audit records `dropout_module_count` and only `p=0.0`
-- [ ] Exactly one catalog train event is present
-- [ ] A800 step-1 loss is compared with RTX `4.538916110992432` under the same dropout-zero protocol
+- [x] Script and input SHA-256 checks pass
+- [x] Initial model, CUDA RNG, and first catalog batch hashes match the archived contract
+- [x] Child audit records `dropout_module_count` and only `p=0.0`
+- [x] Exactly one catalog train event is present
+- [x] A800 step-1 loss is compared with RTX `4.538916110992432` under the same dropout-zero protocol
 
 ## Result / Notes
 
-Pending GPU execution.
+A800 completed the probe in job `tide-chenyufei03-10588-tfdip` on queue
+`rudder-exper`. The authoritative output is
+`/models_rw/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v3`.
+
+Under BF16, batch `16`, seed `20260626`, lr `3e-4`, weight decay `0`, default
+BF16 reduction, default TF32/cuDNN flags, and AdamW `foreach=None` (runtime
+inference `foreach=True`), the step-1 losses were:
+
+```text
+RTX PRO 6000, dropout=0.0: 4.538916110992432
+A800,          dropout=0.0: 4.554369926452637
+delta:                       0.015453815460205078
+```
+
+The original dropout `0.1` comparison under the same probe contract was
+`4.528710842132568` on RTX and `4.546923637390137` on A800. Setting dropout to
+zero reduced the cross-GPU delta by only `0.002758979797` loss units. The probe
+therefore does not support dropout masks as the main cause of the divergence.
