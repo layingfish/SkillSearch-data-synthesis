@@ -97,6 +97,9 @@
 - 同四个区域的 step-50 loss gap 为 `0.0297207832336/0.0211133956909/0.0140085220337/0.00123596191406`，相对 control 的 reduction 为 `0%/28.9608%/52.8662%/95.8414%`；条件同上。四组 pair 的 source/data/model/runtime/first-batch/init/RNG audit 全部通过。
 - Phase 2 没有区域达到 `D_param` 与 loss gap 同时降低至少 `50%`。decoder 对参数轨迹最有效，heads+CE 对标量 loss gap 最有效；两种信号分离说明敏感性至少跨 decoder 内部传播与输出/loss 路径，下一轮需要测试 decoder 半区和 decoder+heads/CE 联合边界。
 - Phase 3 跨 job control audit 允许诊断 wrapper hash 与临时路径/GPU UUID 变化，但要求 archived pipeline、数据、model、训练合同、precision、dropout、稳定 runtime 字段、first batch、初始化和 RNG 全部一致。这样可复用 Phase 2 control，同时明确记录新旧 probe hash。
+- Phase 3 的 decoder blocks 0–5、blocks 6–11、full decoder+heads/CE、blocks 0–5+heads/CE `D_param` reduction 为 `4.5123%/3.9496%/-5.1412%/1.8471%`，step-50 loss-gap reduction 为 `86.2616%/-32.2482%/12.7597%/85.4321%`；条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0，control 来自 Phase 2 BF16 pair。
+- Phase 3 的四组 pair audit 与八个 candidate-to-control compatibility audit 全部通过。最大峰值显存 `max_allocated_bytes=42,101,778,432`（A800 default、full decoder+heads/CE、catalog 前 50 updates、batch=16）。
+- Phase 2/3 一致表明标量 loss gap 可由局部 FP32 大幅压缩，但完整参数轨迹差异最多只降低 `14.6651%`（Phase 2 whole-decoder FP32；A800、50-step 固定条件）。局部 FP32 不足以建立稳定 baseline，后续转向 catalog→query optimizer 状态放大器。
 - `scripts/legacy_runtime_matrix_probe.py` 会从 commit `15f6c51131f3b6f3e8580aa4564b17cbe13a9790` 解包并在子进程运行 `skill_gr_pipeline.py`；固定检查 catalog rows=14,551、batch=16、lr=3e-4、weight decay=0 和最多 50 个 catalog updates。
 - 新诊断应继续从该 archived commit 解包源码，并把 instrumentation 放在外层 wrapper；这样能保持 legacy 训练主体的 hash 与语义不变。
 - structured decoder 的关键路径可拆成 `backbone.encoder`、`sid_embedding`、`backbone.decoder`、四个 position-specific `code_heads`、`control_head` 和 CE reduction。局部精度实验应先记录这些边界的实际 dtype，再决定是否强制 FP32。

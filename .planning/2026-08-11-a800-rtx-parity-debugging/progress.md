@@ -138,3 +138,15 @@
 - structured local review 已检查 block 选择、嵌套 autocast、CE patch、每步调用次数、跨 job stable-runtime/hash contract、Phase 2 control 重算和 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
 - Phase 3 实现提交为 commit `ec164e4ae1f9072ce84dc54c7208708a3835f449`；提交后 worktree clean，目标 v1 output 在作业提交前不存在。
 - Tianzhi dry-run 通过后已提交 job=`tide-chenyufei03-10594-pemnv`（queue=`rudder-exper`、nodes=1、`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`ec164e4ae1f9072ce84dc54c7208708a3835f449`）。
+- worker `tide-chenyufei03-10594-pemnv-worker-0` 已进入 Running（1/1 ready、0 restarts）；CFS aliases、launch commit=`ec164e4ae1f9072ce84dc54c7208708a3835f449` 与 Phase 2 control root 校验通过，正在解包冻结 runtime。
+- Phase 3 runtime preflight 通过：Python 3.10.12、torch 2.10.0+cu128、CUDA 12.8、cuDNN 91002、Transformers 5.3.0、Tokenizers 0.22.2、node GPU count=8。
+- 四组 default/workspace16 pair 已分别启动在 GPU 0–7；pod 保持 Running（1/1 ready、0 restarts），当前日志只有非阻塞 Hugging Face deprecation warning。
+- 运行约 2 分 50 秒时九份 node/arm log 均已创建；各 arm 仍在 archived source-length audit/模型初始化阶段，日志未发现 Traceback、OOM、CUDA error 或 arm failure。
+- 八个 arm 均完成 step 50。decoder blocks 0–5、blocks 6–11、full decoder+heads/CE、blocks 0–5+heads/CE 的 step-50 loss gap 分别为 `0.00408315658569/0.0393052101135/0.0259284973145/0.00432968139648`；条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0。
+- decoder blocks 0–5 的 loss-gap reduction 约为 `86.26%`（相对 Phase 2 BF16 control=`0.0297207832336`，上述固定条件），当前等待 final state 保存和 CPU FP64 `D_param` analyzer。
+- Phase 3 analyzer 完成；四组 `D_param` reduction 分别为 `4.5123%/3.9496%/-5.1412%/1.8471%`，没有区域通过双门禁。条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0。
+- 四组 candidate pair audit、八个 Phase 2 control compatibility audit、module call-count 与 dtype audit 全部通过；没有 OOM/NaN/Inf。
+- job `tide-chenyufei03-10594-pemnv` 在约 5 分 30 秒完成（1 个 `8×A800` 节点、八个独立单卡 arm、0 restarts）。局部 FP32 路线停止，下一步进入 catalog→query optimizer 稳定性实验。
+- Phase 3 标记 done；Phase 4 因没有通过短 probe 的局部 FP32 候选而 skipped；Phase 5 标记 in_progress。
+- Phase 5 首轮改为 backend × optimizer state × query lr 的 `2×2×2` factorial，共八个单卡 arm，占满一个 `8×A800` 节点；同一 lr 内仍可独立估计 carry/reset 效果。
+- task plan 已重新 attestation，SHA-256 前缀=`f4f63191bcdb`（Phase 5 in_progress）。

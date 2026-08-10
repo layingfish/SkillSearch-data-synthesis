@@ -8,8 +8,8 @@
 
 ## 当前状态
 
-- 状态：`in_progress`；Phase 2 已完成，四个高层区域均未通过双门禁。
-- 当前阶段：Phase 3，敏感模块细分。
+- 状态：`in_progress`；Phase 2/3 已证明局部 FP32 无法让参数轨迹收敛。
+- 当前阶段：Phase 5，catalog→query optimizer 稳定性。
 - 风险：训练与 checkpoint 语义属于 Tier 2；局部 autocast wrapper 必须通过关闭开关时的端到端等价检查。
 
 ## 固定条件
@@ -129,7 +129,7 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 - 找到一个最小局部 FP32 区域；或
 - 两轮后没有区域达到 50% 双判据。后一情况说明敏感性分散在整个网络，转入 Phase 5 的优化稳定性路线。
 
-- **Status：in_progress**
+- **Status：done**
 
 ## Phase 4：完整训练验证局部 FP32
 
@@ -148,22 +148,24 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 
 通过后将该配方标记为“局部精度 A800 候选”，尚不直接用于后续方法实验。
 
-- **Status：pending**
+- **Status：skipped**；Phase 2/3 没有局部 FP32 候选通过 50-step 双门禁。
 
 ## Phase 5：验证 catalog→query optimizer 放大器
 
 仅在以下任一条件满足时进入：局部 FP32 没有通过 Phase 4；或局部 FP32 恢复深召回但 Top-1 仍明显偏低。
 
-第一步只测试 optimizer state，不同时加入 scheduler 或 clipping：
+第一步使用完整 2×2 factorial 隔离 optimizer state 与 query lr；不加入 scheduler、warmup 或 clipping：
 
-- 对每个 backend 的同一个 catalog-final model 复制两份完全相同的模型状态，比较 query 阶段继续继承 AdamW state 与重建 AdamW；两者均使用 lr=3e-4、weight decay=0、betas=(0.9,0.999)、eps=1e-8、无 warmup/scheduler/clipping。
-- default 与 `workspace_16` 各跑一对。先比较 query 前 50 updates 的 `D_param`、loss 和 gradient/update trace。
-- optimizer reset 若把 query step-50 的 backend `D_param` 降低至少 50%，再进入完整 query 训练。
+- 在一个 `8×A800` 节点运行 backend=`{default, workspace_16}` × optimizer state=`{carry, reset}` × query lr=`{2e-4, 3e-4}`，共八个独立单卡 arm。
+- 八个 arm 的 catalog 阶段都固定为 2,730 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、betas=(0.9,0.999)、eps=1e-8、dropout=0.1。每个 backend 内四个 catalog-final model/optimizer hash 必须 exact，确保 query 分叉前状态一致。
+- query 阶段只跑前 50 updates、batch=16、dropout=0.1。carry 保留 catalog AdamW moments；reset 从同一 catalog-final model 重建 AdamW。query lr 只取对应 factorial level，其余条件不变。
+- 在 CPU FP64 上比较 default/workspace16 的 query update-vector 差异：`D_update = ||delta_default - delta_workspace||_2 / ||delta_default||_2`，其中 delta 是 query step 50 相对各自 catalog-final model 的参数变化。同时记录 step-1/50 loss gap 与 gradient/update trace。
+- optimizer reset 若在同一 query lr 下把 `D_update` 与 step-50 loss gap 都降低至少 50%，再进入完整 query 训练；两个 lr 都报告，不用 Official core75 选择短 probe。
 
 若 reset 仍不足，执行一次限定 sweep：
 
 - optimizer state=`{carry, reset}`；
-- query lr=`{1e-4, 2e-4, 3e-4}`；
+- query lr 补充 `1e-4`，并与首轮已完成的 `{2e-4, 3e-4}` 合并分析；
 - 其余条件保持不变，共 6 个完整 query arms；
 - 使用 Official core75 75-query 选择；canonical private test 不参与选择。
 
@@ -171,7 +173,7 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 
 这一阶段得到的是新的 A800 稳定训练配方，报告中必须与“严格 legacy reproduction”分开命名。
 
-- **Status：pending**
+- **Status：in_progress**
 
 ## Phase 6：多 seed 锁定与最终评测
 
