@@ -180,3 +180,14 @@
 - 完整 sweep 的六个 selection arms 为 optimizer state=`{carry, reset}` × query lr=`{1e-4,2e-4,3e-4}`；每个 arm 跑 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`，并用 Official core75=`75` queries、beam=`50`、beam-order 选择。
 - 同节点另外两张 A800 分别运行 `workspace_16/carry/query lr=3e-4` exact replica 与 `default/carry/query lr=3e-4` legacy anchor，只做确定性和历史结果对齐。
 - task plan 已重新 attestation，SHA-256 前缀=`14ebdfad4683`（Phase 5 full-query sweep 设计冻结）。
+
+## 2026-08-11：Phase 5 full-query sweep 实现
+
+- 已新增 `legacy_full_query_optimizer_lr.py`。它动态加载 archived pipeline SHA-256=`7b883cb7...`，在 query step `1` 的 AdamW update 前设置 lr 并按 arm carry/reset state，不复制训练循环。
+- 已新增 Official core75 arm/matrix analyzer。六个 selection arms 固定为 `workspace_16` × optimizer state=`{carry,reset}` × query lr=`{1e-4,2e-4,3e-4}`；另外两条为 workspace exact replica 与 default legacy anchor。
+- 已新增八卡 node launcher 与 Tianzhi bootstrap。GPU `0–7` 各运行一个独立单卡进程；每个 arm 固定 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、eval steps=`200`。
+- 为减少八个 full run 的 CFS 写入，best/final checkpoint 只保存模型，last checkpoint 写盘被抑制。训练中的 best selection、forward/backward、optimizer step、dev loss 与 RNG 不变；final state 必须与 best state exact。
+- 模型 safetensors view 改放在持久化 experiment output 的 `controls/` 下，避免 checkpoint metadata 指向 job 结束后消失的 `/tmp` 路径。
+- archived parser contract test 发现原始 single-SID 命令不接受 `--eval-batch-size`；该无效参数已在提交 GPU 作业前移除。dev evaluation 实际沿用训练 batch=`16`。
+- 六个 legacy probe test modules 共 `34` 项将在 frozen Python=`3.10.12`、torch=`2.10.0+cu128` runtime 下做最终回归；focused test 当前 `8/8` 通过，`bash -n` 通过，本机没有 `shellcheck`。
+- structured local review 已覆盖 query transition、checkpoint load/save、dev call cadence、catalog invariant、replica/historical anchor 和八卡映射，未发现 CRITICAL/HIGH 问题。
