@@ -118,4 +118,6 @@
 - Phase 1 dtype audit 确认 `heads_ce` arm 仍覆盖 BF16 head outputs 与 BF16 CE logits；SID embedding 已是 FP32，因此该子模块的局部包装预期为 no-op。
 - structured local review 已逐项检查 model factory 注入点、autocast 边界、CE patch 时机、50-step 调用次数、初始化/最终参数捕获、default/workspace provenance、CPU FP64 距离和八卡进程隔离。未发现 CRITICAL/HIGH 问题。
 - analyzer 对零 control metric 改为明确失败，避免把未定义的 reduction 写成非标准 JSON 数值；新增正负边界断言后，19 项相关测试再次全部通过（冻结的 Python 3.10.12 + torch 2.10.0 runtime）。
-- Phase 2 尚待 commit 和 GPU 提交。
+- Phase 2 实现已提交为 commit `544c44e6d44b5ebe4dbdfa46d161dfd791afd196`；提交后 worktree clean，目标 v1 output 在提交作业前不存在。
+- Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=1、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`544c44e6d44b5ebe4dbdfa46d161dfd791afd196`。
+- Phase 2 GPU job 已提交：`tide-chenyufei03-10593-vgfrd`。节点内八个单卡 arm 映射到 GPU 0–7；状态待调度。

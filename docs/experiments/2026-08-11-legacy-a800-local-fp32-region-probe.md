@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 local FP32 region probe
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -12,7 +12,7 @@ Phase 1 已证明两条 BF16 路径的 embedding 与 encoder outputs tensor-exac
 
 ## Commands
 
-Train: `SKILLGR_LAUNCH_COMMIT=<verified-commit> bash scripts/run_legacy_local_fp32_matrix_tianzhi_20260811.sh`。在 `rudder-exper` 的一个 `8×A800` 节点运行八个单卡 arm：default/workspace16 × `{BF16 control, encoder FP32, decoder FP32, heads+CE FP32}`。
+Train: job=`tide-chenyufei03-10593-vgfrd`，queue=`rudder-exper`，nodes=1，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`544c44e6d44b5ebe4dbdfa46d161dfd791afd196`。节点内运行八个单卡 arm：default/workspace16 × `{BF16 control, encoder FP32, decoder FP32, heads+CE FP32}`，占用 `8×A800`。
 
 每个 arm 固定 catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、外层 BF16 autocast、AdamW foreach=None。
 
