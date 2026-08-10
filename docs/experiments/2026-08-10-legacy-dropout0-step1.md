@@ -24,7 +24,7 @@ bash scripts/run_legacy_dropout0_probe_tianzhi_20260810.sh
 Output root:
 
 ```text
-/models_rw/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v1
+/models_rw/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v2
 ```
 
 ## Verification

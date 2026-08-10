@@ -367,8 +367,6 @@ def command_run(args: argparse.Namespace) -> None:
             "2048",
             "--batch-size",
             "16",
-            "--eval-batch-size",
-            "128",
             "--lr",
             "0.0003",
             "--weight-decay",
