@@ -163,3 +163,4 @@
 - 根因是新 wrapper 的 `row_identifier()` 对实际 catalog row 中存在的 `positive_skill_id` 也拼接了 `|positive_skill_id`，得到 `95cb153d...`；取证包 catalog hash=`721a0d93...` 只使用 `index`。query reference 才使用 `index|positive_skill_id`。
 - 修复已让 catalog/query 显式选择 row-id 口径，并把 hash 比较前移到对应首批。focused optimizer-boundary tests 共 5 项在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下通过；v2 使用新 output/bootstrap 目录，保留 v1 日志。
 - 修复后的五个 legacy probe test modules 共 25 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
+- row-hash 口径修复与 v2 launcher 提交为 commit `f13c2de619824578661275ee7ad8152e466c6171`。Tianzhi dry-run 通过后已提交 v2 job=`tide-chenyufei03-10596-baniu`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`）。

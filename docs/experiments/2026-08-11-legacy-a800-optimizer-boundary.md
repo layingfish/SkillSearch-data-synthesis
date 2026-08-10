@@ -10,7 +10,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: v1 job=`tide-chenyufei03-10595-comjs`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`。八个 arm 完成训练后被 wrapper 的 catalog row-hash 口径错误拒绝；v2 待提交。
+Train: v1 job=`tide-chenyufei03-10595-comjs`，launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`，八个 arm 完成训练后被 wrapper 的 catalog row-hash 口径错误拒绝。v2 job=`tide-chenyufei03-10596-baniu`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`f13c2de619824578661275ee7ad8152e466c6171`。
 
 每个 arm 的 catalog 固定 2,730 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0.1、外层 BF16、AdamW foreach=None。query 固定前 50 updates、batch=16、dropout=0.1；只改变 optimizer state 和 query lr。
 
