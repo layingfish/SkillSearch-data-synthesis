@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 local FP32 decoder refinement
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -10,7 +10,7 @@ archived pipeline SHA-256=`7b883cb7f56667cdaee8bf0227470a2eba2c6882096dc07a2f8f1
 
 ## Commands
 
-Train: 待提交。在 `rudder-exper` 的一个 `8×A800` 节点运行四组 default/workspace16 pair：decoder blocks 0–5、decoder blocks 6–11、full decoder+heads/CE、decoder blocks 0–5+heads/CE。
+Train: job=`tide-chenyufei03-10594-pemnv`，queue=`rudder-exper`，nodes=1，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`ec164e4ae1f9072ce84dc54c7208708a3835f449`。节点内运行四组 default/workspace16 pair：decoder blocks 0–5、decoder blocks 6–11、full decoder+heads/CE、decoder blocks 0–5+heads/CE，占用 `8×A800`。
 
 每个 arm 固定 catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、外层 BF16 autocast、AdamW foreach=None。
 

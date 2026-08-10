@@ -136,3 +136,5 @@
 - 已新增 Phase 3 analyzer、八卡 node launcher、Tianzhi bootstrap、experiment note 和 composed-region/cross-job-audit focused tests。
 - Phase 3 相关 21 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
 - structured local review 已检查 block 选择、嵌套 autocast、CE patch、每步调用次数、跨 job stable-runtime/hash contract、Phase 2 control 重算和 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
+- Phase 3 实现提交为 commit `ec164e4ae1f9072ce84dc54c7208708a3835f449`；提交后 worktree clean，目标 v1 output 在作业提交前不存在。
+- Tianzhi dry-run 通过后已提交 job=`tide-chenyufei03-10594-pemnv`（queue=`rudder-exper`、nodes=1、`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`ec164e4ae1f9072ce84dc54c7208708a3835f449`）。
