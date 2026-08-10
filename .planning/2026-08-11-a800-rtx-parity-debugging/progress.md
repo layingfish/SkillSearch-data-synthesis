@@ -150,3 +150,8 @@
 - Phase 3 标记 done；Phase 4 因没有通过短 probe 的局部 FP32 候选而 skipped；Phase 5 标记 in_progress。
 - Phase 5 首轮改为 backend × optimizer state × query lr 的 `2×2×2` factorial，共八个单卡 arm，占满一个 `8×A800` 节点；同一 lr 内仍可独立估计 carry/reset 效果。
 - task plan 已重新 attestation，SHA-256 前缀=`f4f63191bcdb`（Phase 5 in_progress）。
+- 已定位 archived optimizer 生命周期：单个 AdamW 跨 catalog/query 复用。Phase 5 准备通过 optimizer-step wrapper 在 query step 1 前捕获 catalog-final 状态，并对 reset arm 清空 moments；不复制 archived 训练循环。
+- 已实现 optimizer-boundary probe、CPU FP64 `D_update` analyzer、八卡 node launcher、Tianzhi bootstrap、experiment note 和 focused tests；尚未完成本地验证、review、commit 或 GPU 提交。
+- Phase 5 首次本地测试的 25 项中 24 项通过；optimizer state 的 scalar `step` tensor 在 byte-view hash 中触发 `RuntimeError`。hash helper 已先 reshape 为一维再 view，训练语义未受影响，准备重跑。
+- scalar tensor hash 修复后，Phase 5 相关测试增至 26 项并在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
+- structured local review 已检查 catalog/query call-count 边界、query 首批前 catalog capture、query step-1 backward 后 reset 时机、fresh-AdamW 等价、每 backend 四路 fork invariant、CPU FP64 `D_update`、checkpoint-save observer 与 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
