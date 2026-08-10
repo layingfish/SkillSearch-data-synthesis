@@ -30,7 +30,7 @@
 | GPU job | 未启动 |
 | `git diff --check` | 通过 |
 | worktree 变化 | 仅新增 `.planning/` 独立计划目录 |
-| plan attestation | SHA-256 前缀 `5b0ac1c68d07`，已包含 Phase 1 v1 failure 与 v2 修复 |
+| plan attestation | SHA-256 前缀 `c0fcfc9e618d`，Phase 1 已完成并进入 Phase 2 |
 
 ## 2026-08-11：评测选择策略调整
 
@@ -99,5 +99,18 @@
 - retry 使用新的 output/bootstrap 目录 `legacy_a800_layerwise_trace_20260811_v2`，保留 v1 全部日志与四个 control JSON。
 - hook 修复后的相关测试增至 13 项，并在 frozen Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、`git diff --check` 同时通过。
 - v1 pod 已退出并被集群清理；无需取消。v2 尚未提交。
+- hook 修复提交为 commit `11fd64fa8952f0fda9dacbef5ca40bd159392ecc`。
+- v2 dry-run 通过后已提交：job=`tide-chenyufei03-10590-tdbdv`、queue=`rudder-exper`、nodes=1、`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`11fd64fa8952f0fda9dacbef5ca40bd159392ecc`。
+- v2 提交后前两次 pod 查询尚未返回 worker；当前处于 Tianzhi 创建/调度阶段，没有失败 pod。
+- v2 worker 在约 32 秒内进入 Running（1/1 ready、0 restarts）；CFS aliases 与 launch commit=`11fd64fa8952f0fda9dacbef5ca40bd159392ecc` 校验通过，正在解包 frozen runtime。
+- v2 runtime preflight 再次通过 Python 3.10.12、torch 2.10.0+cu128、CUDA 12.8、cuDNN 91002、Transformers 5.3.0、Tokenizers 0.22.2 与 node GPU count=8；正在完成数据/model hash preflight。
+- v2 的八个单卡 arm 已全部启动在 GPU 0–7；pod 运行约 2 分 9 秒时为 Running（1/1 ready、0 restarts）。
+- v2 运行约 3 分 13 秒时仍为 Running（1/1 ready、0 restarts）；各 arm 尚未完成 source-length audit/step-1，日志无 Traceback、OOM 或磁盘错误。
+- v2 四个 control arms 已在约 4 分 15 秒内完成；四组 step-1 loss 与 final-state SHA-256 均和 v1 byte-identical（A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、trace=off，各自 backend/precision 如名称）。
+- v2 运行约 5 分 25 秒时四个 traced arms 仍在逐参数 artifact 阶段；pod 无 restart，日志未出现新 Traceback/OOM/磁盘错误。
+- v2 default traced arm 已输出 step-1 loss=`4.554369926452637`（A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、default backend、trace=on），与 control 精确一致；未再出现 missing-boundary error，当前在把 raw tensors 从 node `/tmp` 复制到 CFS。
+- v2 八个 arm 全部完成；每个 traced arm 保存 573 个 artifacts，matrix analyzer 报 `pair_equivalence_passed=true`。job `tide-chenyufei03-10590-tdbdv` 在约 8 分 47 秒完成，0 restarts。
+- Phase 1 结论：default/workspace16/cuBLASLt 的 embedding 与 encoder 输出 exact；首个 BF16 backend 分叉统一位于 `decoder.block.0`，并在 decoder blocks 1–2 放大。完整数值已写入 findings 与 experiment note。
+- Phase 1 标记 done；Phase 2 标记 in_progress，继续实施 default/workspace16 × `{BF16 control, encoder FP32, decoder FP32, heads+CE FP32}` 的八个 50-step arm。
 - 尚未完成本地测试、focused review、commit 或 GPU 提交。
 - 状态更新为 Phase 1 `in_progress`；GPU job 尚未提交。

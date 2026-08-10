@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 layerwise numerical trace
-Status: failed
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -47,9 +47,9 @@ Metrics: pending
 ## Verification
 
 - [x] Minimal local check：`py_compile`、`bash -n`、12 related unit tests passed using frozen Python 3.10.12 + torch 2.10.0 runtime
-- [ ] `trace=off` wrapper 与原始无 wrapper 路径等价
-- [ ] 四组 `trace=on/off` 的 step-1 loss 与 optimizer 后参数一致
-- [ ] manifest、源码/data/model/runtime/首批 row/init/RNG/config hash 一致
+- [x] `trace=off` wrapper 与原始无 wrapper 路径等价
+- [x] 四组 `trace=on/off` 的 step-1 loss 与 optimizer 后参数一致
+- [x] manifest、源码/data/model/runtime/首批 row/init/RNG/config hash 一致
 - [x] Reviewer required? yes；当前执行策略不允许调用独立 sub-agent，已完成 structured local review，并把 trace/control 精确等价设为 GPU 硬门禁
 
 ## Result / Notes
@@ -60,3 +60,10 @@ Metrics: pending
 - `tide-chenyufei03-10589-irhff` 已提交，等待 pod 启动。
 - v1 四个 control arms 均完成。四个 traced arms 均完成 one-step loss，但 post-run validation 一致报 `shared_embedding` boundary 缺失。
 - v1 根因：hook 注册在 `backbone.shared`，实际 encoder 调用 `backbone.encoder.embed_tokens`。已修正并增加 regression test；v2 将使用全新输出目录和 job name。
+- v2 retry：`tide-chenyufei03-10590-tdbdv`（`rudder-exper`、nodes=1、`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`11fd64fa8952f0fda9dacbef5ca40bd159392ecc`）。
+- v2 完成八个 arm；四组 trace/control 的 step-1 loss 与 final-state SHA-256 均精确一致，`pair_equivalence_passed=true`。每个 traced arm 保存 573 个 tensor artifacts；条件为 A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、updates=1。
+- default BF16 对 workspace16/cuBLASLt BF16 的 shared embedding、encoder blocks 0–11、SID embedding 全部 exact；首个非零 activation boundary 都是 `decoder.block.0`。
+- workspace16 相对 default 在 decoder block 0/1/2 的 relative L2=`1.811838e-05/4.396393e-04/1.063370e-03`；block 1 相对 block 0 放大 `24.2648×`，block 2 相对 block 1 放大 `2.4187×`。条件为上述 one-step trace，两条路径均为 BF16。
+- cuBLASLt 相对 default 在 decoder block 0/1/2 的 relative L2=`0.001219331/0.003668086/0.006265732`；对应放大率为 `3.0083×/1.7082×`。条件同上，仅候选 backend 为 cuBLASLt。
+- workspace16/cuBLASLt 的最大 activation relative L2=`0.004666657/0.009643726`，最大 gradient relative L2=`0.126297/0.428937`，最大 update relative L2=`0.269945/0.530078`；条件均为上述 one-step trace。
+- authoritative outputs：`/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_layerwise_trace_20260811_v2/layerwise_comparison.{json,md}`。

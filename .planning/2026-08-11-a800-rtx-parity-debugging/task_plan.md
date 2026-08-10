@@ -9,7 +9,7 @@
 ## 当前状态
 
 - 状态：`in_progress`；正在实现 Phase 1，尚未提交 GPU 作业。
-- 当前阶段：Phase 1，建立逐层 one-step trace 与 instrumentation 等价门禁。
+- 当前阶段：Phase 2，局部 FP32 高层二分。
 - 风险：训练与 checkpoint 语义属于 Tier 2；局部 autocast wrapper 必须通过关闭开关时的端到端等价检查。
 
 ## 固定条件
@@ -66,7 +66,7 @@
 
 停止条件：得到可重复的逐层差异报告；如果 wrapper 会改变原始 step-1 结果且两种非侵入方案仍失败，不进入局部精度训练，先收缩到纯 forward probe。
 
-- **Status：in_progress**
+- **Status：done**
 
 ## Phase 2：局部 FP32 高层二分
 
@@ -102,7 +102,7 @@ D_param = ||theta_default - theta_workspace||_2 / ||theta_default - theta_init||
 
 如果多个区域通过，优先选择 FP32 参数量、峰值显存和运行开销更小的区域。
 
-- **Status：pending**
+- **Status：in_progress**
 
 ## Phase 3：敏感模块细分
 
