@@ -155,3 +155,5 @@
 - Phase 5 首次本地测试的 25 项中 24 项通过；optimizer state 的 scalar `step` tensor 在 byte-view hash 中触发 `RuntimeError`。hash helper 已先 reshape 为一维再 view，训练语义未受影响，准备重跑。
 - scalar tensor hash 修复后，Phase 5 相关测试增至 26 项并在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
 - structured local review 已检查 catalog/query call-count 边界、query 首批前 catalog capture、query step-1 backward 后 reset 时机、fresh-AdamW 等价、每 backend 四路 fork invariant、CPU FP64 `D_update`、checkpoint-save observer 与 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
+- Phase 5 实现提交为 commit `b0786627d891c22b1d516b1999553a0a0283429a`；提交后 worktree clean，目标 v1 output 在作业提交前不存在。
+- Tianzhi dry-run 通过后已提交 job=`tide-chenyufei03-10595-comjs`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`）。

@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 catalog-to-query optimizer boundary
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -10,7 +10,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: 待提交。在 `rudder-exper` 的一个 `8×A800` 节点运行八个单卡 arm：backend=`{default, workspace16}` × optimizer=`{carry, reset}` × query lr=`{2e-4, 3e-4}`。
+Train: job=`tide-chenyufei03-10595-comjs`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`。节点内运行八个单卡 arm：backend=`{default, workspace16}` × optimizer=`{carry, reset}` × query lr=`{2e-4, 3e-4}`。
 
 每个 arm 的 catalog 固定 2,730 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0.1、外层 BF16、AdamW foreach=None。query 固定前 50 updates、batch=16、dropout=0.1；只改变 optimizer state 和 query lr。
 
