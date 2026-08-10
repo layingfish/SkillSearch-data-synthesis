@@ -102,6 +102,7 @@ def training_wrapper_source(args: argparse.Namespace) -> str:
         "foreach": optional_bool(args.foreach),
         "preferred_blas": args.preferred_blas,
         "deterministic_algorithms": optional_bool(args.deterministic_algorithms),
+        "dropout_rate": getattr(args, "dropout_rate", None),
     }
     return """
 import runpy
@@ -111,6 +112,17 @@ import sys
 import torch
 
 controls = __CONTROLS__
+dropout_modules = []
+if controls["dropout_rate"] is not None:
+    requested_dropout_rate = float(controls["dropout_rate"])
+    if not 0.0 <= requested_dropout_rate <= 1.0:
+        raise ValueError(f"dropout_rate must be in [0, 1], got {requested_dropout_rate}")
+    original_dropout = torch.nn.Dropout
+    class ControlledDropout(original_dropout):
+        def __init__(self, p=0.5, inplace=False):
+            super().__init__(p=requested_dropout_rate, inplace=inplace)
+            dropout_modules.append(self)
+    torch.nn.Dropout = ControlledDropout
 if controls["bf16_reduction"] is not None:
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = controls["bf16_reduction"]
 if controls["tf32_matmul"] is not None:
@@ -130,6 +142,9 @@ if controls["foreach"] is not None:
         return original_adamw(*optimizer_args, **optimizer_kwargs)
     torch.optim.AdamW = controlled_adamw
 
+script_path = sys.argv[1]
+sys.argv = sys.argv[1:]
+runpy.run_path(script_path, run_name="__main__")
 audit_path = os.environ["SKILLGR_PRECISION_CONTROL_AUDIT"]
 audit_payload = {
     "precision": {
@@ -151,6 +166,9 @@ audit_payload = {
         "preferred_blas_library": str(torch.backends.cuda.preferred_blas_library()),
     },
     "foreach_override": controls["foreach"],
+    "dropout_rate_requested": controls["dropout_rate"],
+    "dropout_module_count": len(dropout_modules),
+    "dropout_module_rates": sorted({float(module.p) for module in dropout_modules}),
     "environment": {
         "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "CUDA_MODULE_LOADING": os.environ.get("CUDA_MODULE_LOADING"),
@@ -159,10 +177,6 @@ audit_payload = {
 with open(audit_path, "w", encoding="utf-8") as handle:
     json.dump(audit_payload, handle, indent=2, sort_keys=True)
     handle.write("\\n")
-
-script_path = sys.argv[1]
-sys.argv = sys.argv[1:]
-runpy.run_path(script_path, run_name="__main__")
 """.replace("__CONTROLS__", repr(controls))
 
 
@@ -508,6 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--cuda-module-loading",
         choices=("auto", "LAZY", "EAGER"),
         default="auto",
+    )
+    parser.add_argument(
+        "--dropout-rate",
+        type=float,
+        default=None,
+        help="override instantiated torch.nn.Dropout modules; omit to preserve the archived setting",
     )
     parser.set_defaults(func=command_run)
     return parser

@@ -29,11 +29,14 @@ class LegacyRuntimeMatrixProbeTest(unittest.TestCase):
                 foreach="false",
                 preferred_blas="cublas",
                 deterministic_algorithms="true",
+                dropout_rate=0.0,
             )
         )
         compile(source, "<training-wrapper>", "exec")
         self.assertIn("'bf16_reduction': False", source)
         self.assertIn("'foreach': False", source)
+        self.assertIn("'dropout_rate': 0.0", source)
+        self.assertIn("dropout_module_rates", source)
 
     def test_selected_weight_file_requires_exactly_one_format(self):
         with tempfile.TemporaryDirectory() as directory:
