@@ -9,7 +9,7 @@
 ## 当前状态
 
 - 状态：`in_progress`；Phase 2/3 已证明局部 FP32 无法让参数轨迹收敛。
-- 当前阶段：Phase 5，catalog→query optimizer 稳定性。
+- 当前阶段：Phase 5；optimizer-boundary 短 probe 已完成，正在进入完整 query 限定 sweep。
 - 风险：训练与 checkpoint 语义属于 Tier 2；局部 autocast wrapper 必须通过关闭开关时的端到端等价检查。
 
 ## 固定条件
@@ -162,12 +162,14 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 - 在 CPU FP64 上比较 default/workspace16 的 query update-vector 差异：`D_update = ||delta_default - delta_workspace||_2 / ||delta_default||_2`，其中 delta 是 query step 50 相对各自 catalog-final model 的参数变化。同时记录 step-1/50 loss gap 与 gradient/update trace。
 - optimizer reset 若在同一 query lr 下把 `D_update` 与 step-50 loss gap 都降低至少 50%，再进入完整 query 训练；两个 lr 都报告，不用 Official core75 选择短 probe。
 
-若 reset 仍不足，执行一次限定 sweep：
+短 probe 已完成。reset 在 query lr=`2e-4` 时把 `D_update` 降低 `14.9632%`、step-50 loss gap 增加 `19.3827%`；在 query lr=`3e-4` 时把两项分别降低 `13.1786%/5.6570%`。条件均为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`。没有组合通过双 `50%` 门禁。
 
-- optimizer state=`{carry, reset}`；
-- query lr 补充 `1e-4`，并与首轮已完成的 `{2e-4, 3e-4}` 合并分析；
-- 其余条件保持不变，共 6 个完整 query arms；
-- 使用 Official core75 75-query 选择；canonical private test 不参与选择。
+因此执行一次限定的完整 query sweep：
+
+- selection backend 固定为 `workspace_16`，因为它在 legacy full run 已达到 Overall R@10/R@50=`69.5556/75.3333`（catalog=`3` epochs、query=`5` epochs、batch=`16`、seed=`20260626`、lr=`3e-4`、Official core75=`75` queries、beam=`50`、beam-order），目前主要缺口是 Top-1；
+- optimizer state=`{carry, reset}`，query lr=`{1e-4, 2e-4, 3e-4}`，共 `6` 个 selection arms；每个 arm 都跑 catalog=`2,730` updates 与 query=`38,805` updates，batch=`16`、seed=`20260626`、catalog lr=`3e-4`、weight decay=`0`、dropout=`0.1`、每 `200` 个 query updates 以 dev loss 选择 best；
+- 同一 `8×A800` 节点剩余两张卡运行 `workspace_16/carry/query lr=3e-4` exact replica 与 `default/carry/query lr=3e-4` legacy anchor；两者使用同一完整日程，只用于确定性和历史结果对齐，不参与六选一；
+- 八个 arm 都评测 Official core75=`75` queries、beam=`50`、beam-order、K=`{1,10,50}`；selection 只使用前六个 `workspace_16` arms，canonical private test 不参与选择。
 
 只有上述 6 个 arm 全部不能达到 Phase 4 的 Official core75 标准，才在最佳组合上分别测试 `warmup_steps=500` 和 `max_grad_norm=1.0`。两项先单独测试，不在第一轮同时启用。
 

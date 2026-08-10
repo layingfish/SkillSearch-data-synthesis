@@ -38,7 +38,7 @@
 | 首个差异来自跨架构 GPU 数值执行路径 | 高 | dropout=0 首步仍分叉；同 A800 replica 精确一致 |
 | 大幅最终差距来自训练配方放大 | 高 | A800 backend-only 完整训练产生大指标跨度 |
 | BF16 GEMM/反向传播中的少数敏感模块是首要定位对象 | 中高 | global backend/precision probe 与公开 autocast 案例一致；具体模块未知 |
-| catalog→query 继承 AdamW 状态是重要放大器 | 中 | 两阶段分布切换且累计更新很长；尚无单独因果实验 |
+| catalog→query 继承 AdamW 状态是主要放大器 | 低 | reset 仅把 `D_update` 降低 `13.1786%–14.9632%`；同 lr 的 step-50 loss gap 最多降低 `5.6570%`（A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query lr=`{2e-4,3e-4}`、dropout=`0.1`） |
 | 继续全局枚举 backend flag 的信息收益低 | 高 | 已完成的矩阵没有任何 arm 恢复 RTX 轨迹 |
 
 ## 关键决策
@@ -111,6 +111,9 @@
 - 当前代码让 encoder 输出直接进入 decoder cross-attention；因此逐层比较必须同时记录 forward activation、backward gradient 和 AdamW 后 parameter delta，只看总 loss 无法判断差异在哪一层被放大。
 - 取证包中真正的原始训练文件是 `repro/20260714_letter_base_single_sid/skill_gr_pipeline.original_20260714.py`，SHA-256=`7b883cb7f56667cdaee8bf0227470a2eba2c6882096dc07a2f8f1c6914396b76`。它与 commit `15f6c511...` 版本只差训练后加入的 eval-batch patch，catalog/query 训练逻辑相同；新 probe 仍应记录并校验所用文件 SHA。
 - 现有 RTX 取证只保存初始化 fingerprint、首批 row hash、step-1/50 loss，没有逐层 activation、gradient 或 step-1 parameter checkpoint。因此在 RTX 不可用时，无法直接定位 RTX/A800 的第一个具体算子；只能用确定的 A800 数值路径做敏感性定位，再以最终检索恢复验证。
+- Phase 5 optimizer-boundary v3 的八个 arm 全部通过 source/data/model/runtime/init、catalog-final model/optimizer/RNG、catalog/query 首批、query step-1 gradient/loss 与 reset transition 审计。job=`tide-chenyufei03-10597-gxpdl` 使用一个 `8×A800` 节点并行八个独立单卡进程，运行约 `29` 分钟、pod restart=`0`。
+- query lr=`2e-4` 时，carry/reset 的 `D_update`=`1.77980018117/1.51348570818`，step-50 backend loss gap=`0.100789546967/0.120325326920`；query lr=`3e-4` 时，对应值为 `1.74075836224/1.51135051239` 与 `0.120148658752/0.113351821899`。条件均为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、weight decay=`0`、dropout=`0.1`、外层 BF16，`D_update` 使用 CPU FP64。
+- reset 没有通过 `D_update` 与 step-50 loss gap 同时降低至少 `50%` 的门槛。catalog moments 对 backend 分叉有小幅贡献，完整检索结果仍需由 `workspace_16` 上的 query lr × optimizer-state full run 直接选择。
 
 ## 参考资料
 

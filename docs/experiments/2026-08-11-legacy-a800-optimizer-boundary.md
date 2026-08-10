@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 catalog-to-query optimizer boundary
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -24,16 +24,25 @@ Node log: v3 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_opti
 
 Bootstrap log: v3 `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_a800_optimizer_boundary_20260811_v3.log`
 
-Metrics: pending
+Metrics:
+
+| query lr | optimizer state | `D_update` | `D_update` reduction vs carry | step-50 loss gap | loss-gap reduction vs carry | 双 `50%` 门禁 |
+|---:|---|---:|---:|---:|---:|---|
+| `2e-4` | carry | `1.77980018117` | `0%` | `0.100789546967` | `0%` | fail |
+| `2e-4` | reset | `1.51348570818` | `14.9632%` | `0.120325326920` | `-19.3827%` | fail |
+| `3e-4` | carry | `1.74075836224` | `0%` | `0.120148658752` | `0%` | fail |
+| `3e-4` | reset | `1.51135051239` | `13.1786%` | `0.113351821899` | `5.6570%` | fail |
+
+表中条件统一为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query lr 与 optimizer state 按行、weight decay=`0`、dropout=`0.1`、外层 BF16；`D_update` 在 CPU FP64 上计算。
 
 ## Verification
 
 - [x] Minimal local check：26 项相关测试在 Python 3.10.12、torch 2.10.0+cu128 的冻结 runtime 下通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过
-- [ ] default catalog step-1/50 loss 命中 frozen A800 reference
-- [ ] catalog/query 首批 row hash 命中取证包 reference
-- [ ] 每个 backend 内四个 catalog-final model/optimizer/RNG/gradient hash exact
-- [ ] reset arm 在 query step 1 update 前 optimizer state entry count=`0`
-- [ ] 八个 arms 的 source/data/model/runtime/init provenance 对齐
+- [x] default catalog step-1/50 loss 命中 frozen A800 reference：`4.546923637390137/4.184666633605957`（A800 default BF16、catalog step=`1/50`、batch=`16`、seed=`20260626`、lr=`3e-4`、dropout=`0.1`）
+- [x] catalog/query 首批 row hash 命中取证包 reference：`721a0d93.../56995788...`（catalog/query 各自首批、batch=`16`、seed=`20260626`）
+- [x] 每个 backend 内四个 catalog-final model/optimizer/RNG/gradient hash exact（A800、catalog=`2,730` updates、batch=`16`、seed=`20260626`、lr=`3e-4`、dropout=`0.1`）
+- [x] reset arm 在 query step 1 update 前 optimizer state entry count=`0`（A800、query step=`1`、reset arms）
+- [x] 八个 arms 的 source/data/model/runtime/init provenance 对齐（Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`）
 - [x] Reviewer required? yes；structured local review 未发现阶段边界、AdamW reset、RNG、batch、state artifact 或八卡隔离的 CRITICAL/HIGH 问题；GPU 边界 invariant 仍是硬门禁
 
 ## Result / Notes
@@ -43,3 +52,6 @@ Metrics: pending
 - v1 的八个 arm 均完成 catalog=`2,730` updates 与 query=`50` updates（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`），随后统一失败于 post-run catalog row hash。根因是 wrapper 对 catalog row 误加了 `|positive_skill_id`；取证口径对 catalog 只 hash `index`，对 query 才 hash `index|positive_skill_id`。训练主体未失败，但 v1 未写出 state artifact，不能计算 `D_update`。
 - v2 已把 catalog/query row-id 口径显式分开，并把 hash 门禁前移到对应首批，避免再到训练结束才报错。v1 日志完整保留。
 - v2 八个 arm 的 catalog/query 首批 hash、observer call counts、optimizer transition、dropout 和 default step-1/50 loss 门禁均通过；随后 manifest 校验把 archived query-dev rows=`2,501` 误写成 `48,750`。v2 未写 state artifact，日志完整保留。v3 将 row-count contract 直接与 archived training manifest 对照测试。
+- v3 八个 arm 全部完成，job=`tide-chenyufei03-10597-gxpdl` 使用一个 `8×A800` 节点并行八个独立单卡进程，运行约 `29` 分钟、pod restart=`0`。matrix summary 与全部 state artifact 已写入 v3 输出目录。
+- reset 在 query lr=`2e-4` 时只把 `D_update` 降低 `14.9632%`，step-50 loss gap 反而增加 `19.3827%`；在 query lr=`3e-4` 时把 `D_update`/loss gap 分别降低 `13.1786%/5.6570%`。条件均为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`。
+- catalog AdamW moments 只贡献小幅 backend 放大，不能解释当前最终 Top-1 差距。下一步固定 `workspace_16` 跑 optimizer state=`{carry, reset}` × query lr=`{1e-4, 2e-4, 3e-4}` 的六个完整 query arms，并直接用 Official core75 75-query 选择。

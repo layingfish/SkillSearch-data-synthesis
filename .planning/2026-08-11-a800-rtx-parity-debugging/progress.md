@@ -170,3 +170,13 @@
 - manifest row-count contract 已集中为常量并新增与 archived training manifest 的回归测试；v3 使用新 output/bootstrap 目录，保留 v1/v2 日志。
 - v2 八个 arm 最终均只命中同一个 query-dev manifest 错误；job 全程 0 restarts，无训练异常。修复后的五个 legacy probe test modules 共 26 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
 - manifest contract 修复与 v3 launcher 提交为 commit `7e046bf4b85e811c842f8b26960f63cf4b4b9059`。Tianzhi dry-run 通过后已提交 v3 job=`tide-chenyufei03-10597-gxpdl`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`）。
+
+## 2026-08-11：Phase 5 optimizer-boundary 结果
+
+- v3 八个 arm 全部完成；job=`tide-chenyufei03-10597-gxpdl` 使用一个 `8×A800` 节点并行八个独立单卡进程，运行约 `29` 分钟、pod restart=`0`。
+- source/data/model/runtime/init、catalog-final model/optimizer/RNG、catalog/query 首批、query step-1 gradient/loss 与 reset transition 审计全部通过。default catalog step-1/50 loss=`4.546923637390137/4.184666633605957`（A800 default BF16、catalog step=`1/50`、batch=`16`、seed=`20260626`、lr=`3e-4`、dropout=`0.1`），精确命中 frozen reference。
+- query lr=`2e-4` 时，reset 相对 carry 的 `D_update` reduction=`14.9632%`，step-50 backend loss-gap reduction=`-19.3827%`；query lr=`3e-4` 时，对应值为 `13.1786%/5.6570%`。条件均为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、weight decay=`0`、dropout=`0.1`、外层 BF16。
+- reset 没有通过双 `50%` 门禁。catalog AdamW moments 只贡献小幅 backend 放大，Phase 5 转入固定 `workspace_16` 的完整 query 限定 sweep。
+- 完整 sweep 的六个 selection arms 为 optimizer state=`{carry, reset}` × query lr=`{1e-4,2e-4,3e-4}`；每个 arm 跑 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`，并用 Official core75=`75` queries、beam=`50`、beam-order 选择。
+- 同节点另外两张 A800 分别运行 `workspace_16/carry/query lr=3e-4` exact replica 与 `default/carry/query lr=3e-4` legacy anchor，只做确定性和历史结果对齐。
+- task plan 已重新 attestation，SHA-256 前缀=`14ebdfad4683`（Phase 5 full-query sweep 设计冻结）。
