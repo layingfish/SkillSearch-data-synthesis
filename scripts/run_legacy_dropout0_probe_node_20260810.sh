@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_REPO=/mnt/cfs_algo_bj/workspace/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v2
+OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v3
 RUNTIME_ROOT=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py311-v1
 PY310_RUNTIME_ROOT=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py310-v1
 PY310_RUNTIME_ARCHIVE="${PY310_RUNTIME_ROOT}/runtime.tar.zst"
@@ -109,45 +109,51 @@ check_sha256 "${SKILLGR_SKILLS}" "${SKILLGR_SKILLS_SHA256}"
 check_sha256 "${SKILLGR_SEMANTIC_IDS}" "${SKILLGR_SEMANTIC_IDS_SHA256}"
 check_sha256 "${BASE_MODEL}/model.safetensors" a90903540cc02cbeb7ff9f823f1a80eb778c7e22426a0e620b01c77a5ec8f5b4
 
-CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${CODE_ROOT}/scripts/legacy_runtime_matrix_probe.py" \
-  --arm dropout0_bf16 \
-  --legacy-source "${LEGACY_SOURCE}" \
-  --legacy-commit "${LEGACY_COMMIT}" \
-  --rows "${SKILLGR_ROWS}" \
-  --dev-rows "${SKILLGR_DEV_ROWS}" \
-  --skills-jsonl "${SKILLGR_SKILLS}" \
-  --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
+PROBE_REPO="${TEMP_ROOT}/probe-repo"
+CATALOG_BASE="${PROBE_REPO}/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713"
+mkdir -p "${CATALOG_BASE}"
+ln -s "${SKILLGR_ROWS%/canonical_alias_core75_learned_d4_inputs/*}/canonical_alias_core75_learned_d4_inputs" \
+  "${CATALOG_BASE}/canonical_alias_core75_learned_d4_inputs"
+ln -s "${SKILLGR_SEMANTIC_IDS%/letter_d4_lightgcn_d32_official_vecdiv_v1_seed42_core75_gt2/*}/letter_d4_lightgcn_d32_official_vecdiv_v1_seed42_core75_gt2" \
+  "${CATALOG_BASE}/letter_d4_lightgcn_d32_official_vecdiv_v1_seed42_core75_gt2"
+
+CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${CODE_ROOT}/scripts/run_dropout_zero_catalog_probe.py" \
+  --probe "${CODE_ROOT}/repro/20260714_letter_base_single_sid/catalog_50_probe.py" \
+  --audit "${OUTPUT_ROOT}/probe/dropout_audit.json" \
+  --repo-root "${PROBE_REPO}" \
   --model "${MODEL_SAFE}" \
-  --output-dir "${OUTPUT_ROOT}/probe" \
+  --batch-size 16 \
+  --max-source-length 2048 \
   --steps 1 \
   --seed 20260626 \
-  --precision bf16 \
-  --bf16-reduction auto \
-  --tf32-matmul auto \
-  --tf32-cudnn auto \
-  --float32-matmul-precision auto \
-  --foreach auto \
-  --preferred-blas auto \
-  --deterministic-algorithms auto \
-  --cublas-workspace-config auto \
-  --cuda-module-loading auto \
-  --dropout-rate 0.0
+  2>&1 | tee "${OUTPUT_ROOT}/logs/probe.log"
 
-"${PYTHON_BIN}" - "${OUTPUT_ROOT}/probe/runtime_probe.json" <<'PY'
+"${PYTHON_BIN}" - "${OUTPUT_ROOT}/logs/probe.log" "${OUTPUT_ROOT}/probe/dropout_audit.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if payload["losses"] != {"step_1": payload["losses"]["step_1"]}:
-    raise SystemExit(f"unexpected probe loss events: {payload['losses']}")
-child = payload["condition"]["child_effective_precision"]
-if child["dropout_module_count"] <= 0 or child["dropout_module_rates"] != [0.0]:
-    raise SystemExit(f"dropout override audit failed: {child}")
-if payload["initialization"]["legacy_state_fingerprint"] != "c219d07a2ac425cffd677cefc0792a81f47aa3ad9d0fa76a0bfa37cdf9f5ebde":
+log_path, audit_path = map(Path, sys.argv[1:3])
+events = []
+for line in log_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if line.startswith("{"):
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+header = next(row for row in events if row.get("event") == "probe_header")
+first_batch = next(row for row in events if row.get("event") == "first_batch")
+train = next(row for row in events if row.get("event") == "train" and row.get("step") == 1)
+audit = json.loads(audit_path.read_text(encoding="utf-8"))
+if audit["dropout_module_count"] <= 0 or audit["dropout_module_rates"] != [0.0]:
+    raise SystemExit(f"dropout override audit failed: {audit}")
+if header["source_sha256"] != "7b883cb7f56667cdaee8bf0227470a2eba2c6882096dc07a2f8f1c6914396b76":
+    raise SystemExit("original probe source mismatch")
+if header["initial_model_fingerprint"] != "c219d07a2ac425cffd677cefc0792a81f47aa3ad9d0fa76a0bfa37cdf9f5ebde":
     raise SystemExit("initial model fingerprint mismatch")
-if payload["first_catalog_batch"]["row_ids_sha256"] != "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443":
+if first_batch["row_ids_sha256"] != "721a0d93aaef2f9d0104adae8501fcfabcefcd6bd9f23c1e4a1aae701710d443":
     raise SystemExit("first catalog batch mismatch")
-print(json.dumps({"verification": "passed", "step_1": payload["losses"]["step_1"]}, sort_keys=True))
+print(json.dumps({"verification": "passed", "step_1": train["train_loss"]}, sort_keys=True))
 PY
 touch "${OUTPUT_ROOT}/probe.done"
