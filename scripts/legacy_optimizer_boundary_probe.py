@@ -69,6 +69,12 @@ EXPECTED_DEFAULT_CATALOG_LOSSES = {
     "catalog_step_1": 4.546923637390137,
     "catalog_step_50": 4.184666633605957,
 }
+EXPECTED_MANIFEST_ROW_COUNTS = {
+    "source_train_rows": 94912,
+    "query_train_rows": 124175,
+    "query_dev_rows": 2501,
+    "catalog_rows": 14551,
+}
 OPTIMIZER_MODES = ("carry", "reset")
 OPTIONAL_BOOL_CHOICES = ("auto", "true", "false")
 
@@ -582,10 +588,7 @@ def command_run(args: argparse.Namespace) -> None:
                     f"default {name} loss mismatch: expected={expected}, observed={observer.losses[name]}"
                 )
     expected_manifest = {
-        "source_train_rows": 94912,
-        "query_train_rows": 124175,
-        "query_dev_rows": 48750,
-        "catalog_rows": 14551,
+        **EXPECTED_MANIFEST_ROW_COUNTS,
         "catalog_steps": args.catalog_steps,
         "query_steps": args.query_steps,
         "batch_size": args.batch_size,

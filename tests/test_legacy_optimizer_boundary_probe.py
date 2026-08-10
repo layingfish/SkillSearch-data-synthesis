@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from scripts.analyze_legacy_optimizer_boundary_matrix import (
 )
 from scripts.legacy_optimizer_boundary_probe import (
     EXPECTED_CATALOG_FIRST_BATCH_SHA256,
+    EXPECTED_MANIFEST_ROW_COUNTS,
     EXPECTED_QUERY_FIRST_BATCH_SHA256,
     recursive_state_sha256,
     reset_optimizer_in_place,
@@ -21,6 +23,18 @@ from scripts.legacy_optimizer_boundary_probe import (
 
 
 class LegacyOptimizerBoundaryMetadataTest(unittest.TestCase):
+    def test_manifest_row_counts_match_archived_training_manifest(self):
+        manifest_path = (
+            Path(__file__).resolve().parents[1]
+            / "repro/20260714_letter_base_single_sid/archive/train/"
+            "single_sid_decoder_train_manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        observed = {
+            key: manifest.get(key) for key in EXPECTED_MANIFEST_ROW_COUNTS
+        }
+        self.assertEqual(observed, EXPECTED_MANIFEST_ROW_COUNTS)
+
     def test_archived_catalog_and_query_row_hashes(self):
         catalog_ids = [
             "catalog:other/services-layer",

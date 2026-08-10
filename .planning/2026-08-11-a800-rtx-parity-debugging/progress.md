@@ -164,3 +164,8 @@
 - 修复已让 catalog/query 显式选择 row-id 口径，并把 hash 比较前移到对应首批。focused optimizer-boundary tests 共 5 项在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下通过；v2 使用新 output/bootstrap 目录，保留 v1 日志。
 - 修复后的五个 legacy probe test modules 共 25 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
 - row-hash 口径修复与 v2 launcher 提交为 commit `f13c2de619824578661275ee7ad8152e466c6171`。Tianzhi dry-run 通过后已提交 v2 job=`tide-chenyufei03-10596-baniu`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`）。
+- v2 worker 已进入 Running（1/1 ready、0 restarts）；冻结 runtime 与八卡 preflight 通过。八个 arm 的 catalog 首批 row hash 前置门禁全部通过，并同步完成 catalog step `200/2730`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`）。
+- v2 四个 default arm 完成 catalog=`2,730` updates 与 query=`50` updates（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`），并通过 catalog/query 首批 hash、observer、optimizer transition、dropout 和 frozen default loss 门禁；随后统一失败于 manifest 的 query-dev row count。
+- 第二个根因是 wrapper 误写 expected query-dev rows=`48,750`；archived training manifest、exact-runtime dev JSONL 与 source-length audit 均为 `2,501` rows。训练主体未失败，但 v2 仍未落 state artifact。
+- manifest row-count contract 已集中为常量并新增与 archived training manifest 的回归测试；v3 使用新 output/bootstrap 目录，保留 v1/v2 日志。
+- v2 八个 arm 最终均只命中同一个 query-dev manifest 错误；job 全程 0 restarts，无训练异常。修复后的五个 legacy probe test modules 共 26 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。

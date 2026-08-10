@@ -10,7 +10,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: v1 job=`tide-chenyufei03-10595-comjs`，launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`，八个 arm 完成训练后被 wrapper 的 catalog row-hash 口径错误拒绝。v2 job=`tide-chenyufei03-10596-baniu`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`f13c2de619824578661275ee7ad8152e466c6171`。
+Train: v1 job=`tide-chenyufei03-10595-comjs` 因 wrapper 的 catalog row-hash 口径错误失败。v2 job=`tide-chenyufei03-10596-baniu`，launch commit=`f13c2de619824578661275ee7ad8152e466c6171`，因 wrapper 的 query-dev manifest 期望行数错误失败。v3 待提交；queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
 
 每个 arm 的 catalog 固定 2,730 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0.1、外层 BF16、AdamW foreach=None。query 固定前 50 updates、batch=16、dropout=0.1；只改变 optimizer state 和 query lr。
 
@@ -18,17 +18,17 @@ Eval: 在 CPU FP64 上计算 `D_update = ||delta_default - delta_workspace||_2 /
 
 ## Outputs
 
-Artifacts: v2 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_optimizer_boundary_20260811_v2/`
+Artifacts: v3 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_optimizer_boundary_20260811_v3/`
 
-Node log: v2 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_optimizer_boundary_20260811_v2/logs/node.log`
+Node log: v3 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_optimizer_boundary_20260811_v3/logs/node.log`
 
-Bootstrap log: v2 `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_a800_optimizer_boundary_20260811_v2.log`
+Bootstrap log: v3 `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/legacy_a800_optimizer_boundary_20260811_v3.log`
 
 Metrics: pending
 
 ## Verification
 
-- [x] Minimal local check：25 项相关测试在 Python 3.10.12、torch 2.10.0+cu128 的冻结 runtime 下通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过
+- [x] Minimal local check：26 项相关测试在 Python 3.10.12、torch 2.10.0+cu128 的冻结 runtime 下通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过
 - [ ] default catalog step-1/50 loss 命中 frozen A800 reference
 - [ ] catalog/query 首批 row hash 命中取证包 reference
 - [ ] 每个 backend 内四个 catalog-final model/optimizer/RNG/gradient hash exact
@@ -42,3 +42,4 @@ Metrics: pending
 - post-run last/final checkpoint save 被 observer 抑制；每个 arm 只保存 catalog-final 与 query-step-50 trainable state，供 `D_update` 精确计算。
 - v1 的八个 arm 均完成 catalog=`2,730` updates 与 query=`50` updates（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`），随后统一失败于 post-run catalog row hash。根因是 wrapper 对 catalog row 误加了 `|positive_skill_id`；取证口径对 catalog 只 hash `index`，对 query 才 hash `index|positive_skill_id`。训练主体未失败，但 v1 未写出 state artifact，不能计算 `D_update`。
 - v2 已把 catalog/query row-id 口径显式分开，并把 hash 门禁前移到对应首批，避免再到训练结束才报错。v1 日志完整保留。
+- v2 八个 arm 的 catalog/query 首批 hash、observer call counts、optimizer transition、dropout 和 default step-1/50 loss 门禁均通过；随后 manifest 校验把 archived query-dev rows=`2,501` 误写成 `48,750`。v2 未写 state artifact，日志完整保留。v3 将 row-count contract 直接与 archived training manifest 对照测试。
