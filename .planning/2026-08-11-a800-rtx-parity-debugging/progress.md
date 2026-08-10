@@ -112,5 +112,10 @@
 - v2 八个 arm 全部完成；每个 traced arm 保存 573 个 artifacts，matrix analyzer 报 `pair_equivalence_passed=true`。job `tide-chenyufei03-10590-tdbdv` 在约 8 分 47 秒完成，0 restarts。
 - Phase 1 结论：default/workspace16/cuBLASLt 的 embedding 与 encoder 输出 exact；首个 BF16 backend 分叉统一位于 `decoder.block.0`，并在 decoder blocks 1–2 放大。完整数值已写入 findings 与 experiment note。
 - Phase 1 标记 done；Phase 2 标记 in_progress，继续实施 default/workspace16 × `{BF16 control, encoder FP32, decoder FP32, heads+CE FP32}` 的八个 50-step arm。
-- 尚未完成本地测试、focused review、commit 或 GPU 提交。
-- 状态更新为 Phase 1 `in_progress`；GPU job 尚未提交。
+- 已创建 Phase 2 experiment note。
+- 已实现 `legacy_local_fp32_probe.py`、matrix analyzer、八卡 node launcher、Tianzhi bootstrap 和 6 项 focused unit tests。
+- Phase 2 相关 19 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 检查和 `git diff --check` 通过。
+- Phase 1 dtype audit 确认 `heads_ce` arm 仍覆盖 BF16 head outputs 与 BF16 CE logits；SID embedding 已是 FP32，因此该子模块的局部包装预期为 no-op。
+- structured local review 已逐项检查 model factory 注入点、autocast 边界、CE patch 时机、50-step 调用次数、初始化/最终参数捕获、default/workspace provenance、CPU FP64 距离和八卡进程隔离。未发现 CRITICAL/HIGH 问题。
+- analyzer 对零 control metric 改为明确失败，避免把未定义的 reduction 写成非标准 JSON 数值；新增正负边界断言后，19 项相关测试再次全部通过（冻结的 Python 3.10.12 + torch 2.10.0 runtime）。
+- Phase 2 尚待 commit 和 GPU 提交。

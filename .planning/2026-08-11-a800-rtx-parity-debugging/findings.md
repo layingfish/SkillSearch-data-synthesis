@@ -90,6 +90,9 @@
 - cuBLASLt 相对 default 的 decoder relative L2 从 block 0 的 `0.001219331` 增至 block 1 的 `0.003668086`（`3.0083×`）和 block 2 的 `0.006265732`（`1.7082×`）；最大 activation relative L2 是 control head 的 `0.009643726`。条件同上，仅候选 backend 为 cuBLASLt。
 - workspace16/cuBLASLt 的最大 gradient relative L2 为 `0.126297/0.428937`，最大 update relative L2 为 `0.269945/0.530078`；条件均为上述 one-step trace。encoder activation 虽然 exact，encoder gradient 仍会因 decoder 分叉经反向传播而变化，因此 gradient 排名不能推翻 forward 首差异位于 decoder 的证据。
 - 全 FP32 相对 default BF16 从 `encoder.block.0` 开始分叉，最大 activation/gradient/update relative L2=`0.706401/2.941832/1.584453`；条件为同一 A800 one-step 数据与优化配置，仅 precision 为 FP32。这反映全局 precision 改变，不能用于定位 BF16 backend 的首个分叉。
+- Phase 2 wrapper 直接包装 archived `catalog_50_probe.py`。局部区域内部使用 `autocast(enabled=False)`，只把浮点输入转为 FP32；输出保持模块真实 dtype，交给外层 autocast 决定后续算子精度。
+- Phase 2 每个 arm 保存 trainable final state 和相对同一初始化的 squared L2 distance。matrix analyzer 以 CPU FP64 计算 default/workspace16 的 `D_param`，同时比较 step-50 loss gap 与 peak GPU memory。
+- Phase 1 dtype trace 显示 SID embedding 输入/输出为 int64/FP32，四个 code head 与 control head 输入/输出为 FP32/BF16，五次 CE 输入为 BF16 logits + int64 labels、输出为 FP32；条件为 A800 default BF16、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、updates=1、trace=on。因此 Phase 2 的 `heads_ce` arm 主要测试 head GEMM、logit 量化和 FP32 logits 上的 CE，SID embedding 包装本身预期为 no-op。
 - `scripts/legacy_runtime_matrix_probe.py` 会从 commit `15f6c51131f3b6f3e8580aa4564b17cbe13a9790` 解包并在子进程运行 `skill_gr_pipeline.py`；固定检查 catalog rows=14,551、batch=16、lr=3e-4、weight decay=0 和最多 50 个 catalog updates。
 - 新诊断应继续从该 archived commit 解包源码，并把 instrumentation 放在外层 wrapper；这样能保持 legacy 训练主体的 hash 与语义不变。
 - structured decoder 的关键路径可拆成 `backbone.encoder`、`sid_embedding`、`backbone.decoder`、四个 position-specific `code_heads`、`control_head` 和 CE reduction。局部精度实验应先记录这些边界的实际 dtype，再决定是否强制 FP32。
