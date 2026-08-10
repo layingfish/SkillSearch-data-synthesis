@@ -169,3 +169,4 @@
 - 第二个根因是 wrapper 误写 expected query-dev rows=`48,750`；archived training manifest、exact-runtime dev JSONL 与 source-length audit 均为 `2,501` rows。训练主体未失败，但 v2 仍未落 state artifact。
 - manifest row-count contract 已集中为常量并新增与 archived training manifest 的回归测试；v3 使用新 output/bootstrap 目录，保留 v1/v2 日志。
 - v2 八个 arm 最终均只命中同一个 query-dev manifest 错误；job 全程 0 restarts，无训练异常。修复后的五个 legacy probe test modules 共 26 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
+- manifest contract 修复与 v3 launcher 提交为 commit `7e046bf4b85e811c842f8b26960f63cf4b4b9059`。Tianzhi dry-run 通过后已提交 v3 job=`tide-chenyufei03-10597-gxpdl`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`）。
