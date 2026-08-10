@@ -217,3 +217,5 @@ D_param = ||theta_default - theta_workspace||_2 / ||theta_default - theta_init||
 | 本地 `uv` 环境缺少 torch，tensor 单测首次启动失败 | 使用已冻结的 Python 3.10 + torch 2.10.0 runtime 做 CPU 单测；GPU hook/invariant 继续在 `8×A800` preflight 验证 |
 | 首次解包本地 frozen runtime 的命令因包含临时目录递归清理而被执行器拒绝 | 改用唯一 `/tmp` 目录且不在命令内删除；依靠临时文件系统生命周期回收，不绕过安全策略 |
 | Python 3.10 frozen runtime 单独加载 torch 时缺少 `libcudnn.so.9` | launcher 与本地测试叠加已校验的 Python 3.11 site archive，仅从中提供 NVIDIA shared libraries；Python 与 torch 仍使用冻结的 3.10 runtime |
+| Tianzhi `submit.sh --help` 返回 unknown option | 直接读取 skill 自带脚本的 usage/参数解析，随后 dry-run 验证 resolved request，再正式提交 |
+| Phase 1 v1 四个 traced arm 在训练后均报告缺失 `shared_embedding` boundary | hook 从未被调用的 `backbone.shared` 改到实际 encoder 路径 `backbone.encoder.embed_tokens`；新增回归测试，v1 结果保留并以 v2 新目录重跑 |

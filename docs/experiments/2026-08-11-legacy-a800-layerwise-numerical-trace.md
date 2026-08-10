@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 layerwise numerical trace
-Status: planned
+Status: failed
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -18,6 +18,16 @@ bash scripts/run_legacy_layerwise_trace_tianzhi_20260811.sh
 
 Tianzhi submission uses one `8×A800` node on `rudder-exper` with image `chenyufei03/skillsearch-gr:cu128-torch28-v1`. The bootstrap receives the verified launch commit through `SKILLGR_LAUNCH_COMMIT` and runs from a temporary archived checkout.
 
+Submitted request:
+
+```text
+jobID=tide-chenyufei03-10589-irhff
+queue=rudder-exper
+nodes=1
+image=chenyufei03/skillsearch-gr:cu128-torch28-v1
+launch_commit=ed1527ad8e1893b41998638df9f471d8b7e2f2d2
+```
+
 The node launcher starts eight single-GPU arms: default BF16, `CUBLAS_WORKSPACE_CONFIG=:16:8` BF16, cuBLASLt BF16, and FP32; each path has `trace=on/off`. Every arm uses catalog first batch, batch=16, seed=20260626, lr=3e-4, weight decay=0, dropout=0, updates=1.
 
 Eval: 对四组 `trace=on/off` 配对检查 loss、optimizer 后参数与 provenance；对四个 traced arm 生成逐层差异报告。
@@ -26,7 +36,9 @@ Eval: 对四组 `trace=on/off` 配对检查 loss、optimizer 后参数与 proven
 
 Checkpoint: none；one-step model states are represented by region SHA-256 and raw parameter-update tensors, not retained training checkpoints.
 
-Artifacts: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_layerwise_trace_20260811_v1/`
+Artifacts (failed v1): `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_layerwise_trace_20260811_v1/`
+
+Artifacts (v2 retry): `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_layerwise_trace_20260811_v2/`
 
 Log: `/models_rw/SkillSearch-data-synthesis/logs/legacy_a800_layerwise_trace_20260811_v1.log`
 
@@ -45,3 +57,6 @@ Metrics: pending
 - 用户指定队列为 `rudder-exper`。
 - 单节点八张 A800 分配给八个独立单卡 arm；不使用 DDP，避免改变 archived 单卡训练语义。
 - default BF16 control 必须精确复现 step-1 loss=`4.554369926452637`（A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、default backend）。
+- `tide-chenyufei03-10589-irhff` 已提交，等待 pod 启动。
+- v1 四个 control arms 均完成。四个 traced arms 均完成 one-step loss，但 post-run validation 一致报 `shared_embedding` boundary 缺失。
+- v1 根因：hook 注册在 `backbone.shared`，实际 encoder 调用 `backbone.encoder.embed_tokens`。已修正并增加 regression test；v2 将使用全新输出目录和 job name。

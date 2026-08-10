@@ -65,6 +65,34 @@ class LegacyLayerwiseTraceTensorTest(unittest.TestCase):
             self.assertFalse(torch.equal(before, model.weight.detach()))
             self.assertTrue(recorder.activation_records[0]["outputs"][0]["artifact"])
 
+    def test_attach_model_hooks_encoder_token_embedding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = torch.nn.Module()
+            model.backbone = torch.nn.Module()
+            model.backbone.shared = torch.nn.Embedding(8, 2)
+            model.backbone.encoder = torch.nn.Module()
+            model.backbone.encoder.embed_tokens = torch.nn.Embedding(8, 2)
+            model.backbone.encoder.block = torch.nn.ModuleList(
+                torch.nn.Identity() for _ in range(12)
+            )
+            model.backbone.decoder = torch.nn.Module()
+            model.backbone.decoder.block = torch.nn.ModuleList(
+                torch.nn.Identity() for _ in range(12)
+            )
+            model.sid_embedding = torch.nn.Embedding(8, 2)
+            model.code_heads = torch.nn.ModuleList(
+                torch.nn.Linear(2, 8) for _ in range(4)
+            )
+            model.control_head = torch.nn.Linear(2, 2)
+
+            recorder = TraceRecorder(
+                TensorArtifactWriter(Path(directory)), enabled=True
+            )
+            recorder.attach_model(model)
+            model.backbone.encoder.embed_tokens(torch.tensor([[1, 2]]))
+            self.assertEqual(recorder.module_calls["shared_embedding"], 1)
+            self.assertNotIn("backbone.shared", recorder.module_calls)
+
     def test_relative_l2(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -81,6 +81,9 @@
 - Python 3.10 runtime archive 不含 `site/nvidia` shared libraries；直接导入 torch 会报 `libcudnn.so.9` 缺失。最新 dropout launcher 的有效组合是 Python 3.10 runtime site + Python 3.11 site archive 中的 NVIDIA libraries，Phase 1 launcher 已同步采用该组合。
 - 项目已验证的 Tianzhi 镜像是 `chenyufei03/skillsearch-gr:cu128-torch28-v1`；launcher 会在容器内覆盖为冻结的 Python 3.10 + torch 2.10 runtime，因此镜像自带 torch 2.8 不参与诊断训练。
 - default BF16 control 增加已归档 dropout=0 step-1 loss 精确门禁：`4.554369926452637`（catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、A800 default backend）。这能直接验证新 wrapper 没有改变已取证行为。
+- Phase 1 live default BF16 control 已命中该精确门禁：step-1 loss=`4.554369926452637`，initial fingerprint=`c219d07a...`，first-batch SHA-256=`721a0d93...`，final state SHA-256=`12661000...`；条件为 A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、default backend、trace=off。
+- 其余 live control 的 step-1 loss/final-state SHA-256 为 workspace16 BF16=`4.554419040679932/38fc4c38...`、cuBLASLt BF16=`4.554467678070068/70d2e435...`、FP32=`4.536993980407715/0a9c687e...`；条件均为 A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、trace=off，仅 backend/precision 按名称变化。
+- Phase 1 v1 四个 traced arm 都完成了 one-step forward/backward，并复现各自 control loss，但在 post-run validation 一致缺失 `shared_embedding`。实际 token embedding 调用路径是 `backbone.encoder.embed_tokens`；`backbone.shared` 只共享权重，未触发注册在该 module object 上的 hook。
 - `scripts/legacy_runtime_matrix_probe.py` 会从 commit `15f6c51131f3b6f3e8580aa4564b17cbe13a9790` 解包并在子进程运行 `skill_gr_pipeline.py`；固定检查 catalog rows=14,551、batch=16、lr=3e-4、weight decay=0 和最多 50 个 catalog updates。
 - 新诊断应继续从该 archived commit 解包源码，并把 instrumentation 放在外层 wrapper；这样能保持 legacy 训练主体的 hash 与语义不变。
 - structured decoder 的关键路径可拆成 `backbone.encoder`、`sid_embedding`、`backbone.decoder`、四个 position-specific `code_heads`、`control_head` 和 CE reduction。局部精度实验应先记录这些边界的实际 dtype，再决定是否强制 FP32。

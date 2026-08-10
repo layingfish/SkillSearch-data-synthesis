@@ -211,7 +211,7 @@ class TraceRecorder:
                 f"encoder={len(encoder_blocks)}, decoder={len(decoder_blocks)}, "
                 f"code_heads={len(code_heads)}"
             )
-        self.register_module("shared_embedding", model.backbone.shared)
+        self.register_module("shared_embedding", model.backbone.encoder.embed_tokens)
         for index, block in enumerate(encoder_blocks):
             self.register_module(f"encoder.block.{index}", block)
         self.register_module("sid_embedding", model.sid_embedding)

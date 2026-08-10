@@ -30,7 +30,7 @@
 | GPU job | 未启动 |
 | `git diff --check` | 通过 |
 | worktree 变化 | 仅新增 `.planning/` 独立计划目录 |
-| plan attestation | SHA-256 前缀 `1456bbfa83db`，已包含 Phase 1 启动状态与当前错误记录 |
+| plan attestation | SHA-256 前缀 `5b0ac1c68d07`，已包含 Phase 1 v1 failure 与 v2 修复 |
 
 ## 2026-08-11：评测选择策略调整
 
@@ -81,5 +81,23 @@
 - 提交前 focused local review 未发现训练顺序、autocast、dropout、optimizer 或数据顺序语义偏移。trace=off 保留 archived probe 路径；trace=on 只增加 forward hooks、CE observer 与 AdamW.step 前后快照。最终结论仍由 GPU 上的精确等价门禁决定。
 - 提交前完整相关测试覆盖新 trace、runtime matrix、baseline parity 与 controlled wrapper，共 12 项测试在 frozen Python 3.10.12 + torch 2.10.0 runtime 下通过；`py_compile`、`bash -n`、可用时的 `shellcheck`、trailing-whitespace 检查和 `git diff --cached --check` 通过。
 - staged scope 仅包含独立 A800/RTX 计划、Phase 1 experiment note、两个 Python 诊断脚本、两个 launcher 和一份 focused test；未包含数据、checkpoint、runtime archive 或本地日志。
+- Phase 1 实现已提交为 commit `ed1527ad8e1893b41998638df9f471d8b7e2f2d2`；提交前 worktree 仅含上述 scoped files。
+- `submit.sh` 不支持 `--help`，一次只读帮助尝试返回 unknown option；读取脚本 usage 后完成 dry-run，resolved request 为 queue=`rudder-exper`、nodes=1、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
+- GPU job 已提交：`tide-chenyufei03-10589-irhff`，一个 `8×A800` 节点，launch commit=`ed1527ad8e1893b41998638df9f471d8b7e2f2d2`。状态待启动。
+- `tide-chenyufei03-10589-irhff-worker-0` 在提交后约 34 秒进入 Running（1/1 ready、0 restarts）；bootstrap log 已在 CFS 创建，arm 输出目录尚未出现。
+- 集群 runtime preflight 通过：Python 3.10.12、torch 2.10.0+cu128、CUDA 12.8、cuDNN 91002、Transformers 5.3.0、Tokenizers 0.22.2，节点可见 8 张 GPU。
+- GPU 0–7 已分别启动 default BF16、workspace16 BF16、cuBLASLt BF16、FP32 的 control/trace 八个单卡进程；pod 保持 Running、0 restarts。
+- 九份 node/arm log 已在 CFS 创建。首次 arm 日志检查仅见非阻塞 Hugging Face deprecation warning，尚未输出 probe header；进程仍在 archived 全量 source-length audit/模型初始化阶段。
+- 运行约 2 分 41 秒时 pod 仍为 Running（1/1 ready、0 restarts）；node log 尚无 arm 完成事件。
+- default BF16 control 已完成并精确复现 archived dropout=0 step-1 loss=`4.554369926452637`（A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、trace=off）；initial fingerprint 与 first-batch hash 同时通过。
+- 同路径 traced arm 已完成 provenance/header 与 first-batch 阶段，正在执行 forward/backward 和 tensor artifact 写入。
+- 四个 control arm 已全部完成；workspace16 BF16、cuBLASLt BF16、FP32 的 step-1 loss 分别为 `4.554419040679932/4.554467678070068/4.536993980407715`（A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、trace=off，各自 backend/precision 如名称）。
+- 当前九份日志未发现 Traceback、OOM、磁盘不足或 arm failure；四个 traced arm 继续写 tensor artifacts。
+- 运行约 5 分 12 秒时四个 control JSON 已落盘；四个 traced JSON 尚未落盘，pod 仍为 Running（1/1 ready、0 restarts），日志仍无错误。trace 进程在逐参数 hash/save 阶段不会持续打印进度。
+- Phase 1 v1 四个 traced arm 在完成 step-1 后均失败于同一 post-run validation：`trace missed expected boundaries: ['shared_embedding']`。没有 OOM、NaN 或训练失败；各 traced arm 的 loss 已正常输出。
+- 根因是 hook 注册在未被 encoder forward 调用的 `backbone.shared` module object；已改为 `backbone.encoder.embed_tokens`，并新增专门的 CPU 回归测试。
+- retry 使用新的 output/bootstrap 目录 `legacy_a800_layerwise_trace_20260811_v2`，保留 v1 全部日志与四个 control JSON。
+- hook 修复后的相关测试增至 13 项，并在 frozen Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、`git diff --check` 同时通过。
+- v1 pod 已退出并被集群清理；无需取消。v2 尚未提交。
 - 尚未完成本地测试、focused review、commit 或 GPU 提交。
 - 状态更新为 Phase 1 `in_progress`；GPU job 尚未提交。

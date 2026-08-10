@@ -4,7 +4,7 @@ set -euo pipefail
 CODE_ROOT="$(pwd)"
 PHYSICAL_REPO=/mnt/cfs_algo_bj/workspace/chenyufei03/SkillSearch-data-synthesis
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/legacy_a800_layerwise_trace_20260811_v1"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/legacy_a800_layerwise_trace_20260811_v2"
 PY310_RUNTIME_ROOT=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py310-v1
 PY310_RUNTIME_ARCHIVE="${PY310_RUNTIME_ROOT}/runtime.tar.zst"
 PY310_RUNTIME_ARCHIVE_SHA256=6102937effeaf983f44455c47adfce34ef2adc1afffcef6f5c6193288bb36b72
