@@ -93,6 +93,10 @@
 - Phase 2 wrapper 直接包装 archived `catalog_50_probe.py`。局部区域内部使用 `autocast(enabled=False)`，只把浮点输入转为 FP32；输出保持模块真实 dtype，交给外层 autocast 决定后续算子精度。
 - Phase 2 每个 arm 保存 trainable final state 和相对同一初始化的 squared L2 distance。matrix analyzer 以 CPU FP64 计算 default/workspace16 的 `D_param`，同时比较 step-50 loss gap 与 peak GPU memory。
 - Phase 1 dtype trace 显示 SID embedding 输入/输出为 int64/FP32，四个 code head 与 control head 输入/输出为 FP32/BF16，五次 CE 输入为 BF16 logits + int64 labels、输出为 FP32；条件为 A800 default BF16、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、updates=1、trace=on。因此 Phase 2 的 `heads_ce` arm 主要测试 head GEMM、logit 量化和 FP32 logits 上的 CE，SID embedding 包装本身预期为 no-op。
+- Phase 2 的 BF16 control/encoder FP32/decoder FP32/heads+CE FP32 `D_param` 为 `1.04082965952/1.11710764746/0.888190704721/0.989632963297`；相对 control 的 reduction 为 `0%/-7.3286%/14.6651%/4.9188%`。条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0、CPU FP64 参数距离。
+- 同四个区域的 step-50 loss gap 为 `0.0297207832336/0.0211133956909/0.0140085220337/0.00123596191406`，相对 control 的 reduction 为 `0%/28.9608%/52.8662%/95.8414%`；条件同上。四组 pair 的 source/data/model/runtime/first-batch/init/RNG audit 全部通过。
+- Phase 2 没有区域达到 `D_param` 与 loss gap 同时降低至少 `50%`。decoder 对参数轨迹最有效，heads+CE 对标量 loss gap 最有效；两种信号分离说明敏感性至少跨 decoder 内部传播与输出/loss 路径，下一轮需要测试 decoder 半区和 decoder+heads/CE 联合边界。
+- Phase 3 跨 job control audit 允许诊断 wrapper hash 与临时路径/GPU UUID 变化，但要求 archived pipeline、数据、model、训练合同、precision、dropout、稳定 runtime 字段、first batch、初始化和 RNG 全部一致。这样可复用 Phase 2 control，同时明确记录新旧 probe hash。
 - `scripts/legacy_runtime_matrix_probe.py` 会从 commit `15f6c51131f3b6f3e8580aa4564b17cbe13a9790` 解包并在子进程运行 `skill_gr_pipeline.py`；固定检查 catalog rows=14,551、batch=16、lr=3e-4、weight decay=0 和最多 50 个 catalog updates。
 - 新诊断应继续从该 archived commit 解包源码，并把 instrumentation 放在外层 wrapper；这样能保持 legacy 训练主体的 hash 与语义不变。
 - structured decoder 的关键路径可拆成 `backbone.encoder`、`sid_embedding`、`backbone.decoder`、四个 position-specific `code_heads`、`control_head` 和 CE reduction。局部精度实验应先记录这些边界的实际 dtype，再决定是否强制 FP32。

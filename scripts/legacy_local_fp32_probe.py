@@ -53,7 +53,24 @@ except ModuleNotFoundError:
     )
 
 
-REGIONS = ("none", "encoder", "decoder", "heads_ce")
+PHASE2_REGIONS = ("none", "encoder", "decoder", "heads_ce")
+PHASE3_REGIONS = (
+    "decoder_blocks_0_5",
+    "decoder_blocks_6_11",
+    "decoder_heads_ce",
+    "decoder_blocks_0_5_heads_ce",
+)
+REGIONS = PHASE2_REGIONS + PHASE3_REGIONS
+HEADS_CE_REGIONS = {
+    "heads_ce",
+    "decoder_heads_ce",
+    "decoder_blocks_0_5_heads_ce",
+}
+DECODER_BLOCK_REGIONS = {
+    "decoder_blocks_0_5": range(0, 6),
+    "decoder_blocks_6_11": range(6, 12),
+    "decoder_blocks_0_5_heads_ce": range(0, 6),
+}
 OPTIONAL_BOOL_CHOICES = ("auto", "true", "false")
 
 
@@ -103,14 +120,22 @@ class LocalFP32Controller:
         self.initial_parameters: dict[str, Any] = {}
         self.call_counts: dict[str, int] = {}
         self.dtype_audit: dict[str, dict[str, Any]] = {}
+        self.expected_calls_per_step: dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
         return self.region != "none"
 
+    @property
+    def includes_heads_ce(self) -> bool:
+        return self.region in HEADS_CE_REGIONS
+
     def wrap_module(self, name: str, module: Any) -> None:
         import torch
 
+        if name in self.expected_calls_per_step:
+            raise ValueError(f"duplicate local FP32 module wrapper: {name}")
+        self.expected_calls_per_step[name] = 1
         original_forward = module.forward
 
         def local_fp32_forward(*args: Any, **kwargs: Any) -> Any:
@@ -136,6 +161,9 @@ class LocalFP32Controller:
         import torch
 
         name = "cross_entropy"
+        if name in self.expected_calls_per_step:
+            raise ValueError(f"duplicate local FP32 function wrapper: {name}")
+        self.expected_calls_per_step[name] = 5
 
         def local_fp32_cross_entropy(
             logits: Any,
@@ -162,6 +190,14 @@ class LocalFP32Controller:
 
         return local_fp32_cross_entropy
 
+    def wrap_heads_ce_modules(self, model: Any) -> None:
+        self.wrap_module("sid_embedding", model.sid_embedding)
+        for index, head in enumerate(model.code_heads):
+            self.wrap_module(f"code_head.{index}", head)
+        if model.dedup_head is not None:
+            self.wrap_module("dedup_head", model.dedup_head)
+        self.wrap_module("control_head", model.control_head)
+
     def remember_model(self, model: Any) -> Any:
         self.model = model
         self.initial_parameters = {
@@ -171,15 +207,16 @@ class LocalFP32Controller:
         }
         if self.region == "encoder":
             self.wrap_module("backbone.encoder", model.backbone.encoder)
-        elif self.region == "decoder":
+        elif self.region in {"decoder", "decoder_heads_ce"}:
             self.wrap_module("backbone.decoder", model.backbone.decoder)
-        elif self.region == "heads_ce":
-            self.wrap_module("sid_embedding", model.sid_embedding)
-            for index, head in enumerate(model.code_heads):
-                self.wrap_module(f"code_head.{index}", head)
-            if model.dedup_head is not None:
-                self.wrap_module("dedup_head", model.dedup_head)
-            self.wrap_module("control_head", model.control_head)
+        elif self.region in DECODER_BLOCK_REGIONS:
+            blocks = model.backbone.decoder.block
+            if len(blocks) != 12:
+                raise ValueError(f"expected 12 decoder blocks, found {len(blocks)}")
+            for index in DECODER_BLOCK_REGIONS[self.region]:
+                self.wrap_module(f"backbone.decoder.block.{index}", blocks[index])
+        if self.includes_heads_ce:
+            self.wrap_heads_ce_modules(model)
         return model
 
     def validate(self, expected_steps: int) -> None:
@@ -187,17 +224,10 @@ class LocalFP32Controller:
             if self.call_counts or self.dtype_audit:
                 raise ValueError("precision gate is off but local FP32 calls were recorded")
             return
-        if self.region == "encoder":
-            expected = {"backbone.encoder": expected_steps}
-        elif self.region == "decoder":
-            expected = {"backbone.decoder": expected_steps}
-        else:
-            expected = {
-                "sid_embedding": expected_steps,
-                **{f"code_head.{index}": expected_steps for index in range(4)},
-                "control_head": expected_steps,
-                "cross_entropy": expected_steps * 5,
-            }
+        expected = {
+            name: expected_steps * calls_per_step
+            for name, calls_per_step in self.expected_calls_per_step.items()
+        }
         if self.call_counts != expected:
             raise ValueError(
                 f"local FP32 call counts mismatch: expected={expected}, actual={self.call_counts}"
@@ -282,7 +312,7 @@ def command_run(args: argparse.Namespace) -> None:
 
     torch.nn.Dropout = ControlledDropout
     original_cross_entropy = functional.cross_entropy
-    if args.region == "heads_ce":
+    if controller.includes_heads_ce:
         functional.cross_entropy = controller.wrap_cross_entropy(original_cross_entropy)
 
     original_adamw = torch.optim.AdamW

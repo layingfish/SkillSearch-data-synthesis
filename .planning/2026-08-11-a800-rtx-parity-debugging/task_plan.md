@@ -8,8 +8,8 @@
 
 ## 当前状态
 
-- 状态：`in_progress`；正在实现 Phase 1，尚未提交 GPU 作业。
-- 当前阶段：Phase 2，局部 FP32 高层二分。
+- 状态：`in_progress`；Phase 2 已完成，四个高层区域均未通过双门禁。
+- 当前阶段：Phase 3，敏感模块细分。
 - 风险：训练与 checkpoint 语义属于 Tier 2；局部 autocast wrapper 必须通过关闭开关时的端到端等价检查。
 
 ## 固定条件
@@ -102,13 +102,24 @@ D_param = ||theta_default - theta_workspace||_2 / ||theta_default - theta_init||
 
 如果多个区域通过，优先选择 FP32 参数量、峰值显存和运行开销更小的区域。
 
-- **Status：in_progress**
+- **Status：done**
 
 ## Phase 3：敏感模块细分
 
-只细分 Phase 2 排名最高的区域，最多两轮，避免无边界搜索。
+只围绕 Phase 2 排名最高的 decoder 路径做最多两轮，避免无边界搜索。Phase 2 中 decoder FP32 的 `D_param` reduction=`14.6651%`、loss-gap reduction=`52.8662%`；heads+CE FP32 的对应值为 `4.9188%/95.8414%`。条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0。
 
-- encoder/decoder：先比较 blocks 0–5 与 6–11，再在命中半区比较 attention 与 FFN；必要时细到单个 block。
+第一轮在一个 `8×A800` 节点运行四组 default/workspace16 pair，每个 arm 沿用同一 50-step、dropout=0 protocol：
+
+| 局部 FP32 区域 | 目的 |
+|---|---|
+| decoder blocks 0–5 | 验证首个分叉所在前半区 |
+| decoder blocks 6–11 | 排除后半区独立放大 |
+| full decoder + heads/CE | 验证 decoder 与输出/loss 路径的联合敏感性 |
+| decoder blocks 0–5 + heads/CE | 测试更小的联合区域 |
+
+Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 analyzer 必须验证 source/data/model/runtime/first-batch/init/RNG 与该 control 对齐。
+
+- decoder：先比较 blocks 0–5 与 6–11；若半区命中，再在第二轮比较 attention 与 FFN，必要时细到单个 block。
 - 输出路径：分别比较 SID embedding、四个 code heads、control head 和 CE reduction。
 - 每轮仍使用 default/`workspace_16` 成对的 50-step、dropout=0 protocol，并沿用 Phase 2 的 50% 双判据。
 - 找到最小有效 FP32 区域后，用 dropout=0.1 重跑 50 steps；只有效果方向保持一致才进入完整训练。
@@ -118,7 +129,7 @@ D_param = ||theta_default - theta_workspace||_2 / ||theta_default - theta_init||
 - 找到一个最小局部 FP32 区域；或
 - 两轮后没有区域达到 50% 双判据。后一情况说明敏感性分散在整个网络，转入 Phase 5 的优化稳定性路线。
 
-- **Status：pending**
+- **Status：in_progress**
 
 ## Phase 4：完整训练验证局部 FP32
 

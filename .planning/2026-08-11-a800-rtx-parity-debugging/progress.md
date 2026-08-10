@@ -121,3 +121,18 @@
 - Phase 2 实现已提交为 commit `544c44e6d44b5ebe4dbdfa46d161dfd791afd196`；提交后 worktree clean，目标 v1 output 在提交作业前不存在。
 - Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=1、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`544c44e6d44b5ebe4dbdfa46d161dfd791afd196`。
 - Phase 2 GPU job 已提交：`tide-chenyufei03-10593-vgfrd`。节点内八个单卡 arm 映射到 GPU 0–7；状态待调度。
+- worker `tide-chenyufei03-10593-vgfrd-worker-0` 已进入 Running（1/1 ready、0 restarts）；CFS aliases 与 launch commit=`544c44e6d44b5ebe4dbdfa46d161dfd791afd196` 校验通过，正在解包冻结 runtime。
+- Phase 2 runtime preflight 通过：Python 3.10.12、torch 2.10.0+cu128、CUDA 12.8、cuDNN 91002、Transformers 5.3.0、Tokenizers 0.22.2、node GPU count=8。
+- default/workspace16 × `{none, encoder, decoder, heads_ce}` 八个单卡 arm 已分别启动在 GPU 0–7；pod 保持 Running（1/1 ready、0 restarts）。
+- 运行约 2 分 33 秒时九份 node/arm log 均已创建；尚未输出 probe header，说明各 arm 仍在 archived source-length audit/模型初始化阶段。日志未发现 Traceback、OOM、CUDA error 或 arm failure。
+- 八个 arm 均已通过 probe header 与 first-batch 阶段并完成 step 1。default/workspace16 的 step-1 loss gap 为：BF16 control=`4.911423e-05`、encoder FP32=`7.295609e-05`、decoder FP32=`0`、heads+CE FP32=`4.339218e-05`；条件均为 A800、catalog 首批、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0，仅局部 FP32 区域和 workspace path 按名称变化。
+- decoder FP32 已在 step 1 消除两条 backend 路径的 loss gap；最终选择仍等待 step-50 loss gap 与 CPU FP64 `D_param` 双门禁。
+- 八个 arm 均完成 50 updates 并保存 final trainable state、dtype audit、peak memory 与完整 provenance；matrix analyzer 成功生成 summary 和 `matrix.done`。
+- Phase 2 双门禁无人通过：decoder FP32 的 `D_param`/loss-gap reduction=`14.6651%/52.8662%`，heads+CE FP32=`4.9188%/95.8414%`，encoder FP32=`-7.3286%/28.9608%`；条件均为 A800、default 对 workspace16、catalog 前 50 updates、batch=16、seed=20260626、lr=3e-4、weight decay=0、dropout=0。
+- job `tide-chenyufei03-10593-vgfrd` 在约 5 分 56 秒完成（1 个 `8×A800` 节点、八个独立单卡 arm、0 restarts）。Phase 2 标记 done，准备进入 Phase 3。
+- Phase 3 第一轮固定四组 default/workspace16 pair：decoder blocks 0–5、decoder blocks 6–11、full decoder+heads/CE、decoder blocks 0–5+heads/CE；Phase 2 BF16 control 作为 reference，不重复占卡。
+- task plan 已重新 attestation，SHA-256 前缀=`0b3a0b19122d`（Phase 2 done、Phase 3 in_progress）。
+- 已扩展 local FP32 controller：支持 decoder block 半区与 heads/CE 组合，并把预期 module/CE 调用次数改为 region 驱动的统一验证。
+- 已新增 Phase 3 analyzer、八卡 node launcher、Tianzhi bootstrap、experiment note 和 composed-region/cross-job-audit focused tests。
+- Phase 3 相关 21 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
+- structured local review 已检查 block 选择、嵌套 autocast、CE patch、每步调用次数、跨 job stable-runtime/hash contract、Phase 2 control 重算和 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
