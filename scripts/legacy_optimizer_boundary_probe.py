@@ -202,14 +202,25 @@ def set_optimizer_lr(optimizer: Any, query_lr: float) -> None:
         group["lr"] = float(query_lr)
 
 
-def row_identifier(row: dict[str, Any]) -> str:
+def row_identifier(
+    row: dict[str, Any], *, include_positive_skill_id: bool
+) -> str:
     index = str(row["index"])
+    if not include_positive_skill_id:
+        return index
     positive = row.get("positive_skill_id")
-    return f"{index}|{positive}" if positive is not None else index
+    if positive is None:
+        raise ValueError(f"query row is missing positive_skill_id: {index}")
+    return f"{index}|{positive}"
 
 
-def row_ids_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    row_ids = [row_identifier(row) for row in rows]
+def row_ids_payload(
+    rows: list[dict[str, Any]], *, include_positive_skill_id: bool
+) -> dict[str, Any]:
+    row_ids = [
+        row_identifier(row, include_positive_skill_id=include_positive_skill_id)
+        for row in rows
+    ]
     raw = "".join(f"{row_id}\n" for row_id in row_ids).encode()
     return {"row_ids": row_ids, "row_ids_sha256": hashlib.sha256(raw).hexdigest()}
 
@@ -277,10 +288,23 @@ class OptimizerBoundaryObserver:
             batch = original_builder(batch_rows, *args, **kwargs)
             if next_call in {1, self.catalog_steps + 1}:
                 name = "catalog_step_1" if next_call == 1 else "query_step_1"
-                self.batches[name] = {
-                    **row_ids_payload(batch_rows),
+                payload = {
+                    **row_ids_payload(
+                        batch_rows,
+                        include_positive_skill_id=name == "query_step_1",
+                    ),
                     "tensor_sha256": recursive_state_sha256(batch),
                 }
+                expected_hash = {
+                    "catalog_step_1": EXPECTED_CATALOG_FIRST_BATCH_SHA256,
+                    "query_step_1": EXPECTED_QUERY_FIRST_BATCH_SHA256,
+                }[name]
+                if payload["row_ids_sha256"] != expected_hash:
+                    raise ValueError(
+                        f"{name} row hash mismatch: expected={expected_hash}, "
+                        f"observed={payload['row_ids_sha256']}"
+                    )
+                self.batches[name] = payload
             self.batch_calls = next_call
             return batch
 

@@ -58,7 +58,13 @@ class LegacyOptimizerBoundaryMetadataTest(unittest.TestCase):
             "14816|other/cell-segmentation-gptomics-bioskills",
             "pseudo:catalog_task:other/designer:4|other/designer",
         ]
-        catalog_rows = [{"index": row_id} for row_id in catalog_ids]
+        catalog_rows = [
+            {
+                "index": row_id,
+                "positive_skill_id": row_id.removeprefix("catalog:"),
+            }
+            for row_id in catalog_ids
+        ]
         query_rows = [
             {
                 "index": row_id.rsplit("|", 1)[0],
@@ -67,12 +73,22 @@ class LegacyOptimizerBoundaryMetadataTest(unittest.TestCase):
             for row_id in query_ids
         ]
         self.assertEqual(
-            row_ids_payload(catalog_rows)["row_ids_sha256"],
+            row_ids_payload(
+                catalog_rows, include_positive_skill_id=False
+            )["row_ids_sha256"],
             EXPECTED_CATALOG_FIRST_BATCH_SHA256,
         )
         self.assertEqual(
-            row_ids_payload(query_rows)["row_ids_sha256"],
+            row_ids_payload(
+                query_rows, include_positive_skill_id=True
+            )["row_ids_sha256"],
             EXPECTED_QUERY_FIRST_BATCH_SHA256,
+        )
+        self.assertNotEqual(
+            row_ids_payload(
+                catalog_rows, include_positive_skill_id=True
+            )["row_ids_sha256"],
+            EXPECTED_CATALOG_FIRST_BATCH_SHA256,
         )
 
     def test_catalog_invariant_covers_pre_query_state_and_gradient(self):

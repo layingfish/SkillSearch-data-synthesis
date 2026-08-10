@@ -153,7 +153,13 @@
 - 已定位 archived optimizer 生命周期：单个 AdamW 跨 catalog/query 复用。Phase 5 准备通过 optimizer-step wrapper 在 query step 1 前捕获 catalog-final 状态，并对 reset arm 清空 moments；不复制 archived 训练循环。
 - 已实现 optimizer-boundary probe、CPU FP64 `D_update` analyzer、八卡 node launcher、Tianzhi bootstrap、experiment note 和 focused tests；尚未完成本地验证、review、commit 或 GPU 提交。
 - Phase 5 首次本地测试的 25 项中 24 项通过；optimizer state 的 scalar `step` tensor 在 byte-view hash 中触发 `RuntimeError`。hash helper 已先 reshape 为一维再 view，训练语义未受影响，准备重跑。
-- scalar tensor hash 修复后，Phase 5 相关测试增至 26 项并在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
+- scalar tensor hash 修复后，Phase 5 相关测试共 25 项并在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n`、trailing-whitespace 与 `git diff --check` 通过。
 - structured local review 已检查 catalog/query call-count 边界、query 首批前 catalog capture、query step-1 backward 后 reset 时机、fresh-AdamW 等价、每 backend 四路 fork invariant、CPU FP64 `D_update`、checkpoint-save observer 与 GPU 0–7 映射。未发现 CRITICAL/HIGH 问题。
 - Phase 5 实现提交为 commit `b0786627d891c22b1d516b1999553a0a0283429a`；提交后 worktree clean，目标 v1 output 在作业提交前不存在。
 - Tianzhi dry-run 通过后已提交 job=`tide-chenyufei03-10595-comjs`（queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`b0786627d891c22b1d516b1999553a0a0283429a`）。
+- Phase 5 runtime preflight 通过：Python 3.10.12、torch 2.10.0+cu128、CUDA 12.8、cuDNN 9.10.2、Transformers 5.3.0、Tokenizers 0.22.2、node GPU count=`8`；八个单卡 arm 已分别启动在 GPU 0–7。
+- 八个 arm 的 query train、query dev、catalog source-length audit 均通过；运行约 5 分 58 秒时同步完成 catalog step `250/2730`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`），pod 为 Running、0 restarts，日志未发现训练错误。
+- v1 八个 arm 均完成 catalog=`2,730` updates 与 query=`50` updates（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`），但在 post-run validation 统一失败于 catalog first-batch row hash。pod 全程 0 restarts，无 OOM/NaN/CUDA error。
+- 根因是新 wrapper 的 `row_identifier()` 对实际 catalog row 中存在的 `positive_skill_id` 也拼接了 `|positive_skill_id`，得到 `95cb153d...`；取证包 catalog hash=`721a0d93...` 只使用 `index`。query reference 才使用 `index|positive_skill_id`。
+- 修复已让 catalog/query 显式选择 row-id 口径，并把 hash 比较前移到对应首批。focused optimizer-boundary tests 共 5 项在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下通过；v2 使用新 output/bootstrap 目录，保留 v1 日志。
+- 修复后的五个 legacy probe test modules 共 25 项测试在冻结的 Python 3.10.12 + torch 2.10.0 runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
