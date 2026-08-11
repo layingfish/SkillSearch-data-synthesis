@@ -129,6 +129,16 @@
 - fixed-pool R@1/R@5 与 raw 在四路 checkpoint 上完全相同，raw→fixed top-1 gained/lost 都为 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query 固定池 top-1 恢复均为 `0`。条件为四个 learned-code full-vocabulary log-probs 加 stop control=`1`、max skills=`1`、逐 query 穷举。
 - fixed-pool 只改善深召回：RTX/control/warmup/clip 的 R@50 从 `75.0000/75.3333/73.0000/73.3333` 变为 `78.0000/78.3333/76.6667/75.6667`；control R@10 从 `69.5556` 变为 `70.8889`。条件为上述统一 fixed-pool 协议。
 - fixed-pool 澄清了 index=`8` 的歧义：gold 虽被强制加入，control/warmup/clip 仍排 `78/57/66`。index=`54` 排 `5/14/4`，index=`66` 排 `3/3/7`。Top50 缺失是低 gold score 的结果，当前 R@1 主因是 learned scoring。
+- position-score job=`tide-chenyufei03-10602-lbift` 对 code position=`0/1/2/3` 与 stop control=`1` 保存逐 candidate contribution；四路各 `10,708` 个 candidates 的 component sum 最大误差=`0`（FP64 analyzer），uniform ranking exact。条件为 Official core75=`75` queries 与相同 fixed pool。
+- control/warmup/clip 的 `3,061` 组 normalized global weights 中，full gate 通过数均为 `0`；条件为 fixed-pool R@1/R@10/R@50 门槛=`27.3683/69.0000/75.0000`。control 通过 deep gate 的 `668` 组中最高 R@1=`21.5905`；warmup/clip 的 deep-gate 通过数为 `0`。
+- full-set weighting 把 control/warmup/clip R@1 从 `20.9238/23.9905/23.8794` 提到 `21.5905/24.7683/24.5460`，但五折 heldout R@1=`20.9238/23.8794/21.2127`；条件为 Official core75=`75` queries、同一 fixed pool、五折 train=`60`/heldout=`15`。增益来自 selection-set 拟合，不能作为 baseline 配置。
+- RTX/A800 per-query candidate rank Spearman 在四个 code positions 上为约 `0.4190–0.5421`，stop control 只有 `0.0082–0.0388`；条件为三个 A800 checkpoint 分别对 RTX、Official core75=`75` queries、同一 fixed pool。RTX-correct/A800-wrong cases 的 c0/c1 mean gold margin 在三路都为负且绝对值最大，stop margin 近似 `0`。差异是 query/candidate-specific 的 early-code ranking，无法用固定 position scale 修复。
+- prefix attribution 显示 RTX/control/warmup=`500`/clip=`1.0` 在 depth=`1` 的 macro R@1=`50.1302/50.4635/48.3524/51.1302`，在 depth=`2` 变为 `47.7968/39.7968/44.7968/43.0190`；条件为 Official core75=`75` queries、`200` gold mentions、fixed pool。c1 是稳定的总体差异起点。
+- exact Shapley 在每个 A800 checkpoint 的全部 `32` 个 component masks 上计算。c1 对 control/warmup/clip endpoint R@1 gap 的贡献为 `3.4167/2.3148/2.1759` 个点，占比=`45.9%/52.9%/48.5%`；stop 三路都为 `0.0000` 个点。
+- 任何 learned-code 部分子集都未通过 fixed-pool R@1/R@10/R@50=`27.3683/69.0000/75.0000` 门槛；同时替换 c0/c1/c2/c3 才重建 RTX=`28.3683/69.0000/78.0000`（Official core75=`75` queries、同一 fixed pool）。下一个 loss 需监督累计 prefix/完整 sequence，单独放大 c1 CE 会继续产生 Top-1/深召回交换。
+- 已有 classic document-augmentation `query-only` 在 A800 上达到 Official core75 Overall R@1/R@10/R@50=`27.26/69.33/76.78`（`75` rows、beam=`50`、beam-order、enhanced source queries=`100,078`、global batch=`16` (`8` ranks x `2`)、lr=`3e-4`、query epochs=`5`、catalog passes=`0`）。该结果保留为后续方法对照，不能作为 RTX strict-base parity control。
+- strict-base teacher top-50 c1 negative coverage=`86,305/124,175=69.5027%`（base source queries=`94,912`、排除同 query 全部 sibling GT、same-c0/different-c1）。Single/Multi coverage=`54,135/77,455=69.8922%` 与 `32,170/46,720=68.8570%`，没有明显 multi-GT eligibility 偏差。
+- 第一轮 loss probe 保留 RTX 的 catalog updates=`2,730`、query updates=`38,805` 与 optimizer carry（base source queries=`94,912`、batch=`16`、seed=`20260626`、BF16、`:16:8`），用于直接回答 A800 strict-base recovery。positive CE 使用 archived forward；auxiliary branch 恢复主 CPU/CUDA RNG，避免把额外 dropout 消耗混入结论。
 
 ## 参考资料
 

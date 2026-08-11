@@ -194,7 +194,9 @@ query stability ablation 已完成。workspace control/warmup/clip 的 Overall R
 
 fixed-pool scoring diagnostic 已完成。四路 raw→fixed top-1 gained/lost 均为 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query fixed top-1 恢复均为 `0`。条件为 Official core75=`75` queries、pool=four beam-order Top50 union plus all gold、四个 learned-code full-vocabulary log-probs 加 stop control=`1`、逐 query穷举。四路 R@1/R@5 均与 raw 完全相同；search omission 只在 control R@10 和四路 R@50 产生增益。
 
-下一步只做 scorer 诊断，不加入新的训练超参：保存四个 code positions 与 stop control 的逐 candidate log-prob contribution；在同一 fixed pool 上检查各 position 的 RTX/A800 rank correlation，并做受约束的 position-weight ablation。候选 weighting 只有在 Official core75 的 R@1 达到 `27.3683`、R@10/R@50 不低于 `69.0000/75.0000`（Official core75=`75` queries、fixed pool）后，才进入原 full-catalog beam evaluator验证。
+position-score decomposition 已完成。control/warmup/clip 的 `3,061` 组 normalized weights 中，full gate 通过数均为 `0`；条件为 Official core75=`75` queries、fixed pool、R@1/R@10/R@50 门槛=`27.3683/69.0000/75.0000`。五折 heldout R@1 也没有超过各自 uniform baseline。全局 position scaling 停止，不进入 full-catalog beam evaluator。
+
+在线训练前的 attribution 已完成。c1 占 control/warmup=`500`/clip=`1.0` endpoint R@1 gap 的 `45.9%/52.9%/48.5%`（Official core75=`75` queries、fixed pool、全部 `32` 个 component masks 的 exact Shapley），但通过 R@1/R@10/R@50=`27.3683/69.0000/75.0000` 门槛需要同时替换 c0/c1/c2/c3。当前先对冻结 SkillRouter teacher panel 与 LETTER IDs 做 hard-negative coverage audit，然后实现一个保留 CE 的限定 loss probe：c1 分叉 hard negative + c0--c3 cumulative-prefix/sequence ranking。control 固定为已有 A800 `query-only`（Official core75=`75` queries、beam=`50`、beam-order、global batch=`16`、lr=`3e-4`、query epochs=`5`时 R@1/R@10/R@50=`27.26/69.33/76.78`）。不再增加 backend、全局 position weight 或 catalog exposure sweep。
 
 这一阶段得到的是新的 A800 稳定训练配方，报告中必须与“严格 legacy reproduction”分开命名。
 
@@ -241,6 +243,15 @@ fixed-pool scoring diagnostic 已完成。四路 raw→fixed top-1 gained/lost �
 - canonical private test 只对锁定后的 seed=20260626 checkpoint 评测一次，不参与配方回选。
 - 所有后续实验能复用同一 baseline config、checkpoint 选择和评测协议。
 - 没有 unresolved HIGH 级训练语义或 provenance 问题。
+
+## 当前训练候选：strict-base CE-prefix ranking
+
+- 固定 base source queries=`94,912`、expanded rows=`124,175`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、optimizer carry、dev-best 与 `CUBLAS_WORKSPACE_CONFIG=:16:8`。
+- candidate bundle 固定 summary SHA-256=`72b0f525d6c3d9feabc7770c054ee70d8478f1b280d1a100793da8d5b6c6dd6d`、manifest SHA-256=`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`；teacher top-50 条件下 c1 negative coverage=`86,305/124,175=69.5027%`。
+- 一个 `8×A800` 节点跑两个 gate=`0` control、cumulative lambda=`{0.02,0.05,0.10,0.20}`、c1-only lambda=`0.10`、sequence-only lambda=`0.10`；每个 arm 独占一张 A800。
+- positive CE forward 保留原 batch shape/order；auxiliary decoder 在 forked CPU/CUDA RNG state 内运行并恢复主 RNG。cumulative loss 先在 depth=`2/3/4` 分别计算 softplus，再对 row×depth 求平均。
+- control 必须命中历史 model-state SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、prediction SHA-256=`3663a15ad9859abc76141d815f0da3c88bd9b3d5d9e914f09a3d8b0a3ed843f4`、best query step=`38,200` 与 dev loss=`0.7701343703584546`（上述 strict-base 条件）。
+- 除 Overall absolute gate 外，Single/Multi R@10/R@50 相对 concurrent control 的允许回退均为 `1.0` 个百分点（Official core75=`75` queries、beam=`50`、beam-order）。
 
 ## 错误与防重复
 

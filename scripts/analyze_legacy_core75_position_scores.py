@@ -26,19 +26,15 @@ from scripts.analyze_legacy_core75_query_ranks import (
     numeric_summary,
     pearson_correlation,
 )
-
-
-COMPONENT_LABELS = (
-    "code_position_0",
-    "code_position_1",
-    "code_position_2",
-    "code_position_3",
-    "stop_control_1",
+from scripts.legacy_core75_score_protocol import (
+    COMPONENT_LABELS,
+    CUTOFFS,
+    DEEP_GATES,
+    R1_GATE,
 )
-CUTOFFS = (1, 5, 10, 50)
+
+
 GRID_RAW_VALUES = (0.5, 0.75, 1.0, 1.25, 1.5)
-DEEP_GATES = {"@10": 0.69, "@50": 0.75}
-R1_GATE = 0.28368253968253965 - 0.01
 
 
 def normalized_weight_grid() -> list[tuple[float, ...]]:

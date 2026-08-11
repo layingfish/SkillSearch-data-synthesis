@@ -249,3 +249,28 @@
 - 提交前本地实现与验证已完成。
 - 独立复核最终结论为无 CRITICAL/HIGH/MEDIUM 问题。实现提交为 commit `0ef8258cca6f7fa0d2c6583b4fc98f5e17ee342f`。
 - Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。正式 job=`tide-chenyufei03-10602-lbift` 已提交，等待 worker 创建。
+- job=`tide-chenyufei03-10602-lbift` 已完成；条件为 queue=`rudder-exper`、一个 `8×A800` 节点、pod runtime=`6m6s`、restart=`0`。八个 shards、四路 model/tokenizer/input provenance、A800 archived replay、五项 contribution sum、uniform ranking、`3,061`-weight grid 与五折验证全部通过。
+- control/warmup/clip 的 full-gate grid 数均为 `0/3,061`；条件为 Official core75=`75` queries、fixed pool、R@1/R@10/R@50 门槛=`27.3683/69.0000/75.0000`。control 有 `668/3,061` 组通过 deep gate，但最高 R@1 只有 `21.5905`；warmup/clip 无 deep-gate weighting。
+- 五折 heldout R@1=`20.9238/23.8794/21.2127`，对应 uniform R@1=`20.9238/23.9905/23.8794`；条件为 control/warmup/clip、Official core75=`75` queries、同一 fixed pool、train=`60`/heldout=`15`。full-set 的小幅增益没有跨 fold 稳定性。
+- RTX-correct/A800-wrong cases 的 mean gold-minus-best-nongold margin 主要损失在 c0/c1：control=`-1.6596/-1.2475`（`9` queries）、warmup=`-0.8922/-0.9212`（`9` queries）、clip=`-2.0248/-1.1925`（`8` queries）；stop margin 近似 `0`，条件为各自 uniform checkpoint 与同一 fixed pool。
+- position weighting 路线停止。下一步直接在已保存 artifacts 上做 prefix-depth 与 RTX/A800 component-swap attribution，不提交新 GPU job。
+- task plan 已重新 attestation，SHA-256 前缀=`83c3bd01c3b8`（position-score 结果与下一步 attribution 已写入）。
+
+## 2026-08-11：prefix/component attribution 结果
+
+- 本轮只读取 job=`tide-chenyufei03-10602-lbift` 的 score components，未启动新 GPU job。Official core75=`75` queries、gold mentions=`200`、semantic depth=`4` 与 fixed pool 全部保持不变。
+- RTX/control/warmup=`500`/clip=`1.0` 的 prefix R@1 在 depth=`1` 为 `50.1302/50.4635/48.3524/51.1302`，在 depth=`2` 为 `47.7968/39.7968/44.7968/43.0190`；条件为上述 `200` 个 gold mentions 的 macro recall。总体差距从 c1 决策后明显扩大。
+- 全部 `32` 个 RTX→A800 component masks 的 exact Shapley 显示，c1 占 control/warmup/clip endpoint R@1 gap 的 `45.9%/52.9%/48.5%`；stop contribution=`0`。
+- 只有 mask=`15`（RTX c0/c1/c2/c3 + A800 stop）和 mask=`31`（全 RTX）通过 fixed-pool R@1/R@10/R@50=`27.3683/69.0000/75.0000` 门槛。单换 c1 虽提高 R@1，但 control/warmup/clip R@10 为 `66.1111/67.9556/63.9111`（各自其余 component 保持 A800），深召回交换仍在。
+- attribution 相关 frozen-runtime tests=`20/20`（fixed-pool=`9`、position=`6`、attribution=`5`），endpoint、prefix-sharing、Shapley 守恒和 nondeployable marker 全部通过。独立复核修正三项 MEDIUM 后，无 CRITICAL/HIGH/MEDIUM。
+- 已重读 Multi-GT loss/catalog convergence、classic document augmentation、RIPOR/PAG settings、anchored RIPOR 和单节点多卡说明。现有 A800 `query-only` 在 Official core75=`75` queries、beam=`50`、beam-order、global batch=`16` (`8` ranks x `2`)、lr=`3e-4`、query epochs=`5` 时 R@1/R@10/R@50=`27.26/69.33/76.78`，是下一 loss probe 的 control。
+- 下一动作：先对冻结 SkillRouter teacher panel 和 LETTER IDs 做 c1-diverging hard-negative coverage audit；覆盖充足后，实现保留 CE 的 cumulative-prefix/sequence ranking 限定 probe。
+
+## 2026-08-11：strict-base CE-prefix ranking 实现
+
+- 发现 enhanced audit 与 RTX base 训练目标混用；已核对 base 的 `94,912` 行与 enhanced 前缀逐 JSON object 一致，teacher 前缀在 index/query/gold 上逐行对齐，尾部恰为 enhanced-only `5,166` 行。
+- base candidate bundle 已生成：summary SHA-256=`72b0f525d6c3d9feabc7770c054ee70d8478f1b280d1a100793da8d5b6c6dd6d`、manifest SHA-256=`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`；source queries=`94,912`、gold mentions=`124,175`、teacher top-50 c1 candidates=`86,305`。
+- 已实现 CE+cumulative-prefix loss、candidate bundle fail-closed loader、严格 legacy wrapper、Official core75 matrix analyzer、8卡 node launcher 与 Tianzhi bootstrap。
+- auxiliary decoder 使用 `torch.random.fork_rng` 保存并恢复主 CPU/CUDA RNG；positive CE forward 保持原 batch shape/order。训练第一批还会对 positive/negative depth=`2/3/4` full-sequence score 与 legacy stepwise decoder做 allclose。
+- frozen Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 跑完 `27` 项 focused tests，结果 `26` pass、`1` CUDA-only skip；source-only Ruff、bash syntax 与 diff check 通过。GPU preflight 会补跑 CUDA RNG invariant。
+- GPU job 尚未提交；等待 implementation cross-review 与 launch commit。

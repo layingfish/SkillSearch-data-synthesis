@@ -155,12 +155,62 @@ condition. It does not identify whether the remaining contribution comes from
 the Blackwell versus Ampere architecture, driver `580.126.09` versus
 `535.161.07`, or their interaction.
 
+The position-score decomposition then tested all `3,061` normalized global
+weightings over code positions `0/1/2/3` and stop control=`1`. No A800 weighting
+passed R@1/R@10/R@50=`27.3683/69.0000/75.0000`; conditions are Official
+core75=`75` queries and the same exhaustive fixed pool. Workspace control had
+`668/3,061` deep-gate configurations, but their best R@1 was only `21.5905`.
+Warmup=`500` and clip=`1.0` had `0/3,061` deep-gate configurations. Five-fold
+heldout R@1 was `20.9238/23.8794/21.2127` for control/warmup/clip, compared with
+uniform `20.9238/23.9905/23.8794` under the same fixed-pool condition.
+
+In RTX-correct/A800-wrong cases, the mean A800 gold-minus-best-nongold margins
+were most negative at code positions `0` and `1`: control=`-1.6596/-1.2475`
+over `9` queries, warmup=`-0.8922/-0.9212` over `9` queries, and
+clip=`-2.0248/-1.1925` over `8` queries. The stop-control margin was effectively
+zero. The preferred global weight direction changed across checkpoints and
+folds, so a single position calibration does not explain or repair the gap.
+
+The prefix/component attribution then localized the stable aggregate gap to the
+second learned-code decision. Prefix R@1 at depth `1` was
+`50.1302/50.4635/48.3524/51.1302` for RTX/control/warmup/clip; at depth `2` it
+was `47.7968/39.7968/44.7968/43.0190`. Conditions are Official core75=`75`
+queries, `200` gold mentions, and the same fixed pool. Exact Shapley attribution
+over all `32` RTX-to-A800 component masks assigns c1
+`45.9%/52.9%/48.5%` of the control/warmup/clip endpoint R@1 gap. c1 is the
+largest component in all three comparisons, while stop contributes exactly
+zero.
+
+No partial learned-code component subset passed the fixed-pool
+R@1/R@10/R@50=`27.3683/69.0000/75.0000` gate. Only swapping all four learned
+code components reproduced RTX=`28.3683/69.0000/78.0000`; conditions are the
+same `75` queries and exhaustive fixed pool. A c1-only swap raised A800 R@1 but
+reduced R@10, so the repair target must preserve cumulative sequence ranking
+rather than reweighting a single head.
+
 ## State and next decision
 
 The matching RTX environment remains unavailable. Global backend controls,
 optimizer reset/lr, query warmup=`500`, and query global L2 clip=`1.0` have not
-met the recovery gate. The next diagnostic is per-position score decomposition
-on the fixed pool. It will test whether a constrained code-position/control
-weighting can recover Top-1 without reducing R@10/R@50; any promising weighting
-must then pass the original full-catalog beam evaluator. If this fails, the A800
-baseline needs a changed training objective or checkpoint-selection criterion.
+met the recovery gate. Fixed-pool search and global position weighting are now
+also excluded as explanations for the Top-1 gap. No position-weight candidate
+qualifies for the original full-catalog beam evaluator.
+
+The next bounded training candidate retains CE and adds query-conditioned hard
+negatives at c1-diverging prefixes plus a cumulative-prefix or sequence-level
+ranking objective across c0--c3. The strict-parity control remains the archived
+base schedule: source rows=`94,912`, expanded rows=`124,175`, catalog
+updates=`2,730`, query updates=`38,805`, batch=`16`, seed=`20260626`, optimizer
+carry, BF16, and `CUBLAS_WORKSPACE_CONFIG=:16:8`. This keeps the training
+question aligned with the RTX baseline.
+
+The base candidate audit freezes summary SHA-256
+`72b0f525d6c3d9feabc7770c054ee70d8478f1b280d1a100793da8d5b6c6dd6d`
+and manifest SHA-256
+`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`.
+Teacher top-50 supplies c1-diverging negatives for
+`86,305/124,175=69.5027%` of expanded base rows after sibling-GT exclusion.
+The enhanced query-only result R@1/R@10/R@50=`27.26/69.33/76.78` remains a
+separate method reference under source rows=`100,078`, global batch=`16`
+(`8` ranks x `2`), lr=`3e-4`, query epochs=`5`, catalog passes=`0`, Official
+core75=`75` queries, beam=`50`, and beam-order aggregation.

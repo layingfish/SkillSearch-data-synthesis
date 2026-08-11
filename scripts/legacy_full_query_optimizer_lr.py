@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -81,6 +80,21 @@ except ModuleNotFoundError:
         precision_snapshot,
         runtime_snapshot,
         selected_weight_file,
+    )
+
+try:
+    from legacy_ce_prefix_ranking import (
+        FrozenC1Candidates,
+        PrefixRankingRuntime,
+        SCOPE_DEPTHS,
+        attach_prefix_ranking_forward,
+    )
+except ModuleNotFoundError:
+    from scripts.legacy_ce_prefix_ranking import (
+        FrozenC1Candidates,
+        PrefixRankingRuntime,
+        SCOPE_DEPTHS,
+        attach_prefix_ranking_forward,
     )
 
 
@@ -589,6 +603,48 @@ def command_run(args: argparse.Namespace) -> None:
                 "CUBLAS_WORKSPACE_CONFIG must be set before Python starts: "
                 f"expected={args.cublas_workspace_config}, observed={observed_workspace}"
             )
+    if not math.isfinite(args.prefix_rank_weight) or args.prefix_rank_weight < 0.0:
+        raise ValueError(
+            f"prefix rank weight must be finite and non-negative: {args.prefix_rank_weight}"
+        )
+    if args.prefix_rank_weight > 0.0 and args.prefix_rank_scope == "disabled":
+        raise ValueError("positive prefix rank weight requires an active scope")
+    if not math.isfinite(args.prefix_rank_temperature) or args.prefix_rank_temperature <= 0.0:
+        raise ValueError(
+            "prefix rank temperature must be finite and positive: "
+            f"{args.prefix_rank_temperature}"
+        )
+    candidate_arguments = (
+        args.prefix_rank_summary,
+        args.prefix_rank_summary_sha256,
+        args.prefix_rank_manifest,
+        args.prefix_rank_manifest_sha256,
+    )
+    if any(value is not None for value in candidate_arguments) and not all(
+        value is not None for value in candidate_arguments
+    ):
+        raise ValueError("prefix ranking artifact arguments must be provided together")
+    if args.prefix_rank_weight > 0.0 and not all(
+        value is not None for value in candidate_arguments
+    ):
+        raise ValueError("positive prefix rank weight requires a candidate artifact bundle")
+    candidate_input_hashes = (
+        {
+            "summary": file_sha256(args.prefix_rank_summary),
+            "manifest": file_sha256(args.prefix_rank_manifest),
+        }
+        if args.prefix_rank_summary is not None
+        else {"summary": None, "manifest": None}
+    )
+    expected_candidate_hashes = {
+        "summary": args.prefix_rank_summary_sha256,
+        "manifest": args.prefix_rank_manifest_sha256,
+    }
+    if candidate_input_hashes != expected_candidate_hashes:
+        raise ValueError(
+            "prefix ranking artifact SHA-256 mismatch: "
+            f"expected={expected_candidate_hashes}, observed={candidate_input_hashes}"
+        )
 
     import torch
 
@@ -630,12 +686,44 @@ def command_run(args: argparse.Namespace) -> None:
     pipeline = load_module(args.pipeline, f"full_query_optimizer_lr_{args.arm}")
     original_factory = pipeline.make_structured_t5_sid_model
     original_saver = pipeline.save_structured_decoder_checkpoint
+    prefix_rank_trace: dict[str, Any] = {}
+    prefix_rank_runtime = None
+    if args.prefix_rank_weight > 0.0:
+        semantic_ids = pipeline.load_semantic_ids(args.semantic_ids)
+        candidates = FrozenC1Candidates.load(
+            summary_path=args.prefix_rank_summary,
+            manifest_path=args.prefix_rank_manifest,
+            semantic_ids=semantic_ids,
+            expected_summary_sha256=args.prefix_rank_summary_sha256,
+            expected_manifest_sha256=args.prefix_rank_manifest_sha256,
+            expected_rows_sha256=file_sha256(args.rows),
+            expected_semantic_ids_sha256=file_sha256(args.semantic_ids),
+        )
+        prefix_rank_runtime = PrefixRankingRuntime(
+            candidates=candidates,
+            scope=args.prefix_rank_scope,
+            epochs=5,
+        )
+        pipeline.expand_single_sid_query_rows = prefix_rank_runtime.wrap_expander(
+            pipeline.expand_single_sid_query_rows
+        )
 
     def observed_factory(*factory_args: Any, **factory_kwargs: Any) -> Any:
-        return observer.remember_model(original_factory(*factory_args, **factory_kwargs))
+        model = original_factory(*factory_args, **factory_kwargs)
+        model = attach_prefix_ranking_forward(
+            model,
+            weight=args.prefix_rank_weight,
+            scope=args.prefix_rank_scope,
+            temperature=args.prefix_rank_temperature,
+            trace=prefix_rank_trace,
+        )
+        return observer.remember_model(model)
 
     pipeline.make_structured_t5_sid_model = observed_factory
-    pipeline.structured_sid_batch = observer.wrap_batch_builder(pipeline.structured_sid_batch)
+    batch_builder = pipeline.structured_sid_batch
+    if prefix_rank_runtime is not None:
+        batch_builder = prefix_rank_runtime.wrap_batch_builder(batch_builder)
+    pipeline.structured_sid_batch = observer.wrap_batch_builder(batch_builder)
     pipeline.save_structured_decoder_checkpoint = observer.wrap_checkpoint_saver(original_saver)
 
     train_dir = args.output_dir / "train"
@@ -649,6 +737,33 @@ def command_run(args: argparse.Namespace) -> None:
         torch.optim.AdamW = original_adamw
 
     observer.validate()
+    prefix_rank_execution = (
+        prefix_rank_runtime.validate()
+        if prefix_rank_runtime is not None
+        else {
+            "expander_calls": 0,
+            "query_train_batch_calls": 0,
+            "query_train_row_presentations": 0,
+            "per_row_presentations": 0,
+            "eligible_pair_presentations": 0,
+            "active_comparisons": 0,
+            "active_depths": [],
+        }
+    )
+    expected_trace_steps = (
+        {"1", "50", "500", str(args.query_steps), "score_parity"}
+        if args.prefix_rank_weight > 0.0
+        else set()
+    )
+    if set(prefix_rank_trace) != expected_trace_steps:
+        raise ValueError(
+            f"prefix ranking trace mismatch: observed={sorted(prefix_rank_trace)}"
+        )
+    sampled_losses = [
+        row for key, row in prefix_rank_trace.items() if key != "score_parity"
+    ]
+    if any(not row["finite"] for row in sampled_losses):
+        raise ValueError(f"non-finite prefix ranking trace: {prefix_rank_trace}")
     dropout_rates = sorted({float(module.p) for module in dropout_modules})
     if len(dropout_modules) != EXPECTED_DROPOUT_MODULES or dropout_rates != [args.dropout_rate]:
         raise ValueError(
@@ -735,6 +850,15 @@ def command_run(args: argparse.Namespace) -> None:
         "catalog_lr": 3e-4,
         "weight_decay": 0.0,
         "dropout_rate": args.dropout_rate,
+        "prefix_ranking": {
+            "scope": args.prefix_rank_scope,
+            "weight": args.prefix_rank_weight,
+            "temperature": args.prefix_rank_temperature,
+            "summary_sha256": args.prefix_rank_summary_sha256,
+            "manifest_sha256": args.prefix_rank_manifest_sha256,
+            "candidate_domain": "teacher_top50_exclude_all_sibling_gt",
+            "score": "mean_depth_softplus_negative_minus_positive_cumulative_logprob",
+        },
         "outer_precision": "bf16",
         "requested_controls": {
             "bf16_reduction": args.bf16_reduction,
@@ -748,7 +872,7 @@ def command_run(args: argparse.Namespace) -> None:
         },
     }
     payload = {
-        "artifact_format": "legacy_full_query_optimizer_lr_arm_v1",
+        "artifact_format": "legacy_full_query_optimizer_lr_arm_v2",
         "condition": condition,
         "condition_sha256": stable_json_sha256(condition),
         "runtime": runtime_snapshot(torch),
@@ -766,6 +890,8 @@ def command_run(args: argparse.Namespace) -> None:
             "skills": file_sha256(args.skills_jsonl),
             "semantic_ids": file_sha256(args.semantic_ids),
             "model_weight": file_sha256(weight_file),
+            "prefix_rank_summary": candidate_input_hashes["summary"],
+            "prefix_rank_manifest": candidate_input_hashes["manifest"],
         },
         "initial": observer.initial,
         "batches": observer.batches,
@@ -781,6 +907,10 @@ def command_run(args: argparse.Namespace) -> None:
         "query_stability": {
             "lr_trace": observer.query_lr_trace,
             "gradient_clipping": observer.clipping,
+        },
+        "prefix_ranking": {
+            "execution": prefix_rank_execution,
+            "trace": prefix_rank_trace,
         },
         "training": {
             "history": history_summary,
@@ -817,6 +947,8 @@ def command_run(args: argparse.Namespace) -> None:
                 "optimizer_mode": args.optimizer_mode,
                 "query_warmup_steps": args.query_warmup_steps,
                 "query_max_grad_norm": args.query_max_grad_norm,
+                "prefix_rank_scope": args.prefix_rank_scope,
+                "prefix_rank_weight": args.prefix_rank_weight,
                 "best_step": history_summary["best_step"],
                 "best_dev_loss": history_summary["best_dev_loss"],
                 "final_model_sha256": final_checkpoint["model_state_sha256"]["full"],
@@ -838,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-lr", type=float, required=True)
     parser.add_argument("--query-warmup-steps", type=int, default=0)
     parser.add_argument("--query-max-grad-norm", type=float)
+    parser.add_argument("--prefix-rank-scope", choices=tuple(SCOPE_DEPTHS), default="disabled")
+    parser.add_argument("--prefix-rank-weight", type=float, default=0.0)
+    parser.add_argument("--prefix-rank-temperature", type=float, default=1.0)
+    parser.add_argument("--prefix-rank-summary", type=Path)
+    parser.add_argument("--prefix-rank-summary-sha256")
+    parser.add_argument("--prefix-rank-manifest", type=Path)
+    parser.add_argument("--prefix-rank-manifest-sha256")
     parser.add_argument("--pipeline", type=Path, required=True)
     parser.add_argument("--rows", type=Path, required=True)
     parser.add_argument("--dev-rows", type=Path, required=True)
