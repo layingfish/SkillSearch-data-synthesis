@@ -171,7 +171,16 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 - 同一 `8×A800` 节点剩余两张卡运行 `workspace_16/carry/query lr=3e-4` exact replica 与 `default/carry/query lr=3e-4` legacy anchor；两者使用同一完整日程，只用于确定性和历史结果对齐，不参与六选一；
 - 八个 arm 都评测 Official core75=`75` queries、beam=`50`、beam-order、K=`{1,10,50}`；selection 只使用前六个 `workspace_16` arms，canonical private test 不参与选择。
 
-只有上述 6 个 arm 全部不能达到 Phase 4 的 Official core75 标准，才在最佳组合上分别测试 `warmup_steps=500` 和 `max_grad_norm=1.0`。两项先单独测试，不在第一轮同时启用。
+完整 query sweep 已完成。六个 selection arms 均未达到 Phase 4 的全部 Official core75 标准；条件统一为 A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。最高 Overall R@1=`25.4794` 来自 carry/query lr=`2e-4`，但其 R@10/R@50=`64.2889/68.7778`；carry/query lr=`3e-4` 是唯一达到 R@10/R@50=`69.5556/75.3333` 的组合，但 R@1=`20.9238`。七路 catalog invariant、query lr=`3e-4` exact replica 与两条历史 anchor 全部通过。
+
+下一轮在 carry/query lr=`3e-4` 上分别测试 query `warmup_steps=500` 与 query `max_grad_norm=1.0`。两项不组合。单节点 `8×A800` 映射为：
+
+- backend=`{default, workspace_16}` × intervention=`{control, warmup, clip}`，共六个完整单卡 arm；
+- 另外运行 `workspace_16/warmup` 与 `workspace_16/clip` 各一个 exact replica，共两个完整单卡 arm；
+- warmup 仅作用于 query optimizer step：第 `s` 步使用 `3e-4 × min(s/500, 1)`，因此 query step=`1/500/501` 的 lr=`6e-7/3e-4/3e-4`；
+- clipping 仅作用于 query backward 后、AdamW step 前，global L2 `max_grad_norm=1.0`、`foreach=False`、非有限 norm 直接失败；
+- 每个 backend 内所有 arm 的 catalog-final model/optimizer/RNG、首批与 query step-1 pre-intervention gradient 必须 exact；两个 replica 分别要求 final model、best step/dev loss、predictions 与 metrics exact；
+- default/workspace control 必须精确命中 2026-08-09 历史 anchor；所有 arm 评测 Official core75=`75` queries、beam=`50`、beam-order，selection 只比较两个 workspace intervention arms。
 
 这一阶段得到的是新的 A800 稳定训练配方，报告中必须与“严格 legacy reproduction”分开命名。
 

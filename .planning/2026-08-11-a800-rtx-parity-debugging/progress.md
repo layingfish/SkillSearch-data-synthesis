@@ -194,3 +194,13 @@
 - full-query sweep 实现提交为 commit `e7f0f0f949c13d5ce122fd2a7cfc1e137b5cbe05`；提交后 worktree clean。
 - Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。
 - 正式作业已提交：job=`tide-chenyufei03-10598-otasq`。输出目录为 `/models_rw/SkillSearch-data-synthesis/experiments/legacy_a800_full_query_optimizer_lr_20260811_v1/`，当前等待 worker 创建。
+
+## 2026-08-11：Phase 5 full-query sweep 结果
+
+- job=`tide-chenyufei03-10598-otasq` 在 queue=`rudder-exper` 使用一个 `8×A800` 节点完成，pod runtime=`3h10m`、restart=`0`；八个 arm 全部生成 checkpoint、Official core75 预测与结果摘要。
+- 七路 `workspace_16` catalog invariant 全部通过；carry/query lr=`3e-4` 与 exact replica 的 final model hash、best step/dev loss、predictions hash、metrics 全部 exact；default/workspace 两条历史 anchor 的 best step/dev loss 与 R@1/10/50 全部 exact。
+- 六个 selection arms 均未过门槛。条件统一为 A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
+- carry/query lr=`2e-4` 得到最高 Overall R@1=`25.4794`，但 R@10/R@50=`64.2889/68.7778`；carry/query lr=`3e-4` 是唯一同时达到 R@10/R@50=`69.5556/75.3333` 的 arm，但 R@1=`20.9238`。
+- reset/query lr=`{1e-4,2e-4,3e-4}` 的 Overall R@1=`22.5460/24.3238/21.9238`；相同 lr 的 carry 为 `17.8794/25.4794/20.9238`。reset 没有形成一致的 Top-1 改善方向；条件为上条统一条件。
+- Phase 5 继续在 carry/query lr=`3e-4` 上分别测试 query `warmup_steps=500` 与 query `max_grad_norm=1.0`。下一节点使用 backend=`{default,workspace_16}` × intervention=`{control,warmup,clip}` 六路，加 workspace warmup/clip 各一个 exact replica，占满 `8×A800`。
+- task plan 已重新 attestation，SHA-256 前缀=`0953d3bd5727`（Phase 5 stability ablation 设计冻结）。

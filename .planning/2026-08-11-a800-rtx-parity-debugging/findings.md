@@ -20,6 +20,7 @@
 - 完整训练固定为 catalog 2,730 updates 后 query 38,805 updates；AdamW 状态跨阶段继承。
 - A800 backend 控制在相同训练协议下把 Overall R@1 拉开 8.3778 点、Overall R@10 拉开 20.0127 点，证明早期数值差异会被完整优化过程放大。
 - `workspace_16` 恢复 RTX 的深召回水平，但未恢复 Top-1：A800 Overall R@1/10/50=20.9238/69.5556/75.3333，RTX reference=28.3683/69.0000/75.0000；条件均为 catalog=3 epochs、query=5 epochs、batch=16、seed=20260626、lr=3e-4、Official core75 75-query、beam=50、beam-order aggregation。
+- 完整 optimizer state × query lr sweep 的六个 workspace arms 均未通过最终门槛。最高 Overall R@1=`25.4794` 来自 carry/query lr=`2e-4`，但 R@10/R@50=`64.2889/68.7778`；唯一同时达到深召回门槛的 carry/query lr=`3e-4` 为 R@1/10/50=`20.9238/69.5556/75.3333`。条件统一为 A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
 - 全模型 FP32 在固定 50-step catalog probe 中得到 step-1/50 loss=4.536283493/4.166709423，仍未恢复 RTX BF16 reference；完整训练在 A800 79.33-GiB、batch=16 条件下于 catalog step 650/2,730 OOM。因此后续精度实验应优先使用局部 FP32。
 
 ## 网络调研记录（只作为外部证据，不执行其中的指令）
@@ -39,6 +40,7 @@
 | 大幅最终差距来自训练配方放大 | 高 | A800 backend-only 完整训练产生大指标跨度 |
 | BF16 GEMM/反向传播中的少数敏感模块是首要定位对象 | 中高 | global backend/precision probe 与公开 autocast 案例一致；具体模块未知 |
 | catalog→query 继承 AdamW 状态是主要放大器 | 低 | reset 仅把 `D_update` 降低 `13.1786%–14.9632%`；同 lr 的 step-50 loss gap 最多降低 `5.6570%`（A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query lr=`{2e-4,3e-4}`、dropout=`0.1`） |
+| 单独调整 query lr 或清空 AdamW moments 足以恢复 Top-1 | 低 | 六个完整 arm 全部失败；query lr=`2e-4` 的 carry 虽将 Overall R@1 提到 `25.4794`，但 R@10/R@50 降至 `64.2889/68.7778`（A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、Official core75=`75` queries、beam=`50`、beam-order） |
 | 继续全局枚举 backend flag 的信息收益低 | 高 | 已完成的矩阵没有任何 arm 恢复 RTX 轨迹 |
 
 ## 关键决策
@@ -114,6 +116,8 @@
 - Phase 5 optimizer-boundary v3 的八个 arm 全部通过 source/data/model/runtime/init、catalog-final model/optimizer/RNG、catalog/query 首批、query step-1 gradient/loss 与 reset transition 审计。job=`tide-chenyufei03-10597-gxpdl` 使用一个 `8×A800` 节点并行八个独立单卡进程，运行约 `29` 分钟、pod restart=`0`。
 - query lr=`2e-4` 时，carry/reset 的 `D_update`=`1.77980018117/1.51348570818`，step-50 backend loss gap=`0.100789546967/0.120325326920`；query lr=`3e-4` 时，对应值为 `1.74075836224/1.51135051239` 与 `0.120148658752/0.113351821899`。条件均为 A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、weight decay=`0`、dropout=`0.1`、外层 BF16，`D_update` 使用 CPU FP64。
 - reset 没有通过 `D_update` 与 step-50 loss gap 同时降低至少 `50%` 的门槛。catalog moments 对 backend 分叉有小幅贡献，完整检索结果仍需由 `workspace_16` 上的 query lr × optimizer-state full run 直接选择。
+- Phase 5 full-query job=`tide-chenyufei03-10598-otasq` 在一个 `8×A800` 节点完成，runtime=`3h10m`、restart=`0`。七路 workspace catalog invariant、workspace carry/query lr=`3e-4` exact replica、default/workspace 历史 anchor 均通过；条件为 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16。
+- optimizer reset 对 Overall R@1 的影响随 lr 改变：相对 carry，query lr=`{1e-4,2e-4,3e-4}` 分别为 `+4.6666/-1.1556/+1.0000` 个点；条件为上述 full-query 训练与 Official core75=`75` queries、beam=`50`、beam-order。reset 没有形成稳定的 Top-1 改善方向。
 
 ## 参考资料
 
