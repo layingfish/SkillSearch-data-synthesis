@@ -1,5 +1,5 @@
 # Experiment: Legacy core75 position-score decomposition
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -16,7 +16,7 @@ Risk Tier: 2
 
 ## Commands
 
-Score: `scripts/run_legacy_core75_position_scores_tianzhi_20260811.sh`；Tianzhi job 与 launch commit 待提交后回填。
+Score: job=`tide-chenyufei03-10602-lbift`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`0ef8258cca6f7fa0d2c6583b4fc98f5e17ee342f`。节点内运行四个 checkpoint × 两个 Official core75 row-position shards，共八个单卡 scorer。
 
 Analyze: 节点内八个 scorer 成功后运行 `scripts/analyze_legacy_core75_position_scores.py`，输出 position summary、逐 query contribution 和完整 normalized weight grid。
 
@@ -38,4 +38,4 @@ Output: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_core75_positio
 
 ## Result / Notes
 
-Pending.
+Job 已提交，等待 worker 创建。

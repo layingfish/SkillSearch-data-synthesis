@@ -246,4 +246,6 @@
 - 独立 launcher 固定新 output/bootstrap log、`SKILLGR_POSITION_ANALYSIS=1`，并在启动时要求 node 可见 GPU count=`8` 且每张设备名称包含 `A800`。
 - 冻结 Python=`3.10.12`、torch=`2.10.0+cu128`、NumPy 可用环境下，fixed-pool=`9/9`、position-score=`6/6` 测试通过；`py_compile`、三个 launcher 的 `bash -n`、Ruff 与 `git diff --check` 通过。
 - 旧 v1 fixed-pool 产物重跑后逐 query JSONL SHA-256 保持 `2379a329f7832a39531427cba81c63bc63fa4ce1e67b3e8bb889ea8148c0ed8c`；summary 只新增 model-input alignment 验证字段。
-- 独立复核未发现 CRITICAL/HIGH 问题。GPU job 尚未提交。
+- 提交前本地实现与验证已完成。
+- 独立复核最终结论为无 CRITICAL/HIGH/MEDIUM 问题。实现提交为 commit `0ef8258cca6f7fa0d2c6583b4fc98f5e17ee342f`。
+- Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。正式 job=`tide-chenyufei03-10602-lbift` 已提交，等待 worker 创建。
