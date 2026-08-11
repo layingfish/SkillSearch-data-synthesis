@@ -139,6 +139,9 @@
 - 已有 classic document-augmentation `query-only` 在 A800 上达到 Official core75 Overall R@1/R@10/R@50=`27.26/69.33/76.78`（`75` rows、beam=`50`、beam-order、enhanced source queries=`100,078`、global batch=`16` (`8` ranks x `2`)、lr=`3e-4`、query epochs=`5`、catalog passes=`0`）。该结果保留为后续方法对照，不能作为 RTX strict-base parity control。
 - strict-base teacher top-50 c1 negative coverage=`86,305/124,175=69.5027%`（base source queries=`94,912`、排除同 query 全部 sibling GT、same-c0/different-c1）。Single/Multi coverage=`54,135/77,455=69.8922%` 与 `32,170/46,720=68.8570%`，没有明显 multi-GT eligibility 偏差。
 - 第一轮 loss probe 保留 RTX 的 catalog updates=`2,730`、query updates=`38,805` 与 optimizer carry（base source queries=`94,912`、batch=`16`、seed=`20260626`、BF16、`:16:8`），用于直接回答 A800 strict-base recovery。positive CE 使用 archived forward；auxiliary branch 恢复主 CPU/CUDA RNG，避免把额外 dropout 消耗混入结论。
+- strict-base CE-prefix job=`tide-chenyufei03-10603-gigmv` 的两个 disabled control 精确命中历史 A800 model hash、predictions、best step=`38,200`、best dev loss=`0.7701343703584546` 和全部指标；条件为 base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`、Official core75=`75` queries、beam=`50`、beam-order。
+- `seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为上述 strict-base 训练与各自 dev-best checkpoint。sequence-only 恢复 Overall/Single Top-1 但损失 Multi/deep recall；cumulative lambda=`0.02` 保住 Multi/deep recall但未恢复 Overall/Single Top-1。
+- 六个非零 arm 的联合门槛通过数为 `0/6`（Official core75=`75` queries、Overall/Single/Multi 与 deep-recall gates）；c1-only lambda=`0.10` 的 Overall R@1/R@10/R@50=`22.5905/63.8889/69.4444`。单独监督 c1 不足，下一轮应先分析 `seq_010` 与 `cum_002` 的逐 query 互补性。
 
 ## 参考资料
 

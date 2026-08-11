@@ -1,5 +1,5 @@
 # Experiment: A800 legacy CE-prefix ranking loss probe
-Status: running
+Status: done
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -53,19 +53,21 @@ Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_ce_pr
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_ce_prefix_ranking_loss_20260811_v1/logs/`
 
+Summary: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_ce_prefix_ranking_loss_20260811_v1/ce_prefix_ranking_summary.json`
+
 ## Verification
 
 - [x] `when gate=0, student_forward output must be allclose to base-model output`
 - [x] 冻结 torch=`2.10.0+cu128` CPU runtime 下，gate=`0` 的 output、gradient、single update exact；gate-on 但 rank contribution=`0` 时，当前/下一 batch CE、主 RNG、gradient、update exact
 - [x] GPU preflight 重复 gate-on/rank contribution=`0` 的主 CUDA RNG 与下一 batch CE invariant
-- [ ] 两个 full control 的 final model/predictions exact
-- [ ] 两个 control 命中 workspace anchor：model-state full SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、predictions SHA-256=`3663a15ad9859abc76141d815f0da3c88bd9b3d5d9e914f09a3d8b0a3ed843f4`、best query step=`38,200`、best dev loss=`0.7701343703584546`（base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`）
-- [ ] candidate manifest/source rows/semantic IDs SHA-256 与 checkpoint provenance 精确
-- [ ] 每个 negative 排除全部 sibling GT，且与 positive 在 c1 首分叉
-- [ ] cumulative loss 是各 depth softplus 后的 mean
-- [ ] 同 query 的 positive/negative 在 depth=`2/3/4` 上，full-sequence cumulative full-vocab logprob 与 legacy stepwise decoder allclose（rtol=`1e-5`、atol=`5e-5`、FP32 preflight）；encoder cross-attention context与原 decoder prefix position保持完整
-- [ ] 每个 epoch 的 CE rows、eligible pairs、active comparisons 精确
-- [ ] loss/gradient 无 NaN/Inf，记录 peak GPU memory
+- [x] 两个 full control 的 final model/predictions exact
+- [x] 两个 control 命中 workspace anchor：model-state full SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、predictions SHA-256=`3663a15ad9859abc76141d815f0da3c88bd9b3d5d9e914f09a3d8b0a3ed843f4`、best query step=`38,200`、best dev loss=`0.7701343703584546`（base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`）
+- [x] candidate manifest/source rows/semantic IDs SHA-256 与 checkpoint provenance 精确
+- [x] 每个 negative 排除全部 sibling GT，且与 positive 在 c1 首分叉
+- [x] cumulative loss 是各 depth softplus 后的 mean
+- [x] 同 query 的 positive/negative 在 depth=`2/3/4` 上，full-sequence cumulative full-vocab logprob 与 legacy stepwise decoder allclose（rtol=`1e-5`、atol=`5e-5`、FP32 preflight）；encoder cross-attention context与原 decoder prefix position保持完整
+- [x] 每个 epoch 的 CE rows、eligible pairs、active comparisons 精确
+- [x] loss/gradient 无 NaN/Inf，记录 peak GPU memory
 - [x] Reviewer required? yes
 
 ## Result / Notes
@@ -78,4 +80,18 @@ Deep-recall gate：每个非零 arm 的 Single/Multi R@10/R@50 均不得低于�
 
 集群启动验证：pod 在 `1/1 Running`、restart=`0` 条件下识别到 `8` 张 GPU；冻结 runtime 字段全部命中。节点上的 `21` 项测试全部通过，包括 CUDA RNG invariant。GPU `0–7` 已分别拉起八个独立 arm。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`）；八路数值完全相同，符合 query ranking loss 尚未启用的预期。
 
-运行进度：两个 disabled control 均完成 query updates=`38,805/38,805` 与 Official core75=`75` queries 评测。两者的 final model-state SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、best query step=`38,200`、best dev loss=`0.7701343703584546`、predictions 与指标全部 exact；Overall R@1/R@10/R@50=`20.923809523809525/69.55555555555556/75.33333333333333%`（beam=`50`、beam-order）。其余六路位于 query step=`31,000–32,050/38,805`（各自 prefix-loss scope/lambda 如 arm 表）；pod=`1/1 Running`、restart=`0`，日志未发现 Traceback、OOM、NaN 或 CUDA error。
+运行完成：八路均完成 query updates=`38,805/38,805` 与 Official core75=`75` queries 评测；catalog、control replica、历史 anchor、candidate、score parity 和执行次数审计全部通过。job 结束后 worker 已清理，日志未发现 Traceback、OOM、NaN 或 CUDA error。
+
+下表均为 dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order、K=`{1,10,50}`；Single=`24` queries，Multi=`51` queries。
+
+| arm | scope / lambda | Overall R@1 / R@10 / R@50 | Single R@1 | Multi R@1 | gate |
+|---|---|---:|---:|---:|---|
+| `control_a/b` | disabled / `0` | `20.9238 / 69.5556 / 75.3333` | `25.0000` | `19.0056` | reference |
+| `cum_002` | cumulative / `0.02` | `26.3683 / 69.9556 / 77.1111` | `33.3333` | `23.0906` | fail |
+| `cum_005` | cumulative / `0.05` | `21.9238 / 68.0000 / 73.8889` | `25.0000` | `20.4762` | fail |
+| `cum_010` | cumulative / `0.10` | `25.0349 / 69.6667 / 73.4444` | `33.3333` | `21.1298` | fail |
+| `cum_020` | cumulative / `0.20` | `23.1460 / 66.6540 / 74.2222` | `29.1667` | `20.3128` | fail |
+| `c1_010` | c1-only / `0.10` | `22.5905 / 63.8889 / 69.4444` | `29.1667` | `19.4958` | fail |
+| `seq_010` | sequence-only / `0.10` | `28.7683 / 70.5873 / 73.8889` | `50.0000` | `18.7768` | fail |
+
+没有 arm 通过全部门槛，`passing_arms=[]`、`selected_arm=null`，因此不进入多 seed。`seq_010` 把 Overall R@1 提到 `28.7683%`，超过 RTX=`28.3683%`，Single R@1 也达到 `50.0000%`；但 Overall R@50=`73.8889%` 低于门槛=`75.0000%`，Multi R@1=`18.7768%` 低于门槛=`21.110177404295052%`。`cum_002` 保住 Overall R@10/R@50=`69.9556/77.1111%`，Multi R@1=`23.0906%` 也过门，但 Overall/Single R@1=`26.3683/33.3333%` 未过门。结果表明 sequence-only 与 cumulative 小权重产生互补的子集收益；c1-only 明显不足。

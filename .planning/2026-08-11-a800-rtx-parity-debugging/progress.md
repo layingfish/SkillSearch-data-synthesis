@@ -279,3 +279,10 @@
 - 八个独立单卡 arm 已分别启动在 GPU `0–7`；source-length audit 和模型初始化均已通过。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`），日志未发现 Traceback、OOM 或 CUDA error。
 - 两个 disabled control 已完成 query updates=`38,805/38,805` 与 Official core75=`75` queries 评测；final model-state hash、best query step=`38,200`、best dev loss=`0.7701343703584546`、predictions 和指标均与历史 A800 workspace anchor exact（batch=`16`、seed=`20260626`、BF16、workspace=`:16:8`、beam=`50`、beam-order）。
 - 六个 prefix-loss arm 当前位于 query step=`31,000–32,050/38,805`；GPU `2–7` 继续训练，pod=`1/1 Running`、restart=`0`。按最近约 `30` 秒的日志推进速度估计，训练主体还需约 `20–30` 分钟，之后执行各路 Official core75=`75` queries、beam=`50` 评测与 matrix gate。
+
+## 2026-08-12：strict-base CE-prefix ranking 结果
+
+- job=`tide-chenyufei03-10603-gigmv` 的八个 arm 全部完成；worker 已清理。catalog、control replica、历史 anchor、candidate、score parity、执行次数和 finite audit 全部通过。
+- 两个 disabled control 的 model hash、predictions、best query step=`38,200`、best dev loss=`0.7701343703584546` 和 Official core75 指标均 exact（base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`、beam=`50`、beam-order）。
+- `seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为各自 dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
+- 六个非零 arm 均未通过联合门槛，`passing_arms=[]`、`selected_arm=null`，不进入多 seed。下一步先做 control/`seq_010`/`cum_002` 的 paired per-query error-overlap analysis，再决定如何合并 sequence Top-1 与 cumulative Multi/deep-recall 信号。

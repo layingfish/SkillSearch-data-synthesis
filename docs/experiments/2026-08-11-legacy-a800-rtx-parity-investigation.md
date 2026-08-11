@@ -196,9 +196,9 @@ met the recovery gate. Fixed-pool search and global position weighting are now
 also excluded as explanations for the Top-1 gap. No position-weight candidate
 qualifies for the original full-catalog beam evaluator.
 
-The next bounded training candidate retains CE and adds query-conditioned hard
+The bounded training candidate retained CE and added query-conditioned hard
 negatives at c1-diverging prefixes plus a cumulative-prefix or sequence-level
-ranking objective across c0--c3. The strict-parity control remains the archived
+ranking objective across c0--c3. The strict-parity control remained the archived
 base schedule: source rows=`94,912`, expanded rows=`124,175`, catalog
 updates=`2,730`, query updates=`38,805`, batch=`16`, seed=`20260626`, optimizer
 carry, BF16, and `CUBLAS_WORKSPACE_CONFIG=:16:8`. This keeps the training
@@ -210,6 +210,22 @@ and manifest SHA-256
 `8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`.
 Teacher top-50 supplies c1-diverging negatives for
 `86,305/124,175=69.5027%` of expanded base rows after sibling-GT exclusion.
+
+All eight arms completed under this contract. Both disabled controls reproduced
+the historical A800 model hash, predictions, best step, dev loss, and metrics
+exactly. No ranking-loss arm passed the joint gate. Sequence-only lambda=`0.10`
+reached Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`, Single R@1=`50.0000`,
+and Multi R@1=`18.7768`; cumulative lambda=`0.02` reached
+Overall=`26.3683/69.9556/77.1111`, Single R@1=`33.3333`, and Multi
+R@1=`23.0906`. Conditions are dev-best checkpoint, Official core75=`75`
+queries, beam=`50`, and beam-order. The former recovers Top-1 through Single
+queries while losing Multi/deep recall; the latter preserves Multi/deep recall
+but misses the Overall and Single Top-1 gates. No arm enters multi-seed locking.
+
+The next bounded step is a paired per-query error-overlap analysis of the
+sequence-only, cumulative lambda=`0.02`, and exact control predictions before
+designing another GPU sweep. The target is to preserve the complementary
+Single/Multi gains instead of increasing a global ranking weight.
 The enhanced query-only result R@1/R@10/R@50=`27.26/69.33/76.78` remains a
 separate method reference under source rows=`100,078`, global batch=`16`
 (`8` ranks x `2`), lr=`3e-4`, query epochs=`5`, catalog passes=`0`, Official

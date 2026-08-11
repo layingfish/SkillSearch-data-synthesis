@@ -244,7 +244,7 @@ position-score decomposition 已完成。control/warmup/clip 的 `3,061` 组 nor
 - 所有后续实验能复用同一 baseline config、checkpoint 选择和评测协议。
 - 没有 unresolved HIGH 级训练语义或 provenance 问题。
 
-## 当前训练候选：strict-base CE-prefix ranking
+## 已完成训练候选：strict-base CE-prefix ranking
 
 - 固定 base source queries=`94,912`、expanded rows=`124,175`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、optimizer carry、dev-best 与 `CUBLAS_WORKSPACE_CONFIG=:16:8`。
 - candidate bundle 固定 summary SHA-256=`72b0f525d6c3d9feabc7770c054ee70d8478f1b280d1a100793da8d5b6c6dd6d`、manifest SHA-256=`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`；teacher top-50 条件下 c1 negative coverage=`86,305/124,175=69.5027%`。
@@ -252,6 +252,8 @@ position-score decomposition 已完成。control/warmup/clip 的 `3,061` 组 nor
 - positive CE forward 保留原 batch shape/order；auxiliary decoder 在 forked CPU/CUDA RNG state 内运行并恢复主 RNG。cumulative loss 先在 depth=`2/3/4` 分别计算 softplus，再对 row×depth 求平均。
 - control 必须命中历史 model-state SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、prediction SHA-256=`3663a15ad9859abc76141d815f0da3c88bd9b3d5d9e914f09a3d8b0a3ed843f4`、best query step=`38,200` 与 dev loss=`0.7701343703584546`（上述 strict-base 条件）。
 - 除 Overall absolute gate 外，Single/Multi R@10/R@50 相对 concurrent control 的允许回退均为 `1.0` 个百分点（Official core75=`75` queries、beam=`50`、beam-order）。
+- 结果：六个非零 arm 的联合门槛通过数=`0/6`。`seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为各自 dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
+- 决策：不进入多 seed。先在已保存 predictions 上做 control/`seq_010`/`cum_002` 的逐 query error-overlap，定位 Single/Multi 互补样本，再设计下一轮限定 loss。
 
 ## 错误与防重复
 
