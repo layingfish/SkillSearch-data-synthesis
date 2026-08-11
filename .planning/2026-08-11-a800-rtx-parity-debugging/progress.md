@@ -273,4 +273,7 @@
 - 已实现 CE+cumulative-prefix loss、candidate bundle fail-closed loader、严格 legacy wrapper、Official core75 matrix analyzer、8卡 node launcher 与 Tianzhi bootstrap。
 - auxiliary decoder 使用 `torch.random.fork_rng` 保存并恢复主 CPU/CUDA RNG；positive CE forward 保持原 batch shape/order。训练第一批还会对 positive/negative depth=`2/3/4` full-sequence score 与 legacy stepwise decoder做 allclose。
 - frozen Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 跑完 `27` 项 focused tests，结果 `26` pass、`1` CUDA-only skip；source-only Ruff、bash syntax 与 diff check 通过。GPU preflight 会补跑 CUDA RNG invariant。
-- GPU job 尚未提交；等待 implementation cross-review 与 launch commit。
+- implementation cross-review 初次发现 `2` 项 HIGH：R@1 gate 使用显示值舍入、无合格 arm 时仍生成 fallback winner。两项已修复；复审结果为 CRITICAL=`0`、HIGH=`0`。
+- 实现已提交为 commit=`1310c8d8cda9275e07a1dbb961068876ed796de6`。Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
+- GPU job=`tide-chenyufei03-10603-gigmv` 已提交；worker 在 `1/1 Running`、restart=`0` 条件下通过固定 runtime、GPU count=`8` 与全部 `21` 项 node tests，包括 CUDA RNG invariant。
+- 八个独立单卡 arm 已分别启动在 GPU `0–7`；source-length audit 和模型初始化均已通过。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`），日志未发现 Traceback、OOM 或 CUDA error。

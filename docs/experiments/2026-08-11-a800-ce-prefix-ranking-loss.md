@@ -1,5 +1,5 @@
 # Experiment: A800 legacy CE-prefix ranking loss probe
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -28,7 +28,7 @@ Risk Tier: 3
 
 ## Commands
 
-Train: pending. Queue=`rudder-exper`，node=`1×8 A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。实际训练 runtime 从冻结 archive 加载：Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA package=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`。T5-base weight SHA-256=`a90903540cc02cbeb7ff9f823f1a80eb778c7e22426a0e620b01c77a5ec8f5b4`；archived pipeline SHA-256=`7b883cb7f56667cdaee8bf0227470a2eba2c6882096dc07a2f8f1c6914396b76`。
+Train: job=`tide-chenyufei03-10603-gigmv`，pod=`tide-chenyufei03-10603-gigmv-worker-0`，queue=`rudder-exper`，node=`1×8 A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`1310c8d8cda9275e07a1dbb961068876ed796de6`。实际训练 runtime 从冻结 archive 加载：Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA package=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`。T5-base weight SHA-256=`a90903540cc02cbeb7ff9f823f1a80eb778c7e22426a0e620b01c77a5ec8f5b4`；archived pipeline SHA-256=`7b883cb7f56667cdaee8bf0227470a2eba2c6882096dc07a2f8f1c6914396b76`。
 
 每路 catalog epochs=`3`（updates=`2,730`）、query epochs=`5`（updates=`38,805`）、batch=`16`、seed=`20260626`、AdamW lr=`3e-4`、weight decay=`0`、`foreach=None`、optimizer carry、scheduler=none、warmup=`0`、gradient clipping=disabled、BF16、dropout=`0.1`、max source length=`2048`、dev eval interval=`200` query updates、dev-best 回载、`CUBLAS_WORKSPACE_CONFIG=:16:8`。catalog→query 不重建 optimizer，不重置 Python/CPU/CUDA RNG；query 沿用同一个 `random.Random(seed=20260626)` 与 CUDA dropout stream。
 
@@ -57,7 +57,7 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_ce_prefix_ra
 
 - [x] `when gate=0, student_forward output must be allclose to base-model output`
 - [x] 冻结 torch=`2.10.0+cu128` CPU runtime 下，gate=`0` 的 output、gradient、single update exact；gate-on 但 rank contribution=`0` 时，当前/下一 batch CE、主 RNG、gradient、update exact
-- [ ] GPU preflight 重复 gate-on/rank contribution=`0` 的主 CUDA RNG 与下一 batch CE invariant
+- [x] GPU preflight 重复 gate-on/rank contribution=`0` 的主 CUDA RNG 与下一 batch CE invariant
 - [ ] 两个 full control 的 final model/predictions exact
 - [ ] 两个 control 命中 workspace anchor：model-state full SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、predictions SHA-256=`3663a15ad9859abc76141d815f0da3c88bd9b3d5d9e914f09a3d8b0a3ed843f4`、best query step=`38,200`、best dev loss=`0.7701343703584546`（base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`）
 - [ ] candidate manifest/source rows/semantic IDs SHA-256 与 checkpoint provenance 精确
@@ -66,7 +66,7 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_ce_prefix_ra
 - [ ] 同 query 的 positive/negative 在 depth=`2/3/4` 上，full-sequence cumulative full-vocab logprob 与 legacy stepwise decoder allclose（rtol=`1e-5`、atol=`5e-5`、FP32 preflight）；encoder cross-attention context与原 decoder prefix position保持完整
 - [ ] 每个 epoch 的 CE rows、eligible pairs、active comparisons 精确
 - [ ] loss/gradient 无 NaN/Inf，记录 peak GPU memory
-- [ ] Reviewer required? yes
+- [x] Reviewer required? yes
 
 ## Result / Notes
 
@@ -75,3 +75,5 @@ Absolute recovery gate：Overall R@1 `>=27.368253968253965%`、R@10 `>=69.0000%`
 Deep-recall gate：每个非零 arm 的 Single/Multi R@10/R@50 均不得低于两个 exact concurrent controls 的共同值超过 `1.0` 个百分点（Official core75 子集、beam=`50`、beam-order）。若多个 arm 通过，依次按 Overall R@1、Multi R@1、Single R@1、Overall R@10、较低 dev loss 选择。
 
 启动前验证：冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 下运行 `21` 项相关测试，`20` 项通过，`1` 项 CUDA-only 测试跳过；节点会在训练前补跑该 CUDA invariant。独立交叉审查初次发现 `2` 项 HIGH：R@1 gate 的显示值舍入，以及无过门 arm 时生成 fallback winner。两项已修复并加入回归测试。
+
+集群启动验证：pod 在 `1/1 Running`、restart=`0` 条件下识别到 `8` 张 GPU；冻结 runtime 字段全部命中。节点上的 `21` 项测试全部通过，包括 CUDA RNG invariant。GPU `0–7` 已分别拉起八个独立 arm。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`）；八路数值完全相同，符合 query ranking loss 尚未启用的预期。
