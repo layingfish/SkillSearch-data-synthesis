@@ -182,6 +182,16 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 - 每个 backend 内所有 arm 的 catalog-final model/optimizer/RNG、首批与 query step-1 pre-intervention gradient 必须 exact；两个 replica 分别要求 final model、best step/dev loss、predictions 与 metrics exact；
 - default/workspace control 必须精确命中 2026-08-09 历史 anchor；所有 arm 评测 Official core75=`75` queries、beam=`50`、beam-order，selection 只比较两个 workspace intervention arms。
 
+query stability ablation 已完成。workspace control/warmup/clip 的 Overall R@1/R@10/R@50=`20.9238/69.5556/75.3333`、`23.9905/64.8444/73.0000`、`23.8794/65.1778/73.3333`；条件为 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog/query base lr=`3e-4`、dropout=`0.1`、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。两项 intervention 均未通过完整门槛。
+
+逐 query 取证显示 RTX 与 workspace control/warmup/clip 的平均 Top50 共享率=`24.00%/26.35%/27.01%`；workspace 三路两两平均 Top50 共享率=`30.53%–33.23%`。条件为对每条 Official core75 query 的固定长度 Top50 集合求交集比例后取 `75` 条均值。下一步不再加入训练超参，先跑 fixed-pool scoring diagnostic：
+
+- 每条 query 的候选池固定为四路 beam-order Top50 union 加全部 gold；四个 checkpoint 使用 exact 同一 pool；
+- score 固定为四个 learned-code token 与 stop control=`1` 的 full-vocabulary CE log-prob 之和，不做 trie-child renormalization；逐 query beam capacity 等于 pool size，max skills=`1`，保证穷举；
+- 一个 `8×A800` 节点运行四个 checkpoint × 两个 Official core75 query shard；每个 shard 处理 `row_position % 2 == shard_id`；
+- 三个 A800 checkpoint 必须在自身 archived Top50 上满足 score replay 最大绝对误差 `<=5e-5`；否则停止解释 fixed-pool 结果；
+- 若 raw beam top-1 错误而 fixed-pool top-1 正确，归为 search omission；若 fixed-pool 仍错误，归为 checkpoint scoring failure。两类同时存在时，后续 baseline 需要改训练目标或 decoder/search，而不是继续枚举 backend flag。
+
 这一阶段得到的是新的 A800 稳定训练配方，报告中必须与“严格 legacy reproduction”分开命名。
 
 - **Status：in_progress**

@@ -227,3 +227,8 @@
 - RTX 与 workspace control/warmup/clip 的平均 Top50 共享率=`24.00%/26.35%/27.01%`；workspace 三路两两共享率=`30.53%–33.23%`。条件为逐 query 固定长度 Top50 集合交集比例后取 `75` 条均值。
 - 三路 A800 共同丢失的 RTX-correct query index=`{8,22,35,54,66}`。index=`8` 在三路 A800 Top50 都没有 gold；index=`54/66` 在三路都有 gold，但 top-1 score margin 仍为错误方向。
 - 下一动作：对四路 Top50 union 加全部 gold 构造逐 query fixed pool，在同一 pool 上穷举四个 checkpoint 的 CE log-prob。一个 `8×A800` 节点按四个 checkpoint × 两个 query shard 并行，区分 search omission 与 checkpoint scoring failure。
+- fixed-pool protocol 已冻结：learned code depth=`4`、stop control=`1`、full-vocabulary log-softmax、max skills=`1`、beam capacity=逐 query pool size、score replay atol=`5e-5`。RTX final 与 workspace control/warmup/clip final checkpoint 文件 SHA-256 已写入 experiment note。
+- 已实现 `score_legacy_core75_fixed_pool.py`、matrix analyzer、八卡 node launcher、Tianzhi bootstrap 和七项 focused tests。本地 source-only runtime 通过六项并跳过 torch fake；冻结的 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 跑完全部七项，exhaustive trie score 与逐 candidate step replay allclose。
+- `py_compile` 与两个 launcher 的 `bash -n` 通过。GPU job 尚未提交。
+- task plan 已重新 attestation，SHA-256 前缀=`61f0dca14238`（fixed-pool scoring protocol 冻结）。
+- 独立审查的三项 HIGH 已修：launcher 注入 exact base model；analyzer 校验 shard/input/runtime/checkpoint provenance；multi-GT 改为逐 gold mention 统计，并用 Official core75 的 `200` 个 gold mentions 反算 macro recall。A800 archived Top50 replay 还要求 Top-1/5/10/50 集合不变。
