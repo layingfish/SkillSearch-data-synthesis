@@ -214,3 +214,7 @@
 - 七个 legacy test modules 共 `40` 项在 Python=`3.10.12`、torch=`2.10.0+cu128` frozen runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
 - structured local review 已覆盖 query step-1 pre-intervention gradient、warmup step=`1/500/501` lr、global gradient 集合、clip 调用次数、load-best checkpoint、Official core75 评测和八卡映射，未发现 CRITICAL/HIGH 问题。
 - task plan 已重新 attestation，SHA-256 前缀=`63b87ab19d4c`（clipping 固定为 `foreach=True`）。
+- query stability 实现提交为 commit `06f48f736a82029b922f6685b5ce2e20eb81f025`；提交后 worktree clean。
+- Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。正式 job=`tide-chenyufei03-10599-dfvoq` 已提交，初始 pod 状态=`Init:0/1`、restart=`0`。
+- live runtime preflight 命中 Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`、GPU count=`8`；八个 arm 已分别在 GPU `0–7` 启动。
+- 八路均到 catalog step=`50/2,730`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16）。default 三路 loss 均为 `4.184667`，workspace 五路均为 `4.171228`；pod restart=`0`，日志无 Traceback/OOM/runtime error。

@@ -1,5 +1,5 @@
 # Experiment: Legacy A800 query stability ablation
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -12,7 +12,7 @@ warmup 仅作用于 query optimizer step。query step `s` 使用 lr=`3e-4 × min
 
 ## Commands
 
-Train: pending；queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
+Train: job=`tide-chenyufei03-10599-dfvoq`、queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`06f48f736a82029b922f6685b5ce2e20eb81f025`。
 
 每个 arm：catalog=`2,730` updates、query=`38,805` updates、batch=`16`、eval batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query base lr=`3e-4`、weight decay=`0`、betas=`(0.9,0.999)`、eps=`1e-8`、dropout=`0.1`、外层 BF16、每 `200` 个 query updates 评测 dev loss并选择 best。
 
@@ -44,3 +44,5 @@ Metrics: pending
 
 - 通过门槛：Overall R@1 `>=27.3683`、R@10 `>=69.0000`、R@50 `>=75.0000`（Official core75=`75` queries、beam=`50`、beam-order）；Single R@1 `>=41.6667`（Single=`24` queries）；Multi R@1 `>=21.1102`（Multi=`51` queries）。
 - 若 warmup 与 clip 都通过，按 Overall R@1、Single R@1、Multi R@1、Overall R@10、较低 dev loss 的顺序选择。若均失败，报告各自相对 workspace control 与对应 default pair 的变化，再决定是否有依据测试组合或结束 Phase 5。
+- live runtime preflight 已命中 Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`、GPU count=`8`；job=`tide-chenyufei03-10599-dfvoq`、restart=`0`。
+- 八个 arm 已分别启动在 GPU `0–7`。catalog step=`50` loss 在三条 default arms 均为 `4.184667`，在五条 `workspace_16` arms 均为 `4.171228`；条件为 catalog step=`50/2,730`、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16。日志没有训练错误。
