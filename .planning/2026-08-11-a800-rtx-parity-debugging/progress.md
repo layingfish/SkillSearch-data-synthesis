@@ -302,3 +302,6 @@
 - 首轮一个 `8×A800` 节点运行两个 disabled controls、fixed `seq_010/cum_002` anchors 与四个 hybrid arms；hybrid grid 为 Single sequence lambda=`{0.05,0.10}` × Multi cumulative lambda=`{0.01,0.02}`，每路各占一张 A800。
 - frozen Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 相关测试=`35` 项，结果为通过=`34`、CUDA-only 跳过=`1`；Ruff、`py_compile`、launcher `bash -n` 通过。本地缺少 `shellcheck`；节点 preflight 将补跑 fixed/conditional CUDA RNG invariant。
 - implementation cross-review 最终结论为 CRITICAL=`0`、HIGH=`0`；loss、fixed anchors、counts/gates 与 GPU `0–7` arm 映射均通过复核。
+- conditional hybrid 实现提交为 commit=`cad6fcf35d7e5353728f8a62bae1653dbbb59f21`。Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`；正式 job=`tide-chenyufei03-10607-crtcs` 已提交。
+- pod=`tide-chenyufei03-10607-crtcs-worker-0` 已在 ready=`1/1`、restart=`0` 条件下通过冻结 runtime 和节点测试=`35/35`，其中包含 fixed/conditional CUDA RNG invariant。GPU `0–7` 的八个独立 arm 已全部拉起。
+- 八路均到 catalog step=`50/2,730`，train loss=`4.171228`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、BF16、dropout=`0.1`、`:16:8`）；八路数值一致，日志未发现 Traceback/OOM/NaN/CUDA error。

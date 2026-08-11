@@ -1,6 +1,6 @@
 # Experiment: Legacy conditional prefix-ranking hybrid
 
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -24,7 +24,7 @@ Risk Tier: 3
 
 ## Commands
 
-Train: pending verified commit and Tianzhi job ID.
+Train: job=`tide-chenyufei03-10607-crtcs`，queue=`rudder-exper`，node=`1×8 A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`cad6fcf35d7e5353728f8a62bae1653dbbb59f21`。
 
 Eval: each arm uses Official core75=`75` queries、beam=`50`、beam-order、decoder head=`ce`、score transform=`logprob`、K=`{1,10,50}`。
 
@@ -45,7 +45,7 @@ Metrics: pending.
 - [x] Minimal local check
 - [x] Unit/invariant test if needed
 - [x] Reviewer required? yes
-- [ ] `gate=0` forward、gradient、update、next CE 与 base exact
+- [x] `gate=0` forward、gradient、update、next CE 与 base exact
 - [ ] `control_a/control_b` 命中 strict-base 历史 checkpoint、prediction、metrics hash
 - [ ] `seq_010/cum_002` 命中上一轮对应 checkpoint、prediction、metrics hash
 - [ ] gold cardinality 来自 hash-bound frozen manifest；expanded rows 与 manifest 闭合
@@ -64,3 +64,9 @@ Metrics: pending.
 本地验证：冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 下运行相关测试=`35` 项，结果为通过=`34`、CUDA-only 跳过=`1`；包含 mixed/Single-only/Multi-only 手算归一化、无 eligible row、Single 仅 depth=`4` gradient、Multi depths=`{2,3,4}` gradient、gold-count 传播与 conditional gate=`0` 的 forward/RNG/gradient/update/next-CE exact。节点 preflight 会在可见 GPU=`1` 条件下补跑 fixed/conditional CUDA RNG invariant。`ruff check`、`py_compile` 与两个 launcher 的 `bash -n` 已通过；本地未安装 `shellcheck`。
 
 implementation cross-review 最终结论：CRITICAL=`0`、HIGH=`0`。复核确认 loss 归一化、fixed anchor 兼容、eligible/active comparison 计数、旧 gate、无 fallback 语义和 GPU `0–7` arm 映射成立。
+
+Tianzhi dry-run 与正式请求均确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800` 和上述完整 launch commit。job=`tide-chenyufei03-10607-crtcs` 已提交。
+
+节点启动验证：pod=`tide-chenyufei03-10607-crtcs-worker-0` 在 ready=`1/1`、restart=`0` 条件下识别 GPU count=`8`；冻结 runtime 全部命中。节点测试=`35/35` 通过，包括 fixed/conditional gate=`0` 的 CUDA RNG、gradient、update 与 next-CE invariant。GPU `0–7` 已分别拉起八个独立 arm。
+
+训练已实际开始：八路均到 catalog step=`50/2,730`，train loss=`4.171228`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、BF16、dropout=`0.1`、`CUBLAS_WORKSPACE_CONFIG=:16:8`）。八路数值一致，符合 conditional auxiliary 仅在 query 阶段启用的预期；日志未发现 Traceback、OOM、NaN 或 CUDA error。
