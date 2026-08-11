@@ -89,6 +89,39 @@ EVAL_STEPS = 200
 QUERY_DEV_ROWS = EXPECTED_MANIFEST_ROW_COUNTS["query_dev_rows"]
 
 
+def query_lr_at_step(base_lr: float, query_step: int, warmup_steps: int) -> float:
+    if base_lr <= 0.0:
+        raise ValueError(f"base lr must be positive, got {base_lr}")
+    if query_step <= 0:
+        raise ValueError(f"query step must be positive, got {query_step}")
+    if warmup_steps < 0:
+        raise ValueError(f"warmup steps must be non-negative, got {warmup_steps}")
+    if warmup_steps == 0:
+        return float(base_lr)
+    return float(base_lr) * min(float(query_step) / float(warmup_steps), 1.0)
+
+
+def clip_query_gradients(model: Any, max_grad_norm: float) -> Any:
+    import torch
+
+    if not math.isfinite(max_grad_norm) or max_grad_norm <= 0.0:
+        raise ValueError(f"max grad norm must be finite and positive, got {max_grad_norm}")
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    if not parameters:
+        raise RuntimeError("gradient clipping requested with no trainable gradients")
+    return torch.nn.utils.clip_grad_norm_(
+        parameters,
+        max_norm=max_grad_norm,
+        norm_type=2.0,
+        error_if_nonfinite=True,
+        foreach=True,
+    )
+
+
 def expected_eval_steps(query_steps: int, eval_steps: int) -> list[int]:
     steps = list(range(eval_steps, query_steps + 1, eval_steps))
     if not steps or steps[-1] != query_steps:
@@ -97,7 +130,12 @@ def expected_eval_steps(query_steps: int, eval_steps: int) -> list[int]:
 
 
 def validate_loss_history(
-    events: list[dict[str, Any]], *, query_lr: float, query_steps: int, eval_steps: int
+    events: list[dict[str, Any]],
+    *,
+    query_lr: float,
+    query_steps: int,
+    eval_steps: int,
+    query_warmup_steps: int = 0,
 ) -> dict[str, Any]:
     observed_eval_steps = [
         int(row["step"])
@@ -115,15 +153,23 @@ def validate_loss_history(
         for row in events
         if row.get("stage") == "catalog" and row.get("event") == "train"
     }
-    query_lrs = {
-        float(row["lr"])
+    query_lr_events = [
+        (int(row["step"]), float(row["lr"]))
         for row in events
         if row.get("stage") == "query" and row.get("event") == "train"
-    }
+    ]
+    if not query_lr_events:
+        raise ValueError("query lr history is empty")
+    query_lrs = {lr for _, lr in query_lr_events}
     if catalog_lrs != {3e-4}:
         raise ValueError(f"catalog lr history mismatch: {catalog_lrs}")
-    if query_lrs != {float(query_lr)}:
-        raise ValueError(f"query lr history mismatch: {query_lrs}")
+    mismatched_query_lrs = [
+        (step, observed_lr, query_lr_at_step(query_lr, step, query_warmup_steps))
+        for step, observed_lr in query_lr_events
+        if observed_lr != query_lr_at_step(query_lr, step, query_warmup_steps)
+    ]
+    if mismatched_query_lrs:
+        raise ValueError(f"query lr history mismatch: {mismatched_query_lrs[:5]}")
     best = min(
         (
             row
@@ -138,6 +184,7 @@ def validate_loss_history(
         "best_dev_loss": float(best["dev_loss"]),
         "catalog_logged_lrs": sorted(catalog_lrs),
         "query_logged_lrs": sorted(query_lrs),
+        "query_warmup_steps": query_warmup_steps,
     }
 
 
@@ -168,6 +215,8 @@ class FullQueryObserver:
         query_steps: int,
         eval_steps: int,
         batch_size: int,
+        query_warmup_steps: int = 0,
+        query_max_grad_norm: float | None = None,
     ) -> None:
         if optimizer_mode not in OPTIMIZER_MODES:
             raise ValueError(f"unsupported optimizer mode: {optimizer_mode}")
@@ -177,6 +226,24 @@ class FullQueryObserver:
         self.query_steps = int(query_steps)
         self.eval_steps = int(eval_steps)
         self.batch_size = int(batch_size)
+        self.query_warmup_steps = int(query_warmup_steps)
+        self.query_max_grad_norm = (
+            None if query_max_grad_norm is None else float(query_max_grad_norm)
+        )
+        if self.query_warmup_steps < 0:
+            raise ValueError(
+                f"query warmup steps must be non-negative, got {self.query_warmup_steps}"
+            )
+        if self.query_max_grad_norm is not None and (
+            not math.isfinite(self.query_max_grad_norm)
+            or self.query_max_grad_norm <= 0.0
+        ):
+            raise ValueError(
+                "query max grad norm must be finite and positive, "
+                f"got {self.query_max_grad_norm}"
+            )
+        if self.query_warmup_steps and self.query_max_grad_norm is not None:
+            raise ValueError("query warmup and gradient clipping must be tested separately")
         self.model = None
         self.optimizer = None
         self.optimizer_steps = 0
@@ -189,6 +256,15 @@ class FullQueryObserver:
         self.catalog: dict[str, Any] = {}
         self.transition: dict[str, Any] = {}
         self.query_step_1: dict[str, Any] = {}
+        self.query_lr_trace: dict[str, float] = {}
+        self.clipping: dict[str, Any] = {
+            "max_grad_norm": self.query_max_grad_norm,
+            "norm_type": 2.0,
+            "foreach": True,
+            "calls": 0,
+            "sampled_clipped_calls": 0,
+            "pre_clip_norm_samples": {},
+        }
         self.checkpoint_saves: list[dict[str, Any]] = []
 
     def remember_model(self, model: Any) -> Any:
@@ -305,6 +381,35 @@ class FullQueryObserver:
                         optimizer
                     ),
                 }
+            query_step = next_step - self.catalog_steps
+            if query_step > 0:
+                effective_lr = query_lr_at_step(
+                    self.query_lr, query_step, self.query_warmup_steps
+                )
+                if self.query_warmup_steps:
+                    set_optimizer_lr(optimizer, effective_lr)
+                lr_trace_steps = {1, self.query_steps}
+                if self.query_warmup_steps:
+                    lr_trace_steps.update(
+                        {
+                            min(self.query_warmup_steps, self.query_steps),
+                            min(self.query_warmup_steps + 1, self.query_steps),
+                        }
+                    )
+                if query_step in lr_trace_steps:
+                    self.query_lr_trace[str(query_step)] = effective_lr
+                if self.query_max_grad_norm is not None:
+                    pre_clip_norm_tensor = clip_query_gradients(
+                        self.model, self.query_max_grad_norm
+                    )
+                    self.clipping["calls"] += 1
+                    if query_step in {1, 50, 500, self.query_steps}:
+                        pre_clip_norm = float(pre_clip_norm_tensor.detach().cpu())
+                        self.clipping["pre_clip_norm_samples"][str(query_step)] = (
+                            pre_clip_norm
+                        )
+                        if pre_clip_norm > self.query_max_grad_norm:
+                            self.clipping["sampled_clipped_calls"] += 1
             result = original_step(*args, **kwargs)
             self.optimizer_steps = next_step
             return result
@@ -384,6 +489,42 @@ class FullQueryObserver:
         }
         if transition_lrs != {self.query_lr}:
             raise ValueError(f"query lr transition mismatch: {transition_lrs}")
+        expected_lr_trace_steps = {1, self.query_steps}
+        if self.query_warmup_steps:
+            expected_lr_trace_steps.update(
+                {
+                    min(self.query_warmup_steps, self.query_steps),
+                    min(self.query_warmup_steps + 1, self.query_steps),
+                }
+            )
+        expected_lr_trace = {
+            str(step): query_lr_at_step(
+                self.query_lr, step, self.query_warmup_steps
+            )
+            for step in expected_lr_trace_steps
+        }
+        if self.query_lr_trace != expected_lr_trace:
+            raise ValueError(
+                f"query lr trace mismatch: expected={expected_lr_trace}, "
+                f"observed={self.query_lr_trace}"
+            )
+        expected_clip_calls = (
+            self.query_steps if self.query_max_grad_norm is not None else 0
+        )
+        if self.clipping["calls"] != expected_clip_calls:
+            raise ValueError(
+                "query gradient-clipping call mismatch: "
+                f"expected={expected_clip_calls}, observed={self.clipping['calls']}"
+            )
+        if not 0 <= self.clipping["sampled_clipped_calls"] <= len(
+            self.clipping["pre_clip_norm_samples"]
+        ):
+            raise ValueError(f"invalid clipping counts: {self.clipping}")
+        if any(
+            not math.isfinite(float(value))
+            for value in self.clipping["pre_clip_norm_samples"].values()
+        ):
+            raise ValueError(f"non-finite clipping norm sample: {self.clipping}")
         save_names = [row["name"] for row in self.checkpoint_saves]
         if save_names.count("best") < 1 or save_names.count("last") != 1 or save_names.count("final") != 1:
             raise ValueError(f"checkpoint save policy mismatch: {save_names}")
@@ -468,6 +609,8 @@ def command_run(args: argparse.Namespace) -> None:
         query_steps=args.query_steps,
         eval_steps=args.eval_steps,
         batch_size=args.batch_size,
+        query_warmup_steps=args.query_warmup_steps,
+        query_max_grad_norm=args.query_max_grad_norm,
     )
     dropout_modules: list[Any] = []
     original_dropout = torch.nn.Dropout
@@ -550,6 +693,7 @@ def command_run(args: argparse.Namespace) -> None:
         query_lr=args.query_lr,
         query_steps=args.query_steps,
         eval_steps=args.eval_steps,
+        query_warmup_steps=args.query_warmup_steps,
     )
     if manifest["query_best_dev_loss"] != history_summary["best_dev_loss"]:
         raise ValueError(
@@ -580,6 +724,8 @@ def command_run(args: argparse.Namespace) -> None:
         "path": args.path,
         "optimizer_mode": args.optimizer_mode,
         "query_lr": args.query_lr,
+        "query_warmup_steps": args.query_warmup_steps,
+        "query_max_grad_norm": args.query_max_grad_norm,
         "catalog_steps": args.catalog_steps,
         "query_steps": args.query_steps,
         "eval_steps": args.eval_steps,
@@ -632,6 +778,10 @@ def command_run(args: argparse.Namespace) -> None:
         "catalog_boundary": observer.catalog,
         "optimizer_transition": observer.transition,
         "query_step_1": observer.query_step_1,
+        "query_stability": {
+            "lr_trace": observer.query_lr_trace,
+            "gradient_clipping": observer.clipping,
+        },
         "training": {
             "history": history_summary,
             "manifest": manifest,
@@ -665,6 +815,8 @@ def command_run(args: argparse.Namespace) -> None:
                 "arm": args.arm,
                 "query_lr": args.query_lr,
                 "optimizer_mode": args.optimizer_mode,
+                "query_warmup_steps": args.query_warmup_steps,
+                "query_max_grad_norm": args.query_max_grad_norm,
                 "best_step": history_summary["best_step"],
                 "best_dev_loss": history_summary["best_dev_loss"],
                 "final_model_sha256": final_checkpoint["model_state_sha256"]["full"],
@@ -678,10 +830,14 @@ def command_run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", required=True)
-    parser.add_argument("--role", choices=("selection", "replica", "anchor"), required=True)
+    parser.add_argument(
+        "--role", choices=("selection", "replica", "anchor", "pair"), required=True
+    )
     parser.add_argument("--path", choices=("default", "workspace_16"), required=True)
     parser.add_argument("--optimizer-mode", choices=OPTIMIZER_MODES, required=True)
     parser.add_argument("--query-lr", type=float, required=True)
+    parser.add_argument("--query-warmup-steps", type=int, default=0)
+    parser.add_argument("--query-max-grad-norm", type=float)
     parser.add_argument("--pipeline", type=Path, required=True)
     parser.add_argument("--rows", type=Path, required=True)
     parser.add_argument("--dev-rows", type=Path, required=True)
@@ -728,6 +884,20 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.query_lr <= 0.0:
         raise ValueError(f"query lr must be positive, got {args.query_lr}")
+    if args.query_warmup_steps < 0:
+        raise ValueError(
+            f"query warmup steps must be non-negative, got {args.query_warmup_steps}"
+        )
+    if args.query_max_grad_norm is not None and (
+        not math.isfinite(args.query_max_grad_norm)
+        or args.query_max_grad_norm <= 0.0
+    ):
+        raise ValueError(
+            "query max grad norm must be finite and positive, "
+            f"got {args.query_max_grad_norm}"
+        )
+    if args.query_warmup_steps and args.query_max_grad_norm is not None:
+        raise ValueError("query warmup and gradient clipping must be tested separately")
     if not 0.0 <= args.dropout_rate <= 1.0:
         raise ValueError(f"dropout-rate must be in [0, 1], got {args.dropout_rate}")
     args.func(args)

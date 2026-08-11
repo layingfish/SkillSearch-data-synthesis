@@ -178,7 +178,7 @@ Phase 2 的 BF16 control 作为固定 reference，不重复占用 GPU；新 anal
 - backend=`{default, workspace_16}` × intervention=`{control, warmup, clip}`，共六个完整单卡 arm；
 - 另外运行 `workspace_16/warmup` 与 `workspace_16/clip` 各一个 exact replica，共两个完整单卡 arm；
 - warmup 仅作用于 query optimizer step：第 `s` 步使用 `3e-4 × min(s/500, 1)`，因此 query step=`1/500/501` 的 lr=`6e-7/3e-4/3e-4`；
-- clipping 仅作用于 query backward 后、AdamW step 前，global L2 `max_grad_norm=1.0`、`foreach=False`、非有限 norm 直接失败；
+- clipping 仅作用于 query backward 后、AdamW step 前，global L2 `max_grad_norm=1.0`、`foreach=True`、非有限 norm 直接失败；
 - 每个 backend 内所有 arm 的 catalog-final model/optimizer/RNG、首批与 query step-1 pre-intervention gradient 必须 exact；两个 replica 分别要求 final model、best step/dev loss、predictions 与 metrics exact；
 - default/workspace control 必须精确命中 2026-08-09 历史 anchor；所有 arm 评测 Official core75=`75` queries、beam=`50`、beam-order，selection 只比较两个 workspace intervention arms。
 

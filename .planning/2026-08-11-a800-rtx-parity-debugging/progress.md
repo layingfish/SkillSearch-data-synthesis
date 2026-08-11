@@ -204,3 +204,13 @@
 - reset/query lr=`{1e-4,2e-4,3e-4}` 的 Overall R@1=`22.5460/24.3238/21.9238`；相同 lr 的 carry 为 `17.8794/25.4794/20.9238`。reset 没有形成一致的 Top-1 改善方向；条件为上条统一条件。
 - Phase 5 继续在 carry/query lr=`3e-4` 上分别测试 query `warmup_steps=500` 与 query `max_grad_norm=1.0`。下一节点使用 backend=`{default,workspace_16}` × intervention=`{control,warmup,clip}` 六路，加 workspace warmup/clip 各一个 exact replica，占满 `8×A800`。
 - task plan 已重新 attestation，SHA-256 前缀=`0953d3bd5727`（Phase 5 stability ablation 设计冻结）。
+
+## 2026-08-11：Phase 5 query stability ablation 实现
+
+- full-query wrapper 已增加两个互斥的 query-only 控制：`warmup_steps=500` 使用 lr=`3e-4 × min(query_step/500,1)`；`max_grad_norm=1.0` 在 backward 后、AdamW step 前执行 global L2 clipping，固定 `foreach=True`、非有限 norm 直接失败。catalog optimizer step 不进入两条控制路径。
+- clipping 每个 query update 调用一次，只在 query step=`{1,50,500,38805}` 把 pre-clip norm 同步到 CPU；条件为 query=`38,805` updates、batch=`16`。这保留审计证据，同时避免每步额外 CPU/GPU 同步。
+- 八卡矩阵固定为 backend=`{default,workspace_16}` × intervention=`{control,warmup,clip}` 六路，加 workspace warmup/clip 各一个 exact replica；GPU `0–7` 各运行一个独立单卡进程。
+- analyzer 将分别审计 default 三路和 workspace 五路 catalog invariant、两组 intervention replica、两条历史 final-model/predictions hash，并只用 workspace warmup/clip 做 Official core75 选择。
+- 七个 legacy test modules 共 `40` 项在 Python=`3.10.12`、torch=`2.10.0+cu128` frozen runtime 下全部通过；`py_compile`、`bash -n` 与 `git diff --check` 通过。
+- structured local review 已覆盖 query step-1 pre-intervention gradient、warmup step=`1/500/501` lr、global gradient 集合、clip 调用次数、load-best checkpoint、Official core75 评测和八卡映射，未发现 CRITICAL/HIGH 问题。
+- task plan 已重新 attestation，SHA-256 前缀=`63b87ab19d4c`（clipping 固定为 `foreach=True`）。
