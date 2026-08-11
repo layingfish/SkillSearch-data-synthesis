@@ -10,7 +10,7 @@ import os
 from collections import Counter, defaultdict
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from scripts.analyze_legacy_core75_query_ranks import (
     numeric_summary,
@@ -108,7 +108,10 @@ def load_system_shards(
         if not (shard_dir / "shard.done").is_file():
             raise FileNotFoundError(f"{label}: missing shard.done in {shard_dir}")
         manifest = read_json(shard_dir / "manifest.json")
-        if manifest.get("artifact_format") != "legacy_core75_fixed_pool_score_shard_v1":
+        if manifest.get("artifact_format") not in {
+            "legacy_core75_fixed_pool_score_shard_v1",
+            "legacy_core75_fixed_pool_score_shard_v2",
+        }:
             raise ValueError(f"{label}: unsupported shard artifact in {shard_dir}")
         if manifest.get("label") != label:
             raise ValueError(f"{label}: manifest label mismatch in {shard_dir}")
@@ -543,6 +546,33 @@ def analyze(
     }
     if len(scoring_protocols) != 1:
         raise ValueError("scoring protocol differs across shards")
+
+    def model_input_semantics(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
+        model_inputs = manifest.get("model_inputs")
+        if model_inputs is None:
+            if manifest.get("artifact_format") == "legacy_core75_fixed_pool_score_shard_v2":
+                raise ValueError("score shard v2 is missing model-input provenance")
+            return None
+        base_model = model_inputs["base_model"]
+        tokenizer = model_inputs["tokenizer"]
+        return {
+            "base_model": {
+                "config_json_sha256": base_model["config_json_sha256"],
+                "model_safetensors_sha256": base_model[
+                    "model_safetensors_sha256"
+                ],
+            },
+            "tokenizer": {
+                "tokenizer_json_sha256": tokenizer["tokenizer_json_sha256"],
+                "tokenizer_semantic_config_sha256": tokenizer[
+                    "tokenizer_semantic_config_sha256"
+                ],
+                "tokenized_query_inputs_sha256": tokenizer[
+                    "tokenized_query_inputs_sha256"
+                ],
+            },
+        }
+
     shared_projections = {
         json.dumps(
             {
@@ -552,6 +582,7 @@ def analyze(
                 ],
                 "rows_sha256": manifest["rows_sha256"],
                 "prediction_inputs": manifest["prediction_inputs"],
+                "model_input_semantics": model_input_semantics(manifest),
                 "implementation": manifest["implementation"],
                 "runtime": manifest["runtime"],
             },
@@ -565,6 +596,13 @@ def analyze(
     for label, rows in manifests.items():
         if len({row["checkpoint_file_sha256"] for row in rows}) != 1:
             raise ValueError(f"{label}: checkpoint hash differs across shards")
+        if len(
+            {
+                json.dumps(row.get("model_inputs"), sort_keys=True)
+                for row in rows
+            }
+        ) != 1:
+            raise ValueError(f"{label}: model-input provenance differs across shards")
         validation = [row["score_replay_validation"] for row in rows]
         if label == reference_label:
             if any(row["available"] for row in validation):
@@ -698,6 +736,7 @@ def analyze(
             "shard_merge": True,
             "row_and_pool_alignment": True,
             "input_implementation_runtime_alignment": True,
+            "model_input_semantics_alignment": True,
             "exhaustive_pool_coverage": True,
             "score_replay": {
                 label: {

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export SKILLGR_FIXED_POOL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/experiments/legacy_core75_position_score_decomposition_20260811_v1
+export SKILLGR_BOOTSTRAP_LOG=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/bootstrap_logs/legacy_core75_position_score_decomposition_20260811_v1.log
+export SKILLGR_POSITION_ANALYSIS=1
+
+exec bash /mnt/cfs_algo_bj/workspace/chenyufei03/SkillSearch-data-synthesis/scripts/run_legacy_core75_fixed_pool_tianzhi_20260811.sh

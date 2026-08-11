@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/legacy_core75_fixed_pool_scoring_20260811_v1"
+OUTPUT_ROOT="${SKILLGR_FIXED_POOL_OUTPUT_ROOT:-${PHYSICAL_OUTPUT_BASE}/experiments/legacy_core75_fixed_pool_scoring_20260811_v1}"
 PY310_RUNTIME_ROOT=/models_rw/SkillSearch-data-synthesis/runtime/torch210-tf53-py310-v1
 PY310_RUNTIME_ARCHIVE="${PY310_RUNTIME_ROOT}/runtime.tar.zst"
 PY310_RUNTIME_ARCHIVE_SHA256=6102937effeaf983f44455c47adfce34ef2adc1afffcef6f5c6193288bb36b72
@@ -12,6 +12,10 @@ PY311_SITE_ARCHIVE="${PY311_RUNTIME_ROOT}/site.tar.zst"
 PY311_SITE_ARCHIVE_SHA256=c6ac264c8519eec039614af6e5357b56434ca4d2981d34bfdbdde5fe9272d2b2
 BASE_MODEL=/models_rw/SkillSearch-data-synthesis/base_models/t5-base-a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1
 BASE_MODEL_SHA256=a90903540cc02cbeb7ff9f823f1a80eb778c7e22426a0e620b01c77a5ec8f5b4
+BASE_MODEL_CONFIG_SHA256=46dd7cb62d29c81fb551e0ef1ea274c24a46ba441eeb948897706252933df033
+TOKENIZER_JSON_SHA256=65430662114922dc57697bc782fc1122cd004547611abfcd520fe1a50f125bd9
+RTX_TOKENIZER_CONFIG_SHA256=b9bd8a1f615bd012bfa742dbe9f303a5c6fffb10d9b48e07d1759912dd0701bb
+A800_TOKENIZER_CONFIG_SHA256=ffad9890875f013e214d6f17a54dbb2a8e0870b5c568bdb591be770c2ccf2524
 
 RTX_CHECKPOINT=/models_rw/SkillSearch-data-synthesis/assets-models/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/single_sid_d4_lightgcn_d32_letterofficial_task5_core75_gt2_t5base_cat3_querye5_b16/final
 RTX_CHECKPOINT_SHA256=b92daf62e604f35dbecbb5c80897de9d212995d13c312f0f149f781caf5c0848
@@ -105,7 +109,19 @@ actual = {
 }
 if actual != expected:
     raise SystemExit(f"fixed-pool runtime mismatch: expected={expected}, actual={actual}")
-print(json.dumps({"runtime": actual, "torch_config": torch.__config__.show()}, sort_keys=True))
+gpu_names = [torch.cuda.get_device_name(index) for index in range(actual["gpu_count"])]
+if any("A800" not in name for name in gpu_names):
+    raise SystemExit(f"fixed-pool GPU model mismatch: expected=A800, actual={gpu_names}")
+print(
+    json.dumps(
+        {
+            "runtime": actual,
+            "gpu_names": gpu_names,
+            "torch_config": torch.__config__.show(),
+        },
+        sort_keys=True,
+    )
+)
 PY
 
 set -a
@@ -114,12 +130,21 @@ source "${CODE_ROOT}/configs/legacy_catalog_base_exact_runtime_20260808.env"
 set +a
 
 check_sha256 "${BASE_MODEL}/model.safetensors" "${BASE_MODEL_SHA256}"
+check_sha256 "${BASE_MODEL}/config.json" "${BASE_MODEL_CONFIG_SHA256}"
 check_sha256 "${SKILLGR_OFFICIAL_ROWS}" "${SKILLGR_OFFICIAL_ROWS_SHA256}"
 check_sha256 "${SKILLGR_SEMANTIC_IDS}" "${SKILLGR_SEMANTIC_IDS_SHA256}"
 check_sha256 "${RTX_CHECKPOINT}/structured_decoder.pt" "${RTX_CHECKPOINT_SHA256}"
 check_sha256 "${CONTROL_CHECKPOINT}/structured_decoder.pt" "${CONTROL_CHECKPOINT_SHA256}"
 check_sha256 "${WARMUP_CHECKPOINT}/structured_decoder.pt" "${WARMUP_CHECKPOINT_SHA256}"
 check_sha256 "${CLIP_CHECKPOINT}/structured_decoder.pt" "${CLIP_CHECKPOINT_SHA256}"
+check_sha256 "${RTX_CHECKPOINT}/tokenizer.json" "${TOKENIZER_JSON_SHA256}"
+check_sha256 "${CONTROL_CHECKPOINT}/tokenizer.json" "${TOKENIZER_JSON_SHA256}"
+check_sha256 "${WARMUP_CHECKPOINT}/tokenizer.json" "${TOKENIZER_JSON_SHA256}"
+check_sha256 "${CLIP_CHECKPOINT}/tokenizer.json" "${TOKENIZER_JSON_SHA256}"
+check_sha256 "${RTX_CHECKPOINT}/tokenizer_config.json" "${RTX_TOKENIZER_CONFIG_SHA256}"
+check_sha256 "${CONTROL_CHECKPOINT}/tokenizer_config.json" "${A800_TOKENIZER_CONFIG_SHA256}"
+check_sha256 "${WARMUP_CHECKPOINT}/tokenizer_config.json" "${A800_TOKENIZER_CONFIG_SHA256}"
+check_sha256 "${CLIP_CHECKPOINT}/tokenizer_config.json" "${A800_TOKENIZER_CONFIG_SHA256}"
 check_sha256 "${RTX_PREDICTIONS}" "${RTX_PREDICTIONS_SHA256}"
 check_sha256 "${CONTROL_PREDICTIONS}" "${CONTROL_PREDICTIONS_SHA256}"
 check_sha256 "${WARMUP_PREDICTIONS}" "${WARMUP_PREDICTIONS_SHA256}"
@@ -127,8 +152,10 @@ check_sha256 "${CLIP_PREDICTIONS}" "${CLIP_PREDICTIONS_SHA256}"
 
 "${PYTHON_BIN}" -m py_compile \
   "${CODE_ROOT}/scripts/score_legacy_core75_fixed_pool.py" \
-  "${CODE_ROOT}/scripts/analyze_legacy_core75_fixed_pool.py"
+  "${CODE_ROOT}/scripts/analyze_legacy_core75_fixed_pool.py" \
+  "${CODE_ROOT}/scripts/analyze_legacy_core75_position_scores.py"
 "${PYTHON_BIN}" -m unittest discover -s tests -p 'test_legacy_core75_fixed_pool.py'
+"${PYTHON_BIN}" -m unittest discover -s tests -p 'test_legacy_core75_position_scores.py'
 
 declare -a PIDS=()
 declare -A LABEL_BY_PID=()
@@ -214,3 +241,17 @@ fi
   --shard "workspace_clip1=${OUTPUT_ROOT}/shards/workspace_clip1/shard_1" \
   --reference-label rtx_archived --expected-rows 75 --expected-shards 2 \
   --output-root "${OUTPUT_ROOT}"
+
+if [[ "${SKILLGR_POSITION_ANALYSIS:-0}" == "1" ]]; then
+  "${PYTHON_BIN}" "${CODE_ROOT}/scripts/analyze_legacy_core75_position_scores.py" \
+    --shard "rtx_archived=${OUTPUT_ROOT}/shards/rtx_archived/shard_0" \
+    --shard "rtx_archived=${OUTPUT_ROOT}/shards/rtx_archived/shard_1" \
+    --shard "workspace_control=${OUTPUT_ROOT}/shards/workspace_control/shard_0" \
+    --shard "workspace_control=${OUTPUT_ROOT}/shards/workspace_control/shard_1" \
+    --shard "workspace_warmup500=${OUTPUT_ROOT}/shards/workspace_warmup500/shard_0" \
+    --shard "workspace_warmup500=${OUTPUT_ROOT}/shards/workspace_warmup500/shard_1" \
+    --shard "workspace_clip1=${OUTPUT_ROOT}/shards/workspace_clip1/shard_0" \
+    --shard "workspace_clip1=${OUTPUT_ROOT}/shards/workspace_clip1/shard_1" \
+    --reference-label rtx_archived --expected-rows 75 --expected-shards 2 \
+    --output-root "${OUTPUT_ROOT}"
+fi

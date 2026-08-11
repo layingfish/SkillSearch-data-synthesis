@@ -236,3 +236,14 @@
 - fixed-pool job=`tide-chenyufei03-10601-weesu` 已完成，pod restart=`0`。八个 shards、A800 score replay、Top-1/5/10/50 集合、shard provenance、pool/gold coverage 和 Official core75 的 `200` 个 gold mentions 守恒全部通过。
 - 四路 raw→fixed 的 top-1 gained/lost 都是 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query fixed top-1 恢复均为 `0`。条件为 Official core75=`75` queries、pool=four beam-order Top50 union plus all gold、四个 learned-code full-vocabulary log-probs 加 stop control=`1`、逐 query 穷举。R@1 缺口已定位到 checkpoint learned scoring。
 - task plan 已重新 attestation，SHA-256 前缀=`d288da586667`（fixed-pool 结果已写入，下一步冻结为 position-score decomposition）。
+
+## 2026-08-11：position-score decomposition 实现
+
+- fixed-pool scorer 已保存每个 candidate 的五项 contribution：code position=`0/1/2/3` 与 stop control=`1`。每行强制五项求和重建 total score，uniform weights=`[1,1,1,1,1]` 强制精确重建 fixed-pool 排名。
+- position analyzer 固定搜索 `3,061` 组 normalized weights；条件为五个 raw weights 各取 `{0.5,0.75,1.0,1.25,1.5}`、按 tuple mean 归一化并按八位小数去重。每路 A800 先过 fixed-pool R@10/R@50=`69.0000/75.0000` 门槛，再按 R@1/R@10/R@50 与 uniform L2 distance 选择。
+- 五折诊断固定按 `row_position % 5` 切分；每折 train=`60`、heldout=`15`（Official core75=`75` queries、同一 fixed pool）。无 deep-gate 候选时只报告 ineligible best-effort weighting。
+- 新 manifest 记录 base-model `config.json`/`model.safetensors`、checkpoint tokenizer 原始文件、去掉 `is_local` 后的 semantic config，以及 Official core75=`75` queries、max source length=`2048` 条件下实际 `input_ids`/`attention_mask` 全量 hash。analyzer 强制跨系统对齐实际 tokenizer 输入。
+- 独立 launcher 固定新 output/bootstrap log、`SKILLGR_POSITION_ANALYSIS=1`，并在启动时要求 node 可见 GPU count=`8` 且每张设备名称包含 `A800`。
+- 冻结 Python=`3.10.12`、torch=`2.10.0+cu128`、NumPy 可用环境下，fixed-pool=`9/9`、position-score=`6/6` 测试通过；`py_compile`、三个 launcher 的 `bash -n`、Ruff 与 `git diff --check` 通过。
+- 旧 v1 fixed-pool 产物重跑后逐 query JSONL SHA-256 保持 `2379a329f7832a39531427cba81c63bc63fa4ce1e67b3e8bb889ea8148c0ed8c`；summary 只新增 model-input alignment 验证字段。
+- 独立复核未发现 CRITICAL/HIGH 问题。GPU job 尚未提交。

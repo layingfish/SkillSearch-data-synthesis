@@ -21,6 +21,8 @@ from scripts.score_legacy_core75_fixed_pool import (
     file_sha256,
     pipeline,
     score_single_candidate_stepwise,
+    tokenized_query_inputs_sha256,
+    tokenizer_semantic_config_sha256,
     validate_archived_scores,
 )
 
@@ -57,6 +59,28 @@ class FixedPoolConstructionTest(unittest.TestCase):
                 "workspace_clip1": 2,
             },
         )
+        self.assertIn('if any("A800" not in name for name in gpu_names):', launcher)
+
+    def test_position_launcher_binds_output_log_and_analysis(self):
+        root = Path(__file__).resolve().parents[1]
+        launcher = (
+            root
+            / "scripts"
+            / "run_legacy_core75_position_scores_tianzhi_20260811.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "SKILLGR_FIXED_POOL_OUTPUT_ROOT=/mnt/cfs_algo_bj/models/experiments/"
+            "chenyufei03/SkillSearch-data-synthesis/experiments/"
+            "legacy_core75_position_score_decomposition_20260811_v1",
+            launcher,
+        )
+        self.assertIn(
+            "SKILLGR_BOOTSTRAP_LOG=/mnt/cfs_algo_bj/models/experiments/"
+            "chenyufei03/SkillSearch-data-synthesis/bootstrap_logs/"
+            "legacy_core75_position_score_decomposition_20260811_v1.log",
+            launcher,
+        )
+        self.assertIn("SKILLGR_POSITION_ANALYSIS=1", launcher)
 
     def test_union_pool_adds_gold_and_aligns_inputs(self):
         systems = {
@@ -70,6 +94,37 @@ class FixedPoolConstructionTest(unittest.TestCase):
             indexed, indices, known_skill_ids={"a", "b", "c", "gold"}
         )
         self.assertEqual(pools[0], ["a", "b", "c", "gold"])
+
+    def test_tokenizer_provenance_ignores_only_is_local_and_hashes_inputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = Path(tmpdir) / "first.json"
+            second = Path(tmpdir) / "second.json"
+            first.write_text(
+                json.dumps({"backend": "tokenizers", "is_local": False}),
+                encoding="utf-8",
+            )
+            second.write_text(
+                json.dumps({"backend": "tokenizers", "is_local": True}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                tokenizer_semantic_config_sha256(first),
+                tokenizer_semantic_config_sha256(second),
+            )
+
+        class FakeTokenizer:
+            def __call__(self, texts, **_kwargs):
+                length = len(texts[0])
+                return {"input_ids": [[length, 1]], "attention_mask": [[1, 1]]}
+
+        rows = [{"index": 7, "query": "same query"}]
+        first_hash = tokenized_query_inputs_sha256(
+            FakeTokenizer(), rows, max_source_length=2048
+        )
+        second_hash = tokenized_query_inputs_sha256(
+            FakeTokenizer(), rows, max_source_length=2048
+        )
+        self.assertEqual(first_hash, second_hash)
 
     def test_archived_score_replay_threshold_is_enforced(self):
         row = {
@@ -120,7 +175,7 @@ class FixedPoolScoreSemanticsTest(unittest.TestCase):
         encoder = torch.zeros((1, 1, 3))
         mask = torch.ones((1, 1), dtype=torch.long)
         model = self.FakeModel()
-        ranked, scores, audit = exhaustive_score_candidate_pool(
+        ranked, scores, score_components, audit = exhaustive_score_candidate_pool(
             model,
             encoder,
             mask,
@@ -131,6 +186,7 @@ class FixedPoolScoreSemanticsTest(unittest.TestCase):
             semantic_id_mode=pipeline.SEMANTIC_ID_MODE_LEARNED,
         )
         self.assertEqual(set(ranked), set(semantic_ids))
+        self.assertEqual(set(score_components), set(semantic_ids))
         self.assertEqual(audit["capacity"], 3)
         for skill_id, codes in semantic_ids.items():
             expected = score_single_candidate_stepwise(
@@ -144,6 +200,12 @@ class FixedPoolScoreSemanticsTest(unittest.TestCase):
                 semantic_id_mode=pipeline.SEMANTIC_ID_MODE_LEARNED,
             )
             self.assertAlmostEqual(scores[skill_id], expected, places=6)
+            self.assertEqual(len(score_components[skill_id]), 3)
+            self.assertAlmostEqual(
+                sum(score_components[skill_id]),
+                scores[skill_id],
+                places=6,
+            )
 
 
 def fixed_row(label, position, raw, fixed, gold, scores):

@@ -17,7 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import skill_gr_pipeline as pipeline
+import skill_gr_pipeline as pipeline  # noqa: E402
 
 
 def file_sha256(path: Path) -> str:
@@ -33,6 +33,41 @@ def stable_json_sha256(payload: Any) -> str:
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def tokenizer_semantic_config_sha256(path: Path) -> str:
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError(f"tokenizer config must be an object: {path}")
+    config.pop("is_local", None)
+    return stable_json_sha256(config)
+
+
+def tokenized_query_inputs_sha256(
+    tokenizer,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    max_source_length: int,
+) -> str:
+    projection = []
+    for row_position, row in enumerate(rows):
+        encoded = tokenizer(
+            [pipeline.decoder_source_text(row)],
+            padding=True,
+            truncation=True,
+            max_length=max_source_length,
+        )
+        projection.append(
+            {
+                "row_position": row_position,
+                "index": int(row["index"]),
+                "input_ids": [int(value) for value in encoded["input_ids"][0]],
+                "attention_mask": [
+                    int(value) for value in encoded["attention_mask"][0]
+                ],
+            }
+        )
+    return stable_json_sha256(projection)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -234,7 +269,12 @@ def exhaustive_score_candidate_pool(
     depth: int,
     dedup_size: int,
     semantic_id_mode: str,
-) -> tuple[list[str], dict[str, float], dict[str, Any]]:
+) -> tuple[
+    list[str],
+    dict[str, float],
+    dict[str, list[float]],
+    dict[str, Any],
+]:
     import torch
     import torch.nn.functional as F
 
@@ -258,6 +298,7 @@ def exhaustive_score_candidate_pool(
             "model_score": 0.0,
             "planner_score": 0.0,
             "stopped": False,
+            "score_components": [],
         }
     ]
     frontier_sizes: list[int] = []
@@ -321,18 +362,21 @@ def exhaustive_score_candidate_pool(
                 reverse=True,
             )
             for log_prob, value in ranked_allowed:
-                candidates.append(
-                    pipeline.advance_structured_beam(
-                        beam,
-                        target_type,
-                        value,
-                        log_prob,
-                        codebook_size,
-                        depth,
-                        dedup_size,
-                        semantic_id_mode,
-                    )
+                advanced = pipeline.advance_structured_beam(
+                    beam,
+                    target_type,
+                    value,
+                    log_prob,
+                    codebook_size,
+                    depth,
+                    dedup_size,
+                    semantic_id_mode,
                 )
+                advanced["score_components"] = [
+                    *beam.get("score_components", []),
+                    log_prob,
+                ]
+                candidates.append(advanced)
         if len(candidates) > capacity:
             raise ValueError(
                 f"pool frontier={len(candidates)} exceeds exhaustive capacity={capacity}"
@@ -356,10 +400,38 @@ def exhaustive_score_candidate_pool(
         raise ValueError("exhaustive scorer did not return the exact candidate pool")
     if set(scores) != set(ranked):
         raise ValueError("exhaustive scorer is missing ranked scores")
+    score_components: dict[str, list[float]] = {}
+    for beam in beams:
+        if len(beam["completed"]) != 1:
+            raise ValueError("single-skill exhaustive beam must contain one completion")
+        skill_id = sequence_to_skill_id.get(tuple(beam["completed"][0]))
+        if skill_id is None or skill_id in score_components:
+            raise ValueError("single-skill exhaustive beam has an invalid completion")
+        components = [float(value) for value in beam.get("score_components", [])]
+        if len(components) != semantic_length + 1:
+            raise ValueError(
+                f"candidate={skill_id}: expected {semantic_length + 1} score components, "
+                f"found {len(components)}"
+            )
+        if not math.isclose(
+            math.fsum(components),
+            float(scores[skill_id]),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"candidate={skill_id}: component sum differs from total score")
+        score_components[skill_id] = components
+    if set(score_components) != set(ranked):
+        raise ValueError("exhaustive scorer is missing score components")
     ordered_scores = [scores[skill_id] for skill_id in ranked]
     if any(left < right for left, right in zip(ordered_scores, ordered_scores[1:])):
         raise ValueError("exhaustive scores are not monotonic")
-    return ranked, scores, {"frontier_sizes": frontier_sizes, "capacity": capacity}
+    return (
+        ranked,
+        scores,
+        score_components,
+        {"frontier_sizes": frontier_sizes, "capacity": capacity},
+    )
 
 
 def score_single_candidate_stepwise(
@@ -517,6 +589,30 @@ def command_score(args: argparse.Namespace) -> None:
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     tokenizer = load_tokenizer(args.checkpoint_dir)
+    tokenizer_json_path = args.checkpoint_dir / "tokenizer.json"
+    tokenizer_config_path = args.checkpoint_dir / "tokenizer_config.json"
+    base_config_path = args.base_model / "config.json"
+    base_weights_path = args.base_model / "model.safetensors"
+    model_inputs = {
+        "base_model": {
+            "path": str(args.base_model),
+            "config_json_sha256": file_sha256(base_config_path),
+            "model_safetensors_sha256": file_sha256(base_weights_path),
+        },
+        "tokenizer": {
+            "path": str(args.checkpoint_dir),
+            "tokenizer_json_sha256": file_sha256(tokenizer_json_path),
+            "tokenizer_config_json_sha256": file_sha256(tokenizer_config_path),
+            "tokenizer_semantic_config_sha256": tokenizer_semantic_config_sha256(
+                tokenizer_config_path
+            ),
+            "tokenized_query_inputs_sha256": tokenized_query_inputs_sha256(
+                tokenizer,
+                rows,
+                max_source_length=args.max_source_length,
+            ),
+        },
+    }
     model, checkpoint, sid_config = load_model(
         args.checkpoint_dir,
         args.base_model,
@@ -552,15 +648,17 @@ def command_score(args: argparse.Namespace) -> None:
             candidate_semantic_ids = {
                 skill_id: semantic_ids[skill_id] for skill_id in pool
             }
-            ranked, scores, exhaustive_audit = exhaustive_score_candidate_pool(
-                model,
-                encoder_hidden_states,
-                attention_mask,
-                candidate_semantic_ids,
-                codebook_size=int(sid_config["codebook_size"]),
-                depth=int(sid_config["depth"]),
-                dedup_size=int(sid_config["dedup_size"]),
-                semantic_id_mode=semantic_id_mode,
+            ranked, scores, score_components, exhaustive_audit = (
+                exhaustive_score_candidate_pool(
+                    model,
+                    encoder_hidden_states,
+                    attention_mask,
+                    candidate_semantic_ids,
+                    codebook_size=int(sid_config["codebook_size"]),
+                    depth=int(sid_config["depth"]),
+                    dedup_size=int(sid_config["dedup_size"]),
+                    semantic_id_mode=semantic_id_mode,
+                )
             )
             score_validation = validate_archived_scores(
                 scores,
@@ -585,6 +683,7 @@ def command_score(args: argparse.Namespace) -> None:
                     "pool_size": len(pool),
                     "fixed_ranked_skill_ids": ranked,
                     "fixed_ranked_skill_scores": scores,
+                    "fixed_ranked_skill_score_components": score_components,
                     "raw_ranked_skill_ids": indexed[args.label][index][
                         "ranked_skill_ids"
                     ],
@@ -623,7 +722,7 @@ def command_score(args: argparse.Namespace) -> None:
         {"index": index, "pool_skill_ids": pools[index]} for index in indices
     ]
     manifest = {
-        "artifact_format": "legacy_core75_fixed_pool_score_shard_v1",
+        "artifact_format": "legacy_core75_fixed_pool_score_shard_v2",
         "label": args.label,
         "shard_id": args.shard_id,
         "num_shards": args.num_shards,
@@ -632,6 +731,7 @@ def command_score(args: argparse.Namespace) -> None:
         "checkpoint_dir": str(args.checkpoint_dir),
         "checkpoint_file_sha256": observed_checkpoint_sha,
         "checkpoint_method_setting": checkpoint.get("method_setting"),
+        "model_inputs": model_inputs,
         "semantic_ids": str(args.semantic_ids),
         "semantic_ids_file_sha256": file_sha256(args.semantic_ids),
         "semantic_ids_logical_sha256": pipeline.semantic_ids_sha256(
@@ -655,6 +755,13 @@ def command_score(args: argparse.Namespace) -> None:
             "decoder_head": "ce",
             "score_transform": "full_vocabulary_logprob",
             "components": "four learned-code tokens plus stop control=1",
+            "component_labels": [
+                *[
+                    f"code_position_{position}"
+                    for position in range(int(sid_config["depth"]))
+                ],
+                "stop_control_1",
+            ],
             "trie_child_renormalization": False,
             "max_skills": 1,
             "exhaustive_capacity": "per-query pool size",
