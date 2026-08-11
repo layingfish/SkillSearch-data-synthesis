@@ -232,3 +232,4 @@
 - `py_compile` 与两个 launcher 的 `bash -n` 通过。GPU job 尚未提交。
 - task plan 已重新 attestation，SHA-256 前缀=`61f0dca14238`（fixed-pool scoring protocol 冻结）。
 - 独立审查的三项 HIGH 已修：launcher 注入 exact base model；analyzer 校验 shard/input/runtime/checkpoint provenance；multi-GT 改为逐 gold mention 统计，并用 Official core75 的 `200` 个 gold mentions 反算 macro recall。A800 archived Top50 replay 还要求 Top-1/5/10/50 集合不变。
+- fixed-pool job=`tide-chenyufei03-10601-weesu` 已提交；条件为 `rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`349505d88e246b6e45430189c59bb4858ea70386`。

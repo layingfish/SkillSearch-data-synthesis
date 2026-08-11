@@ -1,5 +1,5 @@
 # Experiment: Legacy core75 fixed-pool scoring
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -12,9 +12,9 @@ Risk Tier: 2
 
 ## Commands
 
-Score: pending
+Score: job=`tide-chenyufei03-10601-weesu`，queue=`rudder-exper`，nodes=`1`，节点规格=`8×A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`349505d88e246b6e45430189c59bb4858ea70386`。节点内运行四个 checkpoint × 两个 Official core75 row-position shards，共八个单卡 scorer。
 
-Analyze: pending
+Analyze: 八个 shard 全部成功后，同一作业内合并每个 checkpoint 的两个 shards，并输出 fixed-pool summary、逐 query 结果和验证状态。
 
 ## Outputs
 
@@ -41,6 +41,8 @@ Checkpoints:
 ## Result / Notes
 
 Pending.
+
+- `tide-chenyufei03-10601-weesu` 已提交；条件为 `rudder-exper`、nodes=`1`、节点规格=`8×A800`、Official core75=`75` queries、pool=four beam-order Top50 union plus all gold。
 
 - 四个 checkpoint 的 metadata 均为 max source length=`2,048`、source text policy=`skillrouter_query_1500_chars_with_instruction_v1`、codebook size=`256`、depth=`4`、dedup size=`0`；条件为直接读取各自 `structured_decoder.pt`。
 - 本地 source-only runtime 通过六项并跳过一项 torch fake；冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 通过全部七项 focused tests。
