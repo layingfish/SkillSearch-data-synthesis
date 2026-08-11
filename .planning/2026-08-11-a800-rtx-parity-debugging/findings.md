@@ -142,6 +142,12 @@
 - strict-base CE-prefix job=`tide-chenyufei03-10603-gigmv` 的两个 disabled control 精确命中历史 A800 model hash、predictions、best step=`38,200`、best dev loss=`0.7701343703584546` 和全部指标；条件为 base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`、Official core75=`75` queries、beam=`50`、beam-order。
 - `seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为上述 strict-base 训练与各自 dev-best checkpoint。sequence-only 恢复 Overall/Single Top-1 但损失 Multi/deep recall；cumulative lambda=`0.02` 保住 Multi/deep recall但未恢复 Overall/Single Top-1。
 - 六个非零 arm 的联合门槛通过数为 `0/6`（Official core75=`75` queries、Overall/Single/Multi 与 deep-recall gates）；c1-only lambda=`0.10` 的 Overall R@1/R@10/R@50=`22.5905/63.8889/69.4444`。单独监督 c1 不足，下一轮应先分析 `seq_010` 与 `cum_002` 的逐 query 互补性。
+- paired error-overlap 显示 Single 子集的 sequence top-1 hit set 包含 control/cumulative 的全部命中，Multi 子集的 cumulative top-1 hit set包含 control/sequence 的全部命中。条件为 control/`seq_010`/`cum_002`、Official core75=`75` queries、beam=`50`、beam-order；pattern conservation 和独立指标重算均通过。
+- 使用 gold cardinality 诊断性地选择 Single→sequence、Multi→cumulative，Overall R@1/R@10/R@50=`31.7016/72.6222/75.7778`，其中 R@1 与逐 query oracle=`31.7016` 相同；条件为同一 Official core75。该结果不能作为推理 router，但直接支持在一个模型内按训练 query 的 gold count 使用 conditional loss。
+- 条件 loss 的主候选为 Single sequence lambda=`0.10`、Multi cumulative lambda=`0.02`，同时保留原 CE。Multi cumulative R@50=`85.9477`，相对 control=`87.2549` 回退=`1.3072` 个点（Multi=`51` queries、beam=`50`、beam-order），下一轮仍需用 `1.0`-point non-inferiority gate约束深召回。
+- frozen candidate manifest SHA-256=`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d` 对应 source Single/Multi=`77,455/17,457`、expanded Single/Multi=`77,455/46,720`、每 query epoch eligible Single/Multi=`54,135/32,170`；canonical `(candidate_key,gold_count)` mapping SHA-256=`016728eb7681486d41eb83a9de27fa32c56e70adce1a0b17d47d8631bff796aa`。
+- conditional hybrid 的归一化固定为 per-row active-depth mean → group lambda → eligible-row mean。Single 只从 depth=`4` 接收 ranking gradient；Multi 从 depths=`{2,3,4}` 接收 ranking gradient。该定义保留 expanded-row CE 的行权重语义。
+- 独立计划复核无 CRITICAL，指出 Official core75=`75` queries 重复用于假设生成与权重选择。本轮因此只作探索性选择；正式稳定性使用 seeds=`{20260626,20260627,20260628}`，最终锁定后仅对 seed=`20260626` 跑一次 canonical private test=`1,000` queries 且不回选。
 
 ## 参考资料
 

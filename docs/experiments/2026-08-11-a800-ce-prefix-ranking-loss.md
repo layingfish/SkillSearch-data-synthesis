@@ -95,3 +95,7 @@ Deep-recall gate：每个非零 arm 的 Single/Multi R@10/R@50 均不得低于�
 | `seq_010` | sequence-only / `0.10` | `28.7683 / 70.5873 / 73.8889` | `50.0000` | `18.7768` | fail |
 
 没有 arm 通过全部门槛，`passing_arms=[]`、`selected_arm=null`，因此不进入多 seed。`seq_010` 把 Overall R@1 提到 `28.7683%`，超过 RTX=`28.3683%`，Single R@1 也达到 `50.0000%`；但 Overall R@50=`73.8889%` 低于门槛=`75.0000%`，Multi R@1=`18.7768%` 低于门槛=`21.110177404295052%`。`cum_002` 保住 Overall R@10/R@50=`69.9556/77.1111%`，Multi R@1=`23.0906%` 也过门，但 Overall/Single R@1=`26.3683/33.3333%` 未过门。结果表明 sequence-only 与 cumulative 小权重产生互补的子集收益；c1-only 明显不足。
+
+后续逐 query 配对分析见 `docs/experiments/2026-08-12-legacy-ce-prefix-error-overlap.md`。Single 的 sequence top-1 hit set 和 Multi 的 cumulative top-1 hit set分别包含另外两路的命中；按 gold cardinality 组合的诊断 R@1=`31.7016%`（Official core75=`75` queries、beam=`50`、beam-order），与三路逐 query oracle 相同。
+
+单 checkpoint conditional hybrid 训练见 `docs/experiments/2026-08-12-legacy-conditional-prefix-hybrid.md`。首轮 grid 固定为 Single sequence lambda=`{0.05,0.10}` × Multi cumulative lambda=`{0.01,0.02}`（其余 strict-base 条件不变）。

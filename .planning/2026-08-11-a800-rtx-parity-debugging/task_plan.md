@@ -254,6 +254,11 @@ position-score decomposition 已完成。control/warmup/clip 的 `3,061` 组 nor
 - 除 Overall absolute gate 外，Single/Multi R@10/R@50 相对 concurrent control 的允许回退均为 `1.0` 个百分点（Official core75=`75` queries、beam=`50`、beam-order）。
 - 结果：六个非零 arm 的联合门槛通过数=`0/6`。`seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为各自 dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
 - 决策：不进入多 seed。先在已保存 predictions 上做 control/`seq_010`/`cum_002` 的逐 query error-overlap，定位 Single/Multi 互补样本，再设计下一轮限定 loss。
+- paired error-overlap 已完成。Single 的 sequence top-1 hit set与 Multi 的 cumulative top-1 hit set分别包含另外两路的全部命中；按 gold cardinality 组合的诊断 Overall R@1/R@10/R@50=`31.7016/72.6222/75.7778`（Official core75=`75` queries、beam=`50`、beam-order），R@1 与逐 query oracle相同。
+- 下一训练候选：同一个 checkpoint 内保留 CE；Single rows 使用 sequence lambda=`0.10`，Multi rows 使用 cumulative lambda=`0.02`。query 类型只在训练时由 frozen manifest 的 `gold_skill_ids` 数量决定，推理协议不变。Multi R@50 继续使用相对 concurrent control 最多回退 `1.0` 个百分点的硬门槛。
+- conditional hybrid 首轮固定一个 `8×A800` 节点：两个 disabled controls、fixed `seq_010/cum_002` anchors，以及 Single sequence lambda=`{0.05,0.10}` × Multi cumulative lambda=`{0.01,0.02}` 四个 selection arms。每路独占一张 A800；其余 strict-base 条件保持不变。
+- conditional loss 对每个 eligible expanded row 先在 active depths 内取 mean，再乘组内 lambda，最后对 batch eligible rows 取 mean。frozen manifest 条件下，query epochs=`5` 的 Single/Multi presentations=`270,675/160,850`，active comparisons=`270,675/482,550`，合计=`753,225`。
+- Official core75=`75` queries 已参与 scope/lambda 提议，本轮结果标记为探索性选择。没有 hybrid arm 通过原 absolute/deep-recall gate 时写 `selected_arm=null`；有 arm 通过后才进入 seeds=`{20260626,20260627,20260628}` 和一次不回选的 canonical private test=`1,000` queries。
 
 ## 错误与防重复
 

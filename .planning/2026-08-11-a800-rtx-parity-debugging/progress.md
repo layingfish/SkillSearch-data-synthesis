@@ -286,3 +286,19 @@
 - 两个 disabled control 的 model hash、predictions、best query step=`38,200`、best dev loss=`0.7701343703584546` 和 Official core75 指标均 exact（base source queries=`94,912`、catalog updates=`2,730`、query updates=`38,805`、batch=`16`、seed=`20260626`、BF16、`:16:8`、beam=`50`、beam-order）。
 - `seq_010` 的 Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889`、Single R@1=`50.0000`、Multi R@1=`18.7768`；`cum_002` 对应 Overall=`26.3683/69.9556/77.1111`、Single R@1=`33.3333`、Multi R@1=`23.0906`。条件为各自 dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。
 - 六个非零 arm 均未通过联合门槛，`passing_arms=[]`、`selected_arm=null`，不进入多 seed。下一步先做 control/`seq_010`/`cum_002` 的 paired per-query error-overlap analysis，再决定如何合并 sequence Top-1 与 cumulative Multi/deep-recall 信号。
+
+## 2026-08-12：paired error-overlap 结果
+
+- 新增 `analyze_legacy_ce_prefix_error_overlap.py` 与合成测试；新旧 query-rank analyzer 合计 `5` 项测试、Ruff、`py_compile` 和 diff check 全部通过。
+- control/`seq_010`/`cum_002` 的 `75` 条 Official core75 predictions 在 index、source index、query、gold、target count 上 exact 对齐；独立重算 R@1/R@10/R@50 与已有 result summary 在 atol=`1e-12` 内一致。
+- Single 子集的 sequence top-1 hit set包含 control/cumulative 的全部命中；Multi 子集的 cumulative top-1 hit set包含 control/sequence 的全部命中。按 gold cardinality 诊断性组合的 Overall R@1/R@10/R@50=`31.7016/72.6222/75.7778`（Official core75=`75` queries、beam=`50`、beam-order），其中 R@1 与逐 query oracle相同。
+- 输出 summary/per-query/report SHA-256 分别为 `4460df1c571a04b94280cd0654ff74e0e4e9b538f3c80c06934ed31f3ade2e3d`、`ed00c1ec5a4bb7c30fc289aab8674048263635e521ec9888ee51fd05ac2a03fe`、`7f66c47ce75db0f2fd437af7cba06633faadac7801a0a866b361b9b8c4cbdb8f`；路径为 ignored `outputs/legacy_ce_prefix_error_overlap_20260812_v1/`。
+- 下一训练候选收敛为 conditional hybrid：Single rows 用 sequence lambda=`0.10`，Multi rows 用 cumulative lambda=`0.02`，原 CE 保留；推理仍为单 checkpoint 与原 beam decoder。
+
+## 2026-08-12：conditional prefix hybrid 实现
+
+- 独立计划复核无 CRITICAL；三项 HIGH 已处理：Official core75=`75` queries 的结果标记为探索性、原 performance gate 与 `selected_arm=null` 写死、单侧 ablation 延后到首轮有 arm 过门后。
+- 已实现 manifest-bound gold cardinality、conditional loss、双组 score parity、group presentation/comparison audit 和 fixed-scope 兼容路径。canonical `(candidate_key,gold_count)` mapping SHA-256=`016728eb7681486d41eb83a9de27fa32c56e70adce1a0b17d47d8631bff796aa`（manifest SHA-256=`8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d`）。
+- 首轮一个 `8×A800` 节点运行两个 disabled controls、fixed `seq_010/cum_002` anchors 与四个 hybrid arms；hybrid grid 为 Single sequence lambda=`{0.05,0.10}` × Multi cumulative lambda=`{0.01,0.02}`，每路各占一张 A800。
+- frozen Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 相关测试=`35` 项，结果为通过=`34`、CUDA-only 跳过=`1`；Ruff、`py_compile`、launcher `bash -n` 通过。本地缺少 `shellcheck`；节点 preflight 将补跑 fixed/conditional CUDA RNG invariant。
+- implementation cross-review 最终结论为 CRITICAL=`0`、HIGH=`0`；loss、fixed anchors、counts/gates 与 GPU `0–7` arm 映射均通过复核。

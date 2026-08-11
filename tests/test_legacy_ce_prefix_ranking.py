@@ -12,7 +12,10 @@ except ModuleNotFoundError:  # Local source-only environments may omit torch.
 
 from scripts.legacy_ce_prefix_ranking import (
     FrozenC1Candidates,
+    PrefixRankingRuntime,
     attach_prefix_ranking_forward,
+    candidate_key,
+    conditional_prefix_ranking_loss,
     cumulative_prefix_scores,
     prefix_ranking_loss,
 )
@@ -84,6 +87,111 @@ class FrozenC1CandidatesTest(unittest.TestCase):
         self.assertEqual(candidates.source_rows, 1)
         self.assertEqual(candidates.gold_mentions, 1)
         self.assertEqual(candidates.selected_mentions, 1)
+        self.assertEqual(set(candidates.gold_count_by_key.values()), {1})
+        self.assertEqual(candidates.source_rows_by_group, {"single": 1})
+        self.assertEqual(candidates.gold_mentions_by_group, {"single": 1})
+        self.assertEqual(candidates.selected_mentions_by_group, {"single": 1})
+
+    @unittest.skipIf(torch is None, "torch is unavailable")
+    def test_gold_cardinality_is_propagated_and_counted_from_frozen_manifest(self):
+        rows = [
+            {"index": 3, "query": "multi", "positive_skill_id": "gold-a"},
+            {"index": 3, "query": "multi", "positive_skill_id": "gold-b"},
+        ]
+        keys = [candidate_key(row, row["positive_skill_id"]) for row in rows]
+        candidates = FrozenC1Candidates(
+            negative_by_key={keys[0]: "neg-a", keys[1]: "neg-b"},
+            gold_count_by_key={keys[0]: 2, keys[1]: 2},
+            semantic_ids={
+                "gold-a": (1, 2, 3, 4),
+                "gold-b": (1, 2, 3, 5),
+                "neg-a": (1, 7, 8, 9),
+                "neg-b": (1, 6, 8, 9),
+            },
+            source_rows=1,
+            source_rows_by_group={"multi": 1},
+            gold_mentions=2,
+            gold_mentions_by_group={"multi": 2},
+            selected_mentions=2,
+            selected_mentions_by_group={"multi": 2},
+            candidate_limit=50,
+            manifest_sha256="manifest",
+            summary_sha256="summary",
+        )
+        runtime = PrefixRankingRuntime(
+            candidates=candidates,
+            scope="disabled",
+            epochs=1,
+            grouping="gold_cardinality",
+            single_scope="sequence_only",
+            multi_scope="cumulative",
+        )
+
+        def expander():
+            return copy.deepcopy(rows)
+
+        train_rows = runtime.wrap_expander(expander)()
+        runtime.wrap_expander(expander)()
+
+        def builder(batch_rows):
+            batch_size = len(batch_rows)
+            return {
+                "input_ids": torch.ones(batch_size, 3, dtype=torch.long),
+                "decoder_input_ids": torch.ones(batch_size, 5, dtype=torch.long),
+                "decoder_attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
+                "target_types": torch.arange(5).repeat(batch_size, 1),
+                "labels": torch.ones(batch_size, 5, dtype=torch.long),
+            }
+
+        batch = runtime.wrap_batch_builder(builder)(train_rows)
+        torch.testing.assert_close(
+            batch["prefix_rank_gold_counts"], torch.tensor([2, 2])
+        )
+        execution = runtime.validate()
+        self.assertEqual(
+            execution["eligible_pair_presentations_by_group"], {"multi": 2}
+        )
+        self.assertEqual(execution["active_comparisons"], 6)
+
+    @unittest.skipIf(torch is None, "torch is unavailable")
+    def test_batch_with_no_eligible_negative_preserves_base_batch(self):
+        row = {"index": 4, "query": "no-negative", "positive_skill_id": "gold"}
+        key = candidate_key(row, "gold")
+        candidates = FrozenC1Candidates(
+            negative_by_key={key: None},
+            gold_count_by_key={key: 1},
+            semantic_ids={"gold": (1, 2, 3, 4)},
+            source_rows=1,
+            source_rows_by_group={"single": 1},
+            gold_mentions=1,
+            gold_mentions_by_group={"single": 1},
+            selected_mentions=0,
+            selected_mentions_by_group={},
+            candidate_limit=50,
+            manifest_sha256="manifest",
+            summary_sha256="summary",
+        )
+        runtime = PrefixRankingRuntime(
+            candidates=candidates,
+            scope="disabled",
+            epochs=1,
+            grouping="gold_cardinality",
+        )
+
+        def expander():
+            return [dict(row)]
+
+        train_rows = runtime.wrap_expander(expander)()
+        runtime.wrap_expander(expander)()
+
+        def builder(batch_rows):
+            return {"input_ids": torch.ones(len(batch_rows), 2, dtype=torch.long)}
+
+        batch = runtime.wrap_batch_builder(builder)(train_rows)
+        self.assertNotIn("prefix_rank_eligible_indices", batch)
+        execution = runtime.validate()
+        self.assertEqual(execution["eligible_pair_presentations"], 0)
+        self.assertEqual(execution["active_comparisons"], 0)
 
 
 @unittest.skipIf(torch is None, "torch is unavailable")
@@ -123,12 +231,8 @@ class PrefixRankingTensorTest(unittest.TestCase):
             decoder_attention_mask,
         ):
             del encoder_attention_mask, decoder_attention_mask
-            base = encoder_hidden_states.expand(
-                -1, decoder_input_ids.shape[1], -1
-            )
-            return self.dropout(
-                base + decoder_input_ids.float().unsqueeze(-1) * 0.01
-            )
+            base = encoder_hidden_states.expand(-1, decoder_input_ids.shape[1], -1)
+            return self.dropout(base + decoder_input_ids.float().unsqueeze(-1) * 0.01)
 
         def logits_for_next_type_from_encoder(
             self,
@@ -209,7 +313,7 @@ class PrefixRankingTensorTest(unittest.TestCase):
         expected = cumulative[:, [1, 2, 3]]
         torch.testing.assert_close(observed, expected)
 
-    def _assert_zero_contribution_invariant(self, device_name):
+    def _assert_zero_contribution_invariant(self, device_name, *, conditional=False):
         device = torch.device(device_name)
         torch.manual_seed(17)
         if device.type == "cuda":
@@ -217,41 +321,50 @@ class PrefixRankingTensorTest(unittest.TestCase):
         base = self.TinyModel().to(device)
         student = copy.deepcopy(base)
         trace = {}
-        attach_prefix_ranking_forward(
-            student,
-            weight=0.0,
-            scope="cumulative",
-            temperature=1.0,
-            trace=trace,
-            execute_when_zero=True,
-        )
+        attach_kwargs = {
+            "weight": 0.0,
+            "scope": "disabled" if conditional else "cumulative",
+            "temperature": 1.0,
+            "trace": trace,
+            "execute_when_zero": True,
+        }
+        if conditional:
+            attach_kwargs.update(
+                {
+                    "grouping": "gold_cardinality",
+                    "single_scope": "sequence_only",
+                    "single_weight": 0.0,
+                    "multi_scope": "cumulative",
+                    "multi_weight": 0.0,
+                }
+            )
+        attach_prefix_ranking_forward(student, **attach_kwargs)
         batch = {
             "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
             "attention_mask": torch.ones(2, 3, dtype=torch.long),
-            "decoder_input_ids": torch.tensor(
-                [[1, 1, 2, 3, 4], [1, 2, 3, 4, 0]]
-            ),
+            "decoder_input_ids": torch.tensor([[1, 1, 2, 3, 4], [1, 2, 3, 4, 0]]),
             "decoder_attention_mask": torch.ones(2, 5, dtype=torch.long),
             "target_types": torch.arange(5).repeat(2, 1),
             "labels": torch.tensor([[1, 2, 3, 4, 1], [2, 3, 4, 0, 1]]),
         }
         auxiliary = {
             "prefix_rank_eligible_indices": torch.tensor([0]),
-            "prefix_rank_negative_decoder_input_ids": torch.tensor(
-                [[1, 1, 4, 3, 2]]
-            ),
+            "prefix_rank_negative_decoder_input_ids": torch.tensor([[1, 1, 4, 3, 2]]),
             "prefix_rank_negative_decoder_attention_mask": torch.ones(
                 1, 5, dtype=torch.long
             ),
             "prefix_rank_negative_labels": torch.tensor([[1, 4, 3, 2, 1]]),
             "prefix_rank_query_step": 1,
         }
+        if conditional:
+            auxiliary["prefix_rank_gold_counts"] = torch.tensor([1])
         batch = {key: value.to(device) for key, value in batch.items()}
         auxiliary = {
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in auxiliary.items()
         }
         if device.type == "cuda":
+
             def get_rng_state():
                 return torch.cuda.get_rng_state(device)
 
@@ -298,14 +411,22 @@ class PrefixRankingTensorTest(unittest.TestCase):
                 student_parameter, base_parameter, rtol=0.0, atol=0.0
             )
 
-    def test_zero_contribution_aux_branch_preserves_rng_gradient_update_and_next_ce(self):
+    def test_zero_contribution_aux_branch_preserves_rng_gradient_update_and_next_ce(
+        self,
+    ):
         self._assert_zero_contribution_invariant("cpu")
+
+    def test_conditional_zero_contribution_preserves_rng_gradient_update_and_next_ce(
+        self,
+    ):
+        self._assert_zero_contribution_invariant("cpu", conditional=True)
 
     @unittest.skipUnless(
         torch is not None and torch.cuda.is_available(), "CUDA is unavailable"
     )
     def test_cuda_zero_contribution_aux_branch_preserves_main_rng(self):
         self._assert_zero_contribution_invariant("cuda")
+        self._assert_zero_contribution_invariant("cuda", conditional=True)
 
     def test_loss_means_softplus_over_rows_and_depths(self):
         positive = torch.tensor([[2.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
@@ -315,6 +436,72 @@ class PrefixRankingTensorTest(unittest.TestCase):
         wrong_order = torch.nn.functional.softplus((negative - positive).mean())
         torch.testing.assert_close(observed, expected)
         self.assertNotEqual(float(observed), float(wrong_order))
+
+    def test_conditional_loss_means_depth_per_row_then_weights_rows(self):
+        positive = torch.tensor([[2.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+        negative = torch.tensor([[1.0, 2.0, -1.0], [0.5, -1.0, 0.5]])
+        observed, details = conditional_prefix_ranking_loss(
+            positive,
+            negative,
+            torch.tensor([1, 2]),
+            score_depths=(2, 3, 4),
+            single_depths=(4,),
+            multi_depths=(2, 3, 4),
+            single_weight=0.10,
+            multi_weight=0.02,
+            temperature=1.0,
+        )
+        comparison_losses = torch.nn.functional.softplus(negative - positive)
+        expected = (
+            0.10 * comparison_losses[0, 2] + 0.02 * comparison_losses[1].mean()
+        ) / 2
+        torch.testing.assert_close(observed, expected)
+        self.assertEqual(int(details["single"]["rows"]), 1)
+        self.assertEqual(int(details["multi"]["rows"]), 1)
+
+    def test_conditional_gradient_uses_sequence_depth_for_single_and_all_depths_for_multi(
+        self,
+    ):
+        positive = torch.zeros(2, 3, requires_grad=True)
+        negative = torch.ones(2, 3, requires_grad=True)
+        loss, _ = conditional_prefix_ranking_loss(
+            positive,
+            negative,
+            torch.tensor([1, 3]),
+            score_depths=(2, 3, 4),
+            single_depths=(4,),
+            multi_depths=(2, 3, 4),
+            single_weight=0.10,
+            multi_weight=0.02,
+            temperature=1.0,
+        )
+        loss.backward()
+        torch.testing.assert_close(positive.grad[0, :2], torch.zeros(2))
+        self.assertNotEqual(float(positive.grad[0, 2]), 0.0)
+        self.assertTrue(bool(torch.all(positive.grad[1] != 0)))
+
+    def test_conditional_loss_supports_single_only_and_multi_only_batches(self):
+        positive = torch.tensor([[2.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+        negative = torch.tensor([[1.0, 2.0, -1.0], [0.5, -1.0, 0.5]])
+        comparison_losses = torch.nn.functional.softplus(negative - positive)
+        cases = (
+            (torch.tensor([1, 1]), 0.10 * comparison_losses[:, 2].mean()),
+            (torch.tensor([2, 3]), 0.02 * comparison_losses.mean()),
+        )
+        for gold_counts, expected in cases:
+            with self.subTest(gold_counts=gold_counts.tolist()):
+                observed, _ = conditional_prefix_ranking_loss(
+                    positive,
+                    negative,
+                    gold_counts,
+                    score_depths=(2, 3, 4),
+                    single_depths=(4,),
+                    multi_depths=(2, 3, 4),
+                    single_weight=0.10,
+                    multi_weight=0.02,
+                    temperature=1.0,
+                )
+                torch.testing.assert_close(observed, expected)
 
 
 if __name__ == "__main__":

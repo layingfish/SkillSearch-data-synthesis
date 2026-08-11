@@ -85,6 +85,7 @@ except ModuleNotFoundError:
 try:
     from legacy_ce_prefix_ranking import (
         FrozenC1Candidates,
+        GROUPINGS,
         PrefixRankingRuntime,
         SCOPE_DEPTHS,
         attach_prefix_ranking_forward,
@@ -92,6 +93,7 @@ try:
 except ModuleNotFoundError:
     from scripts.legacy_ce_prefix_ranking import (
         FrozenC1Candidates,
+        GROUPINGS,
         PrefixRankingRuntime,
         SCOPE_DEPTHS,
         attach_prefix_ranking_forward,
@@ -119,7 +121,9 @@ def clip_query_gradients(model: Any, max_grad_norm: float) -> Any:
     import torch
 
     if not math.isfinite(max_grad_norm) or max_grad_norm <= 0.0:
-        raise ValueError(f"max grad norm must be finite and positive, got {max_grad_norm}")
+        raise ValueError(
+            f"max grad norm must be finite and positive, got {max_grad_norm}"
+        )
     parameters = [
         parameter
         for parameter in model.parameters()
@@ -257,7 +261,9 @@ class FullQueryObserver:
                 f"got {self.query_max_grad_norm}"
             )
         if self.query_warmup_steps and self.query_max_grad_norm is not None:
-            raise ValueError("query warmup and gradient clipping must be tested separately")
+            raise ValueError(
+                "query warmup and gradient clipping must be tested separately"
+            )
         self.model = None
         self.optimizer = None
         self.optimizer_steps = 0
@@ -300,7 +306,9 @@ class FullQueryObserver:
         import torch
 
         if self.model is None or self.optimizer is None:
-            raise RuntimeError("catalog boundary reached before model/optimizer capture")
+            raise RuntimeError(
+                "catalog boundary reached before model/optimizer capture"
+            )
         if self.catalog:
             raise RuntimeError("catalog boundary captured more than once")
         if self.optimizer_steps != self.catalog_steps:
@@ -310,7 +318,9 @@ class FullQueryObserver:
         self.catalog = {
             "model_fingerprint": legacy_model_state_fingerprint(self.model),
             "model_state_sha256": _hash_tensor_state(self.model.state_dict()),
-            "optimizer_state_sha256": recursive_state_sha256(self.optimizer.state_dict()),
+            "optimizer_state_sha256": recursive_state_sha256(
+                self.optimizer.state_dict()
+            ),
             "optimizer_state_entries": len(self.optimizer.state),
             "optimizer_param_groups": optimizer_param_group_snapshot(self.optimizer),
             "cpu_rng_sha256": tensor_bytes_sha256(torch.random.get_rng_state()),
@@ -318,13 +328,15 @@ class FullQueryObserver:
         }
 
     def wrap_batch_builder(self, original_builder: Any) -> Any:
-        def observed_builder(batch_rows: list[dict[str, Any]], *args: Any, **kwargs: Any) -> Any:
+        def observed_builder(
+            batch_rows: list[dict[str, Any]], *args: Any, **kwargs: Any
+        ) -> Any:
             if self.optimizer_steps == 0 and "catalog_step_1" not in self.batches:
-                payload = row_ids_payload(
-                    batch_rows, include_positive_skill_id=False
-                )
+                payload = row_ids_payload(batch_rows, include_positive_skill_id=False)
                 if payload["row_ids_sha256"] != EXPECTED_CATALOG_FIRST_BATCH_SHA256:
-                    raise ValueError(f"catalog first-batch row hash mismatch: {payload}")
+                    raise ValueError(
+                        f"catalog first-batch row hash mismatch: {payload}"
+                    )
                 self.batches["catalog_step_1"] = payload
             elif (
                 self.optimizer_steps == self.catalog_steps
@@ -361,7 +373,9 @@ class FullQueryObserver:
         def observed_step(*args: Any, **kwargs: Any) -> Any:
             next_step = self.optimizer_steps + 1
             if self.last_scalar_loss is None:
-                raise RuntimeError("optimizer step observed before scalar training loss")
+                raise RuntimeError(
+                    "optimizer step observed before scalar training loss"
+                )
             loss_names = {
                 1: "catalog_step_1",
                 50: "catalog_step_50",
@@ -373,7 +387,9 @@ class FullQueryObserver:
                 self.losses[loss_names[next_step]] = self.last_scalar_loss
             if self.optimizer_steps == self.catalog_steps:
                 if not self.catalog:
-                    raise RuntimeError("query optimizer step started before catalog capture")
+                    raise RuntimeError(
+                        "query optimizer step started before catalog capture"
+                    )
                 gradients = [
                     (name, parameter.grad)
                     for name, parameter in self.model.named_parameters()
@@ -439,7 +455,9 @@ class FullQueryObserver:
             record = {
                 "name": name,
                 "path": str(checkpoint_dir),
-                "best_step": extra.get("best_step") if isinstance(extra, dict) else None,
+                "best_step": extra.get("best_step")
+                if isinstance(extra, dict)
+                else None,
                 "optimizer_requested": kwargs.get("optimizer") is not None,
                 "optimizer_saved": False,
                 "suppressed": name == "last",
@@ -462,11 +480,14 @@ class FullQueryObserver:
                 f"optimizer step mismatch: expected={expected_optimizer_steps}, "
                 f"actual={self.optimizer_steps}"
             )
-        eval_batches = len(expected_eval_steps(self.query_steps, self.eval_steps)) * math.ceil(
-            QUERY_DEV_ROWS / self.batch_size
-        )
+        eval_batches = len(
+            expected_eval_steps(self.query_steps, self.eval_steps)
+        ) * math.ceil(QUERY_DEV_ROWS / self.batch_size)
         expected_forward_calls = expected_optimizer_steps + eval_batches
-        if self.forward_calls != expected_forward_calls or self.batch_calls != expected_forward_calls:
+        if (
+            self.forward_calls != expected_forward_calls
+            or self.batch_calls != expected_forward_calls
+        ):
             raise ValueError(
                 "forward/batch call mismatch: "
                 f"expected={expected_forward_calls}, forward={self.forward_calls}, batch={self.batch_calls}"
@@ -475,7 +496,10 @@ class FullQueryObserver:
             raise ValueError(f"initial model fingerprint mismatch: {self.initial}")
         if self.initial.get("cpu_rng_sha256") != EXPECTED_CPU_RNG_AFTER_MODEL_SHA256:
             raise ValueError(f"initial CPU RNG mismatch: {self.initial}")
-        if self.initial.get("cuda_rng_sha256") != EXPECTED_CUDA_RNG_BEFORE_FORWARD_SHA256:
+        if (
+            self.initial.get("cuda_rng_sha256")
+            != EXPECTED_CUDA_RNG_BEFORE_FORWARD_SHA256
+        ):
             raise ValueError(f"initial CUDA RNG mismatch: {self.initial}")
         expected_losses = {
             "catalog_step_1",
@@ -488,14 +512,21 @@ class FullQueryObserver:
             raise ValueError(f"loss capture mismatch: {sorted(self.losses)}")
         if set(self.batches) != {"catalog_step_1", "query_step_1"}:
             raise ValueError(f"batch capture mismatch: {self.batches.keys()}")
-        if not self.catalog or not self.transition or set(self.query_step_1) != {"gradient"}:
+        if (
+            not self.catalog
+            or not self.transition
+            or set(self.query_step_1) != {"gradient"}
+        ):
             raise ValueError("catalog/query transition capture is incomplete")
         transition_entries = self.transition["optimizer_state_entries_after_transition"]
         if self.optimizer_mode == "reset" and transition_entries != 0:
-            raise ValueError(f"reset optimizer retained {transition_entries} state entries")
-        if self.optimizer_mode == "carry" and transition_entries != self.catalog[
-            "optimizer_state_entries"
-        ]:
+            raise ValueError(
+                f"reset optimizer retained {transition_entries} state entries"
+            )
+        if (
+            self.optimizer_mode == "carry"
+            and transition_entries != self.catalog["optimizer_state_entries"]
+        ):
             raise ValueError("carry optimizer state-entry count changed at transition")
         transition_lrs = {
             float(group["lr"])
@@ -512,9 +543,7 @@ class FullQueryObserver:
                 }
             )
         expected_lr_trace = {
-            str(step): query_lr_at_step(
-                self.query_lr, step, self.query_warmup_steps
-            )
+            str(step): query_lr_at_step(self.query_lr, step, self.query_warmup_steps)
             for step in expected_lr_trace_steps
         }
         if self.query_lr_trace != expected_lr_trace:
@@ -530,8 +559,10 @@ class FullQueryObserver:
                 "query gradient-clipping call mismatch: "
                 f"expected={expected_clip_calls}, observed={self.clipping['calls']}"
             )
-        if not 0 <= self.clipping["sampled_clipped_calls"] <= len(
-            self.clipping["pre_clip_norm_samples"]
+        if (
+            not 0
+            <= self.clipping["sampled_clipped_calls"]
+            <= len(self.clipping["pre_clip_norm_samples"])
         ):
             raise ValueError(f"invalid clipping counts: {self.clipping}")
         if any(
@@ -540,10 +571,16 @@ class FullQueryObserver:
         ):
             raise ValueError(f"non-finite clipping norm sample: {self.clipping}")
         save_names = [row["name"] for row in self.checkpoint_saves]
-        if save_names.count("best") < 1 or save_names.count("last") != 1 or save_names.count("final") != 1:
+        if (
+            save_names.count("best") < 1
+            or save_names.count("last") != 1
+            or save_names.count("final") != 1
+        ):
             raise ValueError(f"checkpoint save policy mismatch: {save_names}")
         if save_names[-2:] != ["last", "final"]:
-            raise ValueError(f"unexpected final checkpoint save order: {save_names[-2:]}")
+            raise ValueError(
+                f"unexpected final checkpoint save order: {save_names[-2:]}"
+            )
 
 
 def pipeline_training_argv(args: argparse.Namespace, train_dir: Path) -> list[str]:
@@ -607,9 +644,41 @@ def command_run(args: argparse.Namespace) -> None:
         raise ValueError(
             f"prefix rank weight must be finite and non-negative: {args.prefix_rank_weight}"
         )
-    if args.prefix_rank_weight > 0.0 and args.prefix_rank_scope == "disabled":
-        raise ValueError("positive prefix rank weight requires an active scope")
-    if not math.isfinite(args.prefix_rank_temperature) or args.prefix_rank_temperature <= 0.0:
+    for label, weight in (
+        ("single", args.prefix_rank_single_weight),
+        ("multi", args.prefix_rank_multi_weight),
+    ):
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(
+                f"{label} prefix rank weight must be finite and non-negative: {weight}"
+            )
+    if args.prefix_rank_grouping == "fixed":
+        if args.prefix_rank_weight > 0.0 and args.prefix_rank_scope == "disabled":
+            raise ValueError("positive prefix rank weight requires an active scope")
+        if (
+            args.prefix_rank_single_weight != 0.0
+            or args.prefix_rank_multi_weight != 0.0
+        ):
+            raise ValueError(
+                "fixed prefix ranking does not accept group-specific weights"
+            )
+        prefix_rank_active = args.prefix_rank_weight > 0.0
+    else:
+        if args.prefix_rank_scope != "disabled" or args.prefix_rank_weight != 0.0:
+            raise ValueError(
+                "gold-cardinality prefix ranking requires fixed scope/weight disabled"
+            )
+        if args.prefix_rank_single_scope == "disabled":
+            raise ValueError("gold-cardinality prefix ranking requires a single scope")
+        if args.prefix_rank_multi_scope == "disabled":
+            raise ValueError("gold-cardinality prefix ranking requires a multi scope")
+        prefix_rank_active = (
+            args.prefix_rank_single_weight > 0.0 or args.prefix_rank_multi_weight > 0.0
+        )
+    if (
+        not math.isfinite(args.prefix_rank_temperature)
+        or args.prefix_rank_temperature <= 0.0
+    ):
         raise ValueError(
             "prefix rank temperature must be finite and positive: "
             f"{args.prefix_rank_temperature}"
@@ -624,10 +693,12 @@ def command_run(args: argparse.Namespace) -> None:
         value is not None for value in candidate_arguments
     ):
         raise ValueError("prefix ranking artifact arguments must be provided together")
-    if args.prefix_rank_weight > 0.0 and not all(
+    if prefix_rank_active and not all(
         value is not None for value in candidate_arguments
     ):
-        raise ValueError("positive prefix rank weight requires a candidate artifact bundle")
+        raise ValueError(
+            "positive prefix rank weight requires a candidate artifact bundle"
+        )
     candidate_input_hashes = (
         {
             "summary": file_sha256(args.prefix_rank_summary),
@@ -653,7 +724,9 @@ def command_run(args: argparse.Namespace) -> None:
             f"each full-query arm requires exactly one visible CUDA GPU, got {torch.cuda.device_count()}"
         )
     if args.output_dir.exists():
-        raise FileExistsError(f"refusing to overwrite full-query arm: {args.output_dir}")
+        raise FileExistsError(
+            f"refusing to overwrite full-query arm: {args.output_dir}"
+        )
     if file_sha256(args.pipeline) != EXPECTED_PIPELINE_SHA256:
         raise ValueError(f"archived pipeline SHA-256 mismatch: {args.pipeline}")
 
@@ -680,7 +753,9 @@ def command_run(args: argparse.Namespace) -> None:
     original_adamw = torch.optim.AdamW
 
     def observed_adamw(*optimizer_args: Any, **optimizer_kwargs: Any) -> Any:
-        return observer.wrap_optimizer(original_adamw(*optimizer_args, **optimizer_kwargs))
+        return observer.wrap_optimizer(
+            original_adamw(*optimizer_args, **optimizer_kwargs)
+        )
 
     torch.optim.AdamW = observed_adamw
     pipeline = load_module(args.pipeline, f"full_query_optimizer_lr_{args.arm}")
@@ -688,7 +763,7 @@ def command_run(args: argparse.Namespace) -> None:
     original_saver = pipeline.save_structured_decoder_checkpoint
     prefix_rank_trace: dict[str, Any] = {}
     prefix_rank_runtime = None
-    if args.prefix_rank_weight > 0.0:
+    if prefix_rank_active:
         semantic_ids = pipeline.load_semantic_ids(args.semantic_ids)
         candidates = FrozenC1Candidates.load(
             summary_path=args.prefix_rank_summary,
@@ -703,6 +778,9 @@ def command_run(args: argparse.Namespace) -> None:
             candidates=candidates,
             scope=args.prefix_rank_scope,
             epochs=5,
+            grouping=args.prefix_rank_grouping,
+            single_scope=args.prefix_rank_single_scope,
+            multi_scope=args.prefix_rank_multi_scope,
         )
         pipeline.expand_single_sid_query_rows = prefix_rank_runtime.wrap_expander(
             pipeline.expand_single_sid_query_rows
@@ -716,6 +794,11 @@ def command_run(args: argparse.Namespace) -> None:
             scope=args.prefix_rank_scope,
             temperature=args.prefix_rank_temperature,
             trace=prefix_rank_trace,
+            grouping=args.prefix_rank_grouping,
+            single_scope=args.prefix_rank_single_scope,
+            single_weight=args.prefix_rank_single_weight,
+            multi_scope=args.prefix_rank_multi_scope,
+            multi_weight=args.prefix_rank_multi_weight,
         )
         return observer.remember_model(model)
 
@@ -724,7 +807,9 @@ def command_run(args: argparse.Namespace) -> None:
     if prefix_rank_runtime is not None:
         batch_builder = prefix_rank_runtime.wrap_batch_builder(batch_builder)
     pipeline.structured_sid_batch = observer.wrap_batch_builder(batch_builder)
-    pipeline.save_structured_decoder_checkpoint = observer.wrap_checkpoint_saver(original_saver)
+    pipeline.save_structured_decoder_checkpoint = observer.wrap_checkpoint_saver(
+        original_saver
+    )
 
     train_dir = args.output_dir / "train"
     original_argv = sys.argv
@@ -752,20 +837,36 @@ def command_run(args: argparse.Namespace) -> None:
     )
     expected_trace_steps = (
         {"1", "50", "500", str(args.query_steps), "score_parity"}
-        if args.prefix_rank_weight > 0.0
+        if prefix_rank_active
         else set()
     )
     if set(prefix_rank_trace) != expected_trace_steps:
         raise ValueError(
             f"prefix ranking trace mismatch: observed={sorted(prefix_rank_trace)}"
         )
+    if prefix_rank_active:
+        score_parity = prefix_rank_trace["score_parity"]
+        if args.prefix_rank_grouping == "fixed":
+            parity_passed = set(score_parity) == {"positive", "negative"} and all(
+                row.get("passed") for row in score_parity.values()
+            )
+        else:
+            parity_passed = set(score_parity) == {"single", "multi"} and all(
+                set(group_rows) == {"positive", "negative"}
+                and all(row.get("passed") for row in group_rows.values())
+                for group_rows in score_parity.values()
+            )
+        if not parity_passed:
+            raise ValueError(f"prefix ranking score parity failed: {score_parity}")
     sampled_losses = [
         row for key, row in prefix_rank_trace.items() if key != "score_parity"
     ]
     if any(not row["finite"] for row in sampled_losses):
         raise ValueError(f"non-finite prefix ranking trace: {prefix_rank_trace}")
     dropout_rates = sorted({float(module.p) for module in dropout_modules})
-    if len(dropout_modules) != EXPECTED_DROPOUT_MODULES or dropout_rates != [args.dropout_rate]:
+    if len(dropout_modules) != EXPECTED_DROPOUT_MODULES or dropout_rates != [
+        args.dropout_rate
+    ]:
         raise ValueError(
             f"dropout override mismatch: count={len(dropout_modules)}, rates={dropout_rates}"
         )
@@ -800,7 +901,9 @@ def command_run(args: argparse.Namespace) -> None:
 
     events = [
         json.loads(line)
-        for line in (train_dir / "loss_history.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (train_dir / "loss_history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
         if line.strip()
     ]
     history_summary = validate_loss_history(
@@ -818,11 +921,16 @@ def command_run(args: argparse.Namespace) -> None:
     if Path(str(manifest["best_checkpoint"])).name != "best":
         raise ValueError(f"unexpected best checkpoint: {manifest['best_checkpoint']}")
     if (train_dir / "last").exists():
-        raise ValueError("last checkpoint should be suppressed for the full-query sweep")
+        raise ValueError(
+            "last checkpoint should be suppressed for the full-query sweep"
+        )
 
     best_checkpoint = checkpoint_state_summary(train_dir / "best")
     final_checkpoint = checkpoint_state_summary(train_dir / "final")
-    if best_checkpoint["optimizer_state_present"] or final_checkpoint["optimizer_state_present"]:
+    if (
+        best_checkpoint["optimizer_state_present"]
+        or final_checkpoint["optimizer_state_present"]
+    ):
         raise ValueError("model-only checkpoint policy was not applied")
     if best_checkpoint["model_state_sha256"] != final_checkpoint["model_state_sha256"]:
         raise ValueError("final model does not match selected best model")
@@ -851,13 +959,23 @@ def command_run(args: argparse.Namespace) -> None:
         "weight_decay": 0.0,
         "dropout_rate": args.dropout_rate,
         "prefix_ranking": {
+            "grouping": args.prefix_rank_grouping,
             "scope": args.prefix_rank_scope,
             "weight": args.prefix_rank_weight,
+            "single": {
+                "scope": args.prefix_rank_single_scope,
+                "weight": args.prefix_rank_single_weight,
+            },
+            "multi": {
+                "scope": args.prefix_rank_multi_scope,
+                "weight": args.prefix_rank_multi_weight,
+            },
             "temperature": args.prefix_rank_temperature,
             "summary_sha256": args.prefix_rank_summary_sha256,
             "manifest_sha256": args.prefix_rank_manifest_sha256,
             "candidate_domain": "teacher_top50_exclude_all_sibling_gt",
             "score": "mean_depth_softplus_negative_minus_positive_cumulative_logprob",
+            "conditional_normalization": "mean_over_active_depths_per_row_then_weight_then_mean_over_eligible_rows",
         },
         "outer_precision": "bf16",
         "requested_controls": {
@@ -949,6 +1067,11 @@ def command_run(args: argparse.Namespace) -> None:
                 "query_max_grad_norm": args.query_max_grad_norm,
                 "prefix_rank_scope": args.prefix_rank_scope,
                 "prefix_rank_weight": args.prefix_rank_weight,
+                "prefix_rank_grouping": args.prefix_rank_grouping,
+                "prefix_rank_single_scope": args.prefix_rank_single_scope,
+                "prefix_rank_single_weight": args.prefix_rank_single_weight,
+                "prefix_rank_multi_scope": args.prefix_rank_multi_scope,
+                "prefix_rank_multi_weight": args.prefix_rank_multi_weight,
                 "best_step": history_summary["best_step"],
                 "best_dev_loss": history_summary["best_dev_loss"],
                 "final_model_sha256": final_checkpoint["model_state_sha256"]["full"],
@@ -970,8 +1093,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-lr", type=float, required=True)
     parser.add_argument("--query-warmup-steps", type=int, default=0)
     parser.add_argument("--query-max-grad-norm", type=float)
-    parser.add_argument("--prefix-rank-scope", choices=tuple(SCOPE_DEPTHS), default="disabled")
+    parser.add_argument(
+        "--prefix-rank-scope", choices=tuple(SCOPE_DEPTHS), default="disabled"
+    )
     parser.add_argument("--prefix-rank-weight", type=float, default=0.0)
+    parser.add_argument("--prefix-rank-grouping", choices=GROUPINGS, default="fixed")
+    parser.add_argument(
+        "--prefix-rank-single-scope",
+        choices=tuple(SCOPE_DEPTHS),
+        default="sequence_only",
+    )
+    parser.add_argument("--prefix-rank-single-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--prefix-rank-multi-scope", choices=tuple(SCOPE_DEPTHS), default="cumulative"
+    )
+    parser.add_argument("--prefix-rank-multi-weight", type=float, default=0.0)
     parser.add_argument("--prefix-rank-temperature", type=float, default=1.0)
     parser.add_argument("--prefix-rank-summary", type=Path)
     parser.add_argument("--prefix-rank-summary-sha256")
@@ -991,7 +1127,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-source-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260626)
     parser.add_argument("--dropout-rate", type=float, default=0.1)
-    parser.add_argument("--bf16-reduction", choices=OPTIONAL_BOOL_CHOICES, default="auto")
+    parser.add_argument(
+        "--bf16-reduction", choices=OPTIONAL_BOOL_CHOICES, default="auto"
+    )
     parser.add_argument("--tf32-matmul", choices=OPTIONAL_BOOL_CHOICES, default="auto")
     parser.add_argument("--tf32-cudnn", choices=OPTIONAL_BOOL_CHOICES, default="auto")
     parser.add_argument(
@@ -1004,7 +1142,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "default", "cublas", "cublaslt"),
         default="auto",
     )
-    parser.add_argument("--deterministic-algorithms", choices=OPTIONAL_BOOL_CHOICES, default="auto")
+    parser.add_argument(
+        "--deterministic-algorithms", choices=OPTIONAL_BOOL_CHOICES, default="auto"
+    )
     parser.add_argument(
         "--cublas-workspace-config",
         choices=("auto", ":4096:8", ":16:8"),
@@ -1028,8 +1168,7 @@ def main() -> None:
             f"query warmup steps must be non-negative, got {args.query_warmup_steps}"
         )
     if args.query_max_grad_norm is not None and (
-        not math.isfinite(args.query_max_grad_norm)
-        or args.query_max_grad_norm <= 0.0
+        not math.isfinite(args.query_max_grad_norm) or args.query_max_grad_norm <= 0.0
     ):
         raise ValueError(
             "query max grad norm must be finite and positive, "
