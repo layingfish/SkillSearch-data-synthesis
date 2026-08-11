@@ -77,3 +77,5 @@ Deep-recall gate：每个非零 arm 的 Single/Multi R@10/R@50 均不得低于�
 启动前验证：冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 下运行 `21` 项相关测试，`20` 项通过，`1` 项 CUDA-only 测试跳过；节点会在训练前补跑该 CUDA invariant。独立交叉审查初次发现 `2` 项 HIGH：R@1 gate 的显示值舍入，以及无过门 arm 时生成 fallback winner。两项已修复并加入回归测试。
 
 集群启动验证：pod 在 `1/1 Running`、restart=`0` 条件下识别到 `8` 张 GPU；冻结 runtime 字段全部命中。节点上的 `21` 项测试全部通过，包括 CUDA RNG invariant。GPU `0–7` 已分别拉起八个独立 arm。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`）；八路数值完全相同，符合 query ranking loss 尚未启用的预期。
+
+运行进度：两个 disabled control 均完成 query updates=`38,805/38,805` 与 Official core75=`75` queries 评测。两者的 final model-state SHA-256=`bbec7389f56b36a24db000111adf8ce99e3bf712609cfcd1562c64c9910172f8`、best query step=`38,200`、best dev loss=`0.7701343703584546`、predictions 与指标全部 exact；Overall R@1/R@10/R@50=`20.923809523809525/69.55555555555556/75.33333333333333%`（beam=`50`、beam-order）。其余六路位于 query step=`31,000–32,050/38,805`（各自 prefix-loss scope/lambda 如 arm 表）；pod=`1/1 Running`、restart=`0`，日志未发现 Traceback、OOM、NaN 或 CUDA error。

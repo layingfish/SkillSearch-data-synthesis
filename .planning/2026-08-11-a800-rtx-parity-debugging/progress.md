@@ -277,3 +277,5 @@
 - 实现已提交为 commit=`1310c8d8cda9275e07a1dbb961068876ed796de6`。Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。
 - GPU job=`tide-chenyufei03-10603-gigmv` 已提交；worker 在 `1/1 Running`、restart=`0` 条件下通过固定 runtime、GPU count=`8` 与全部 `21` 项 node tests，包括 CUDA RNG invariant。
 - 八个独立单卡 arm 已分别启动在 GPU `0–7`；source-length audit 和模型初始化均已通过。八路已同步到 catalog step=`100/2,730`，train loss=`4.092995`（batch=`16`、seed=`20260626`、lr=`3e-4`、BF16、dropout=`0.1`），日志未发现 Traceback、OOM 或 CUDA error。
+- 两个 disabled control 已完成 query updates=`38,805/38,805` 与 Official core75=`75` queries 评测；final model-state hash、best query step=`38,200`、best dev loss=`0.7701343703584546`、predictions 和指标均与历史 A800 workspace anchor exact（batch=`16`、seed=`20260626`、BF16、workspace=`:16:8`、beam=`50`、beam-order）。
+- 六个 prefix-loss arm 当前位于 query step=`31,000–32,050/38,805`；GPU `2–7` 继续训练，pod=`1/1 Running`、restart=`0`。按最近约 `30` 秒的日志推进速度估计，训练主体还需约 `20–30` 分钟，之后执行各路 Official core75=`75` queries、beam=`50` 评测与 matrix gate。
