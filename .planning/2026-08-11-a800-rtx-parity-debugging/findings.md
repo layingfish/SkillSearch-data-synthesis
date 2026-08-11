@@ -118,6 +118,10 @@
 - reset 没有通过 `D_update` 与 step-50 loss gap 同时降低至少 `50%` 的门槛。catalog moments 对 backend 分叉有小幅贡献，完整检索结果仍需由 `workspace_16` 上的 query lr × optimizer-state full run 直接选择。
 - Phase 5 full-query job=`tide-chenyufei03-10598-otasq` 在一个 `8×A800` 节点完成，runtime=`3h10m`、restart=`0`。七路 workspace catalog invariant、workspace carry/query lr=`3e-4` exact replica、default/workspace 历史 anchor 均通过；条件为 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16。
 - optimizer reset 对 Overall R@1 的影响随 lr 改变：相对 carry，query lr=`{1e-4,2e-4,3e-4}` 分别为 `+4.6666/-1.1556/+1.0000` 个点；条件为上述 full-query 训练与 Official core75=`75` queries、beam=`50`、beam-order。reset 没有形成稳定的 Top-1 改善方向。
+- query warmup=`500` 与 global L2 clip=`1.0` 把 workspace Overall R@1 从 `20.9238` 提到 `23.9905/23.8794`，同时把 R@10 从 `69.5556` 降到 `64.8444/65.1778`、R@50 从 `75.3333` 降到 `73.0000/73.3333`；条件为 A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog/query base lr=`3e-4`、dropout=`0.1`、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。两项都只是在 Top-1 与深召回之间换点。
+- query-rank 取证显示 RTX 与 workspace control/warmup/clip 的平均 Top50 共享率只有 `24.00%/26.35%/27.01%`；workspace 三个设置两两平均 Top50 共享率也只有 `30.53%–33.23%`。条件为 Official core75=`75` queries、每条 query 的 beam-order Top50 集合交集比例再取均值。完整训练轨迹改变了大部分候选集合。
+- workspace control/warmup/clip 分别丢失 `9/9/8` 条 RTX top-1 正确 query，并分别只新增 `1/4/3` 条 RTX top-1 错误、A800 正确 query；条件为相同 Official core75 `75` 条 query 的 top-1 配对命中状态。
+- index=`{8,22,35,54,66}` 在三个 A800 设置中都丢失 RTX 正确 top-1。index=`8` 的 gold 在三路 A800 Top50 都缺失；index=`54/66` 的 gold 在三路 A800 Top50 都存在但排序错误。当前证据同时指向 candidate generation 与 learned scoring，不能只靠 warmup/clipping 解决。
 
 ## 参考资料
 

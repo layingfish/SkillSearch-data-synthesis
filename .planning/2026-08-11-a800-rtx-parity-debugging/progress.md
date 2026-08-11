@@ -218,3 +218,12 @@
 - Tianzhi dry-run 确认 queue=`rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1` 与完整 launch commit。正式 job=`tide-chenyufei03-10599-dfvoq` 已提交，初始 pod 状态=`Init:0/1`、restart=`0`。
 - live runtime preflight 命中 Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2`、GPU count=`8`；八个 arm 已分别在 GPU `0–7` 启动。
 - 八路均到 catalog step=`50/2,730`（batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、BF16）。default 三路 loss 均为 `4.184667`，workspace 五路均为 `4.171228`；pod restart=`0`，日志无 Traceback/OOM/runtime error。
+
+## 2026-08-11：Phase 5 query stability 与 query-rank 结果
+
+- job=`tide-chenyufei03-10599-dfvoq` 已完成；八个 arm、两组 exact replica、两条历史 anchor、catalog/intervention audit 全部通过，pod restart=`0`。
+- workspace control/warmup/clip 的 Overall R@1/R@10/R@50=`20.9238/69.5556/75.3333`、`23.9905/64.8444/73.0000`、`23.8794/65.1778/73.3333`；条件为 catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog/query base lr=`3e-4`、dropout=`0.1`、dev-best checkpoint、Official core75=`75` queries、beam=`50`、beam-order。两个 intervention 都未通过门槛。
+- 新增 `scripts/analyze_legacy_core75_query_ranks.py` 与三项 focused unit tests。四个系统的 `75` 条 prediction exact 对齐；Top50 唯一性、A800 score 完整性/单调性、独立 metric 重算和所有守恒检查通过。
+- RTX 与 workspace control/warmup/clip 的平均 Top50 共享率=`24.00%/26.35%/27.01%`；workspace 三路两两共享率=`30.53%–33.23%`。条件为逐 query 固定长度 Top50 集合交集比例后取 `75` 条均值。
+- 三路 A800 共同丢失的 RTX-correct query index=`{8,22,35,54,66}`。index=`8` 在三路 A800 Top50 都没有 gold；index=`54/66` 在三路都有 gold，但 top-1 score margin 仍为错误方向。
+- 下一动作：对四路 Top50 union 加全部 gold 构造逐 query fixed pool，在同一 pool 上穷举四个 checkpoint 的 CE log-prob。一个 `8×A800` 节点按四个 checkpoint × 两个 query shard 并行，区分 search omission 与 checkpoint scoring failure。
