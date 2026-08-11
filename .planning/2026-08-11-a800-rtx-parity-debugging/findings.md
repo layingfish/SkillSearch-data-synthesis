@@ -42,6 +42,8 @@
 | catalog→query 继承 AdamW 状态是主要放大器 | 低 | reset 仅把 `D_update` 降低 `13.1786%–14.9632%`；同 lr 的 step-50 loss gap 最多降低 `5.6570%`（A800 default 对 `workspace_16`、catalog=`2,730` updates、query=`50` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、query lr=`{2e-4,3e-4}`、dropout=`0.1`） |
 | 单独调整 query lr 或清空 AdamW moments 足以恢复 Top-1 | 低 | 六个完整 arm 全部失败；query lr=`2e-4` 的 carry 虽将 Overall R@1 提到 `25.4794`，但 R@10/R@50 降至 `64.2889/68.7778`（A800 `workspace_16`、catalog=`2,730` updates、query=`38,805` updates、batch=`16`、seed=`20260626`、catalog lr=`3e-4`、dropout=`0.1`、Official core75=`75` queries、beam=`50`、beam-order） |
 | 继续全局枚举 backend flag 的信息收益低 | 高 | 已完成的矩阵没有任何 arm 恢复 RTX 轨迹 |
+| 当前 beam=`50` search omission 是 R@1 缺口来源 | 低 | 四路 checkpoint 在 exhaustive fixed pool 上的 R@1/R@5 与 raw 完全相同，raw→fixed top-1 gained/lost 均为 `0/0`（Official core75=`75` queries、pool=four Top50 union plus all gold） |
+| 最终 R@1 缺口直接位于 checkpoint learned scoring | 高 | RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query 在强制加入全部 gold 后 fixed top-1 恢复均为 `0`；A800 archived Top50 score replay 与 Top-1/5/10/50 集合校验通过 |
 
 ## 关键决策
 
@@ -57,6 +59,7 @@
 | Top-1 使用单侧 1.0-point 门槛 | Overall R@1 要求 `>=27.3683`（RTX=`28.3683`，75 queries、beam=50、beam-order）；候选高于 RTX 时正常通过 |
 | 深召回使用不回退门槛 | Overall R@10/R@50 要求 `>=69.0000/75.0000`（RTX reference，75 queries、beam=50、beam-order），因为 `workspace_16` 已达到 `69.5556/75.3333`（相同评测条件；catalog=3 epochs、query=5 epochs、batch=16、seed=20260626、lr=3e-4） |
 | Single R@1 单独处理离散粒度 | 24-query Single 子集每个 query 对应 `4.1667` 个点（beam=50、beam-order、K=1），所以相对 RTX=`41.6667` 最多低 `1.0` 个点等价于要求 `>=41.6667` |
+| 暂停扩大 beam 或做 search-only 调参 | exhaustive fixed pool 对四路 checkpoint 的 R@1/R@5 都没有改变；下一步直接分解 code-position/control score contribution |
 
 ## 实现入口
 
@@ -122,6 +125,10 @@
 - query-rank 取证显示 RTX 与 workspace control/warmup/clip 的平均 Top50 共享率只有 `24.00%/26.35%/27.01%`；workspace 三个设置两两平均 Top50 共享率也只有 `30.53%–33.23%`。条件为 Official core75=`75` queries、每条 query 的 beam-order Top50 集合交集比例再取均值。完整训练轨迹改变了大部分候选集合。
 - workspace control/warmup/clip 分别丢失 `9/9/8` 条 RTX top-1 正确 query，并分别只新增 `1/4/3` 条 RTX top-1 错误、A800 正确 query；条件为相同 Official core75 `75` 条 query 的 top-1 配对命中状态。
 - index=`{8,22,35,54,66}` 在三个 A800 设置中都丢失 RTX 正确 top-1。index=`8` 的 gold 在三路 A800 Top50 都缺失；index=`54/66` 的 gold 在三路 A800 Top50 都存在但排序错误。当前证据同时指向 candidate generation 与 learned scoring，不能只靠 warmup/clipping 解决。
+- fixed-pool job=`tide-chenyufei03-10601-weesu` 已完成；条件为一个 `8×A800` 节点、Official core75=`75` queries、四个 checkpoint × 两个 row-position shards、pool=four beam-order Top50 union plus all gold。八个 shards、A800 archived score replay、Top-1/5/10/50 集合、shard provenance、pool/gold coverage 和 `200` 个 gold mention 守恒全部通过。
+- fixed-pool R@1/R@5 与 raw 在四路 checkpoint 上完全相同，raw→fixed top-1 gained/lost 都为 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query 固定池 top-1 恢复均为 `0`。条件为四个 learned-code full-vocabulary log-probs 加 stop control=`1`、max skills=`1`、逐 query 穷举。
+- fixed-pool 只改善深召回：RTX/control/warmup/clip 的 R@50 从 `75.0000/75.3333/73.0000/73.3333` 变为 `78.0000/78.3333/76.6667/75.6667`；control R@10 从 `69.5556` 变为 `70.8889`。条件为上述统一 fixed-pool 协议。
+- fixed-pool 澄清了 index=`8` 的歧义：gold 虽被强制加入，control/warmup/clip 仍排 `78/57/66`。index=`54` 排 `5/14/4`，index=`66` 排 `3/3/7`。Top50 缺失是低 gold score 的结果，当前 R@1 主因是 learned scoring。
 
 ## 参考资料
 

@@ -192,6 +192,10 @@ query stability ablation 已完成。workspace control/warmup/clip 的 Overall R
 - 三个 A800 checkpoint 必须在自身 archived Top50 上满足 score replay 最大绝对误差 `<=5e-5`；否则停止解释 fixed-pool 结果；
 - 若 raw beam top-1 错误而 fixed-pool top-1 正确，归为 search omission；若 fixed-pool 仍错误，归为 checkpoint scoring failure。两类同时存在时，后续 baseline 需要改训练目标或 decoder/search，而不是继续枚举 backend flag。
 
+fixed-pool scoring diagnostic 已完成。四路 raw→fixed top-1 gained/lost 均为 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query fixed top-1 恢复均为 `0`。条件为 Official core75=`75` queries、pool=four beam-order Top50 union plus all gold、四个 learned-code full-vocabulary log-probs 加 stop control=`1`、逐 query穷举。四路 R@1/R@5 均与 raw 完全相同；search omission 只在 control R@10 和四路 R@50 产生增益。
+
+下一步只做 scorer 诊断，不加入新的训练超参：保存四个 code positions 与 stop control 的逐 candidate log-prob contribution；在同一 fixed pool 上检查各 position 的 RTX/A800 rank correlation，并做受约束的 position-weight ablation。候选 weighting 只有在 Official core75 的 R@1 达到 `27.3683`、R@10/R@50 不低于 `69.0000/75.0000`（Official core75=`75` queries、fixed pool）后，才进入原 full-catalog beam evaluator验证。
+
 这一阶段得到的是新的 A800 稳定训练配方，报告中必须与“严格 legacy reproduction”分开命名。
 
 - **Status：in_progress**

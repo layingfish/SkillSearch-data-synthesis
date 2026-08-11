@@ -233,3 +233,6 @@
 - task plan 已重新 attestation，SHA-256 前缀=`61f0dca14238`（fixed-pool scoring protocol 冻结）。
 - 独立审查的三项 HIGH 已修：launcher 注入 exact base model；analyzer 校验 shard/input/runtime/checkpoint provenance；multi-GT 改为逐 gold mention 统计，并用 Official core75 的 `200` 个 gold mentions 反算 macro recall。A800 archived Top50 replay 还要求 Top-1/5/10/50 集合不变。
 - fixed-pool job=`tide-chenyufei03-10601-weesu` 已提交；条件为 `rudder-exper`、nodes=`1`、节点规格=`8×A800`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`、launch commit=`349505d88e246b6e45430189c59bb4858ea70386`。
+- fixed-pool job=`tide-chenyufei03-10601-weesu` 已完成，pod restart=`0`。八个 shards、A800 score replay、Top-1/5/10/50 集合、shard provenance、pool/gold coverage 和 Official core75 的 `200` 个 gold mentions 守恒全部通过。
+- 四路 raw→fixed 的 top-1 gained/lost 都是 `0/0`；RTX-correct/A800-wrong 的 control/warmup/clip=`9/9/8` 条 query fixed top-1 恢复均为 `0`。条件为 Official core75=`75` queries、pool=four beam-order Top50 union plus all gold、四个 learned-code full-vocabulary log-probs 加 stop control=`1`、逐 query 穷举。R@1 缺口已定位到 checkpoint learned scoring。
+- task plan 已重新 attestation，SHA-256 前缀=`d288da586667`（fixed-pool 结果已写入，下一步冻结为 position-score decomposition）。

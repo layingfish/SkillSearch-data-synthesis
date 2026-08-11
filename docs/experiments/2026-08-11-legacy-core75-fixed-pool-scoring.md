@@ -1,5 +1,5 @@
 # Experiment: Legacy core75 fixed-pool scoring
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -31,18 +31,34 @@ Checkpoints:
 
 - [x] 四路输入 prediction 均为 `75` rows，query/gold/index exact 对齐，Top50 长度=`50` 且去重
 - [x] 本地 pool 构造检查通过：每条 pool 等于四路 Top50 union 加全部 gold；pool size min/mean/max=`98/142.77/181`（Official core75=`75` queries）
-- [ ] exhaustive scorer 对每条 query 返回 pool size 个唯一 candidate，gold coverage=`100%`
-- [ ] A800 checkpoint 在自身原 Top50 上的重算 score 与归档 score 最大绝对误差 `<=5e-5`，且重排后的 Top-1/5/10/50 集合不变
-- [ ] 四个 checkpoint × 两个 shards 合并为各 `75` 条，shard 无交叠、无缺失
+- [x] exhaustive scorer 对每条 query 返回 pool size 个唯一 candidate，gold coverage=`100%`
+- [x] A800 checkpoint 在自身原 Top50 上的重算 score 与归档 score 最大绝对误差 `<=5e-5`，且重排后的 Top-1/5/10/50 集合不变
+- [x] 四个 checkpoint × 两个 shards 合并为各 `75` 条，shard 无交叠、无缺失
 - [x] scorer 的 code/control log-softmax 与逐 step constrained replay 在 fake model 上 allclose；冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 的七项 focused tests 全部通过
 - [x] analyzer 独立重算 fixed-pool R@1/R@5/R@10/R@50；逐 gold mention 统计必须覆盖 Official core75 的 `200` 个 gold mentions，并按 `1/target_skill_count` 反算 macro recall
 - [x] 独立审查完成；stop-token、full-vocabulary normalization、pool exhaustive、shard provenance、Top-K replay 与 multi-GT 守恒问题均已检查并修正
 
 ## Result / Notes
 
-Pending.
-
 - `tide-chenyufei03-10601-weesu` 已提交；条件为 `rudder-exper`、nodes=`1`、节点规格=`8×A800`、Official core75=`75` queries、pool=four beam-order Top50 union plus all gold。
+- `tide-chenyufei03-10601-weesu` 已完成，pod restart=`0`。八个 scorer、合并分析和全部验证通过。
+- A800 archived score replay 最大绝对误差为 control=`2.455711e-05`、warmup=`1.239777e-05`、clip=`1.335144e-05`；条件为各 checkpoint 自身 archived Top50、Official core75=`75` queries、FP32 evaluator、允许误差=`5e-5`。三路 Top-1/5/10/50 集合均保持不变。
+
+| system | raw R@1/R@5/R@10/R@50 | fixed-pool R@1/R@5/R@10/R@50 |
+|---|---:|---:|
+| RTX archived | `28.3683/61.5968/69.0000/75.0000` | `28.3683/61.5968/69.0000/78.0000` |
+| workspace control | `20.9238/59.5302/69.5556/75.3333` | `20.9238/59.5302/70.8889/78.3333` |
+| workspace warmup=`500` | `23.9905/58.9302/64.8444/73.0000` | `23.9905/58.9302/64.8444/76.6667` |
+| workspace clip=`1.0` | `23.8794/58.3302/65.1778/73.3333` | `23.8794/58.3302/65.1778/75.6667` |
+
+表中条件统一为 Official core75=`75` queries、pool=four beam-order Top50 union plus all gold、四个 learned-code token 与 stop control=`1` 的 full-vocabulary CE log-prob、max skills=`1`、逐 query 穷举。raw 与 fixed-pool 的 R@1/R@5 在四个 checkpoint 上完全相同；每路 raw→fixed top-1 gained/lost 都是 `0/0`。
+
+- RTX raw top-1 正确、A800 raw top-1 错误的 query 数为 control/warmup/clip=`9/9/8`；fixed pool top-1 恢复数均为 `0`。条件为上述统一 fixed-pool 协议。
+- RTX 与 control/warmup/clip 在 fixed pool 上的相同 top-1 query 数为 `22/29/29`（Official core75=`75` queries）；mean rank Spearman=`0.111574/0.167770/0.182607`。这说明最终 checkpoint 已学习出明显不同的候选排序。
+- 共同失败 index=`8` 的 gold 被强制加入后，在 control/warmup/clip 中仍排 `78/57/66`；共同失败 index=`54` 排 `5/14/4`，index=`66` 排 `3/3/7`。条件为相同 fixed pool 与 CE score。原 Top50 缺失主要反映 gold score 已经偏低。
+- fixed-pool 只在深召回带来增益：control R@10 增加 `1.3333` 个点；四路 R@50 分别增加 `3.0000/3.0000/3.6667/2.3334` 个点。条件为上表统一协议。
+
+结论：当前 R@1 缺口直接位于 checkpoint 的 learned scoring。beam=`50` 的 search omission 没有造成任何 top-1 或 top-5 错误；继续扩大 beam 无法恢复这些 gold。下一步应分解四个 code positions 与 stop control 的 score contribution，判断能否用受约束的 position weighting 恢复排序；若不能，再改训练目标或 checkpoint selection。
 
 - 四个 checkpoint 的 metadata 均为 max source length=`2,048`、source text policy=`skillrouter_query_1500_chars_with_instruction_v1`、codebook size=`256`、depth=`4`、dedup size=`0`；条件为直接读取各自 `structured_decoder.pt`。
 - 本地 source-only runtime 通过六项并跳过一项 torch fake；冻结 Python=`3.10.12`、torch=`2.10.0+cu128` CPU runtime 通过全部七项 focused tests。

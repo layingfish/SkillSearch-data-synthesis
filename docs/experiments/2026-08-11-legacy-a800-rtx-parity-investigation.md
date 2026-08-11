@@ -1,5 +1,5 @@
 # Experiment: Legacy A800/RTX PRO 6000 parity investigation
-Status: done
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -135,6 +135,21 @@ gap. The leading unresolved cause is the BF16/GEMM execution path on different
 GPU architectures and drivers, with optimization amplifying the resulting
 trajectory difference.
 
+The 2026-08-11 fixed-pool diagnostic localizes the final Top-1 failure more
+precisely. For every Official core75 query, it exhaustively rescored the union
+of the RTX/control/warmup/clip beam-order Top50 lists plus every gold skill.
+All four checkpoints retained exactly the same R@1 and R@5 as their raw beam
+outputs. The RTX-correct/A800-wrong cases recovered `0/9`, `0/9`, and `0/8`
+Top-1 queries for workspace control, warmup=`500`, and clip=`1.0`, respectively;
+conditions are Official core75=`75` queries, four learned-code full-vocabulary
+log-probs plus stop control=`1`, and exhaustive per-query pools.
+
+The final R@1 gap is therefore a checkpoint-scoring gap under the legacy CE
+score. Search coverage still affects deeper recall: fixed-pool R@50 rose from
+`75.0000/75.3333/73.0000/73.3333` to
+`78.0000/78.3333/76.6667/75.6667` for RTX/control/warmup/clip under the same
+fixed-pool condition. It produced no Top-1 or Top-5 recovery.
+
 This conclusion is causal at the level of the coupled hardware/runtime
 condition. It does not identify whether the remaining contribution comes from
 the Blackwell versus Ampere architecture, driver `580.126.09` versus
@@ -142,11 +157,10 @@ the Blackwell versus Ampere architecture, driver `580.126.09` versus
 
 ## State and next decision
 
-The full recovery training proposed earlier remains paused. The dropout-zero
-probe is complete and archived at
-`/models_rw/SkillSearch-data-synthesis/experiments/legacy_dropout0_probe_20260810_v3`.
-The next high-value step is a controlled full training on a matching RTX
-environment, or a precision/backend bridge that can be validated first on the
-one-step probe. Do not interpret the existing A800 catalog sweep as evidence
-about the intrinsic value of catalog epochs until this hardware/runtime gap is
-closed.
+The matching RTX environment remains unavailable. Global backend controls,
+optimizer reset/lr, query warmup=`500`, and query global L2 clip=`1.0` have not
+met the recovery gate. The next diagnostic is per-position score decomposition
+on the fixed pool. It will test whether a constrained code-position/control
+weighting can recover Top-1 without reducing R@10/R@50; any promising weighting
+must then pass the original full-catalog beam evaluator. If this fails, the A800
+baseline needs a changed training objective or checkpoint-selection criterion.
