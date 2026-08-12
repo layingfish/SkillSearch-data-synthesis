@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v1"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v2"
 CONTROL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_core75_checkpoint_oracle_20260812_v1"
 CONTROL_SUMMARY_SHA256=36ebaa1e7942867ac0a14b233024671d76bb1162e6de1975fd7606307bc85b0a
 HISTORICAL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_conditional_prefix_hybrid_20260812_v1/arms"
@@ -189,16 +189,22 @@ Path(sys.argv[1]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n
 PY
 
 declare -a WORKER_PIDS=()
+TRAINING_PID=""
 terminate_workers() {
   local pid
+  if [[ -n "${TRAINING_PID}" ]]; then
+    kill "${TRAINING_PID}" 2>/dev/null || true
+    wait "${TRAINING_PID}" 2>/dev/null || true
+    TRAINING_PID=""
+  fi
   for pid in "${WORKER_PIDS[@]}"; do kill "${pid}" 2>/dev/null || true; done
-  wait || true
+  for pid in "${WORKER_PIDS[@]}"; do wait "${pid}" 2>/dev/null || true; done
+  WORKER_PIDS=()
 }
 trap 'terminate_workers; cleanup; exit 130' INT TERM
 
 run_worker() {
   local gpu="$1" worker_id="$2" label="$3" queue_root="$4" arm_root="$5"
-  exec > >(tee "${OUTPUT_ROOT}/logs/${label}_worker_${worker_id}.log") 2>&1
   export CUDA_VISIBLE_DEVICES="${gpu}"
   "${PYTHON_BIN}" "${SWEEP}" worker \
     --arm "${label}" \
@@ -213,20 +219,8 @@ run_worker() {
     --poll-seconds 0.5
 }
 
-run_arm() {
-  local label="$1" scope="$2" weight="$3"
-  local arm_root="${OUTPUT_ROOT}/arms/${label}"
-  local queue_root="${TEMP_ROOT}/queues/${label}"
-  local historical_args=()
-  mkdir -p "${arm_root}" "${queue_root}"
-  WORKER_PIDS=()
-  for worker_id in 1 2 3 4 5 6 7; do
-    (run_worker "${worker_id}" "${worker_id}" "${label}" "${queue_root}" "${arm_root}") &
-    WORKER_PIDS+=("$!")
-    echo "launched arm=${label} evaluator=${worker_id} CUDA_VISIBLE_DEVICES=${worker_id}"
-  done
-
-  training_status=0
+run_training() {
+  local label="$1" scope="$2" weight="$3" arm_root="$4" queue_root="$5"
   CUDA_VISIBLE_DEVICES=0 CUBLAS_WORKSPACE_CONFIG=:16:8 \
     "${PYTHON_BIN}" "${CODE_ROOT}/scripts/legacy_full_query_optimizer_lr.py" \
       --arm "${label}" --role selection --path workspace_16 \
@@ -245,8 +239,51 @@ run_arm() {
       --catalog-steps 2730 --query-steps 38805 --eval-steps 200 \
       --oracle-checkpoint-queue "${queue_root}" --oracle-max-queued "${ORACLE_MAX_QUEUED}" \
       --batch-size 16 --max-source-length 2048 --seed 20260626 --dropout-rate 0.1 \
-      --cublas-workspace-config :16:8 \
-      > >(tee "${OUTPUT_ROOT}/logs/${label}_train.log") 2>&1 || training_status=$?
+      --cublas-workspace-config :16:8
+}
+
+run_arm() {
+  local label="$1" scope="$2" weight="$3"
+  local arm_root="${OUTPUT_ROOT}/arms/${label}"
+  local queue_root="${TEMP_ROOT}/queues/${label}"
+  local historical_args=()
+  local training_status=0
+  local root_wait_iteration
+  mkdir -p "${queue_root}"
+  WORKER_PIDS=()
+
+  (run_training "${label}" "${scope}" "${weight}" "${arm_root}" "${queue_root}" \
+    > "${OUTPUT_ROOT}/logs/${label}_train.log" 2>&1) &
+  TRAINING_PID="$!"
+  for root_wait_iteration in {1..600}; do
+    if [[ -d "${arm_root}" ]]; then
+      break
+    fi
+    if ! kill -0 "${TRAINING_PID}" 2>/dev/null; then
+      wait "${TRAINING_PID}" || training_status=$?
+      TRAINING_PID=""
+      if (( training_status == 0 )); then training_status=1; fi
+      echo "arm=${label} exited before creating its output directory, status=${training_status}" >&2
+      exit "${training_status}"
+    fi
+    sleep 0.1
+  done
+  if [[ ! -d "${arm_root}" ]]; then
+    terminate_workers
+    echo "arm=${label} did not create its output directory within 60 seconds" >&2
+    exit 1
+  fi
+  echo "launched arm=${label} trainer CUDA_VISIBLE_DEVICES=0 pid=${TRAINING_PID}"
+
+  for worker_id in 1 2 3 4 5 6 7; do
+    (run_worker "${worker_id}" "${worker_id}" "${label}" "${queue_root}" "${arm_root}" \
+      > "${OUTPUT_ROOT}/logs/${label}_worker_${worker_id}.log" 2>&1) &
+    WORKER_PIDS+=("$!")
+    echo "launched arm=${label} evaluator=${worker_id} CUDA_VISIBLE_DEVICES=${worker_id}"
+  done
+
+  wait "${TRAINING_PID}" || training_status=$?
+  TRAINING_PID=""
 
   if (( training_status != 0 )); then
     "${PYTHON_BIN}" - "${queue_root}/producer.failed.json" "${training_status}" <<'PY'

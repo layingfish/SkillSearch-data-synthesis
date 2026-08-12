@@ -99,5 +99,32 @@ class DualCheckpointRetentionTest(unittest.TestCase):
             self.assertEqual(joint_file.read_text(encoding="utf-8"), "third")
 
 
+class SweepLauncherOrderingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.launcher = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh"
+        ).read_text(encoding="utf-8")
+
+    def test_trainer_owns_arm_root_before_evaluators_start(self):
+        run_arm = self.launcher.index("run_arm() {")
+        trainer_started = self.launcher.index('TRAINING_PID="$!"', run_arm)
+        worker_loop = self.launcher.index(
+            "for worker_id in 1 2 3 4 5 6 7; do", trainer_started
+        )
+        self.assertLess(trainer_started, worker_loop)
+        self.assertNotIn('mkdir -p "${arm_root}"', self.launcher[run_arm:worker_loop])
+
+    def test_failure_cleanup_waits_only_explicit_pids(self):
+        cleanup_start = self.launcher.index("terminate_workers() {")
+        cleanup_end = self.launcher.index("\n}", cleanup_start)
+        cleanup = self.launcher[cleanup_start:cleanup_end]
+        self.assertNotIn("wait || true", cleanup)
+        self.assertIn('wait "${TRAINING_PID}"', cleanup)
+        self.assertIn('wait "${pid}"', cleanup)
+
+
 if __name__ == "__main__":
     unittest.main()

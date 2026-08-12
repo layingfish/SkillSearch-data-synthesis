@@ -29,16 +29,16 @@ Eval: 与训练并行消费 snapshot；Official core75=`75` queries、beam=`50`�
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v1/arms/<arm>/{top1_best,joint_best}/`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v2/arms/<arm>/{top1_best,joint_best}/`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v1/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v2/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v1/sequence_weight_checkpoint_sweep_summary.json`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v2/sequence_weight_checkpoint_sweep_summary.json`
 
 ## Verification
 
 - [x] Minimal local check：Ruff、Python compile、两个 launcher 的 `bash -n`
-- [x] Unit/invariant test：本地相关测试=`29`，通过=`17`、torch/CUDA 环境跳过=`12`
+- [x] Unit/invariant test：本地相关测试=`31`，通过=`19`、torch/CUDA 环境跳过=`12`
 - [ ] `when gate=0, student_forward output must be allclose to base-model output`
 - [ ] `seq_010` 与 `cum_002` 历史轨迹锚点 exact
 - [ ] 每个新 arm 覆盖 `195` 个 checkpoint，queue 无残留
@@ -49,3 +49,5 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 独立 reviewer 在计划和实现复核时均没有返回；两次中止后改做结构化本地复核。CRITICAL=`0`。初始 HIGH=`2`：同一 snapshot 同时更新两种 selection 时可能因 move 丢失一份权重；snapshot hook 可能静默改变 ranking arm 的训练轨迹。第一项已通过同盘 move + hard-link clone 和后续独立替换测试关闭。第二项已实现四类 fail-closed exact checks，需在 A800 正式运行命中后关闭。
 
 实现自审覆盖 checkpoint 所有权转移、worker failure 传播、step/dev-loss 一一对齐、queue drain、matrix tie-break 和 control oracle 复用。历史 exact check 已成为正式运行前置门禁，任何不一致都会终止 matrix。当前 unresolved CRITICAL=`0`、HIGH=`0`。
+
+首次 job=`tide-chenyufei03-10662-bawkh` 使用 launch commit=`5b88e67`，节点识别 GPU count=`8`，固定 runtime 全部命中，节点测试=`29/29` 通过。随后在 optimizer step=`0` 前失败：worker 先创建了 `arms/cum_002`，训练器按 fail-closed overwrite guard 拒绝该目录。失败清理又因裸 `wait` 等待 node-level tee 而挂起；作业已取消，v1 日志保留，没有训练更新或 checkpoint。v2 改为训练进程先原子创建 arm root，再启动七个 evaluator；清理只等待显式 PID。
