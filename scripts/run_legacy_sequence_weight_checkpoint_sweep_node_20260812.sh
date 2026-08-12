@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v3"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4"
 CONTROL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_core75_checkpoint_oracle_20260812_v1"
 CONTROL_SUMMARY_SHA256=36ebaa1e7942867ac0a14b233024671d76bb1162e6de1975fd7606307bc85b0a
 HISTORICAL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_conditional_prefix_hybrid_20260812_v1/arms"
@@ -30,9 +30,10 @@ CANDIDATE_SUMMARY_SHA256=72b0f525d6c3d9feabc7770c054ee70d8478f1b280d1a100793da8d
 CANDIDATE_MANIFEST="${CANDIDATE_ROOT}/c1_hard_negative_candidates.jsonl"
 CANDIDATE_MANIFEST_SHA256=8df15d909949e53c0fe8908ab889e164c70a2a2dc5e46a1b6ad505fb3ef17d1d
 ORACLE_MAX_QUEUED=7
-MIN_TMP_AVAILABLE_BYTES=$((30 * 1024 * 1024 * 1024))
+MIN_TMP_AVAILABLE_BYTES=$((100 * 1024 * 1024 * 1024))
 JOINT_MIN_R10=0.69
 JOINT_MIN_R50=0.75
+SHARED_EVAL_GPU=7
 
 if [[ -e "${OUTPUT_ROOT}" ]]; then
   echo "refusing to overwrite sequence-weight checkpoint sweep: ${OUTPUT_ROOT}" >&2
@@ -184,21 +185,28 @@ payload = {
     "checkpoint_steps": list(range(200, 38801, 200)) + [38805],
     "joint_thresholds": {"r10": 0.69, "r50": 0.75},
     "evaluation": "Official core75=75 queries, beam=50, beam_order, CE log-prob",
+    "scheduler": {
+        "parallel_trainers": 7,
+        "trainer_gpus": [0, 1, 2, 3, 4, 5, 6],
+        "shared_evaluator_gpu": 7,
+        "post_training_helper_evaluators": True,
+    },
 }
 Path(sys.argv[1]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 
-declare -a WORKER_PIDS=()
-terminate_workers() {
+declare -a BACKGROUND_PIDS=()
+terminate_background() {
   local pid
-  for pid in "${WORKER_PIDS[@]}"; do kill "${pid}" 2>/dev/null || true; done
-  for pid in "${WORKER_PIDS[@]}"; do wait "${pid}" 2>/dev/null || true; done
-  WORKER_PIDS=()
+  for pid in "${BACKGROUND_PIDS[@]}"; do kill "${pid}" 2>/dev/null || true; done
+  for pid in "${BACKGROUND_PIDS[@]}"; do wait "${pid}" 2>/dev/null || true; done
+  BACKGROUND_PIDS=()
 }
-trap 'terminate_workers; cleanup; exit 130' INT TERM
+trap 'terminate_background; cleanup; exit 130' INT TERM
 
 run_worker() {
   local gpu="$1" worker_id="$2" label="$3" queue_root="$4" arm_root="$5"
+  shift 5
   export CUDA_VISIBLE_DEVICES="${gpu}"
   "${PYTHON_BIN}" "${SWEEP}" worker \
     --arm "${label}" \
@@ -210,12 +218,13 @@ run_worker() {
     --semantic-ids "${SKILLGR_SEMANTIC_IDS}" \
     --joint-min-r10 "${JOINT_MIN_R10}" \
     --joint-min-r50 "${JOINT_MIN_R50}" \
-    --poll-seconds 0.5
+    --poll-seconds 0.5 \
+    "$@"
 }
 
 run_training() {
-  local label="$1" scope="$2" weight="$3" arm_root="$4" queue_root="$5"
-  CUDA_VISIBLE_DEVICES=0 CUBLAS_WORKSPACE_CONFIG=:16:8 \
+  local gpu="$1" label="$2" scope="$3" weight="$4" arm_root="$5" queue_root="$6"
+  CUDA_VISIBLE_DEVICES="${gpu}" CUBLAS_WORKSPACE_CONFIG=:16:8 \
     "${PYTHON_BIN}" "${CODE_ROOT}/scripts/legacy_full_query_optimizer_lr.py" \
       --arm "${label}" --role selection --path workspace_16 \
       --optimizer-mode carry --query-lr 0.0003 \
@@ -236,24 +245,14 @@ run_training() {
       --cublas-workspace-config :16:8
 }
 
-run_arm() {
-  local label="$1" scope="$2" weight="$3"
+run_arm_pipeline() {
+  local gpu="$1" helper_worker_id="$2" label="$3" scope="$4" weight="$5"
   local arm_root="${OUTPUT_ROOT}/arms/${label}"
   local eval_root="${OUTPUT_ROOT}/oracle/${label}"
   local queue_root="${TEMP_ROOT}/queues/${label}"
-  local historical_args=()
   local training_status=0
-  mkdir -p "${queue_root}" "${eval_root}"
-  WORKER_PIDS=()
 
-  for worker_id in 1 2 3 4 5 6 7; do
-    (run_worker "${worker_id}" "${worker_id}" "${label}" "${queue_root}" "${eval_root}" \
-      > "${OUTPUT_ROOT}/logs/${label}_worker_${worker_id}.log" 2>&1) &
-    WORKER_PIDS+=("$!")
-    echo "launched arm=${label} evaluator=${worker_id} CUDA_VISIBLE_DEVICES=${worker_id}"
-  done
-
-  run_training "${label}" "${scope}" "${weight}" "${arm_root}" "${queue_root}" \
+  run_training "${gpu}" "${label}" "${scope}" "${weight}" "${arm_root}" "${queue_root}" \
     > "${OUTPUT_ROOT}/logs/${label}_train.log" 2>&1 || training_status=$?
 
   if (( training_status != 0 )); then
@@ -267,22 +266,73 @@ Path(sys.argv[1]).write_text(
     encoding="utf-8",
 )
 PY
-    terminate_workers
     echo "arm=${label} training failed with status ${training_status}" >&2
-    exit "${training_status}"
+    return "${training_status}"
   fi
   touch "${queue_root}/producer.done"
+  echo "arm=${label} training complete; GPU ${gpu} joins checkpoint evaluation"
+  run_worker "${gpu}" "${helper_worker_id}" "${label}" "${queue_root}" "${eval_root}" \
+    --allow-empty > "${OUTPUT_ROOT}/logs/${label}_worker_${helper_worker_id}.log" 2>&1
+}
 
-  worker_failures=0
-  for pid in "${WORKER_PIDS[@]}"; do
-    if ! wait "${pid}"; then
-      worker_failures=$((worker_failures + 1))
-    fi
+ARM_LABELS=(cum_002 seq_001 seq_002 seq_004 seq_006 seq_008 seq_010)
+ARM_SCOPES=(cumulative sequence_only sequence_only sequence_only sequence_only sequence_only sequence_only)
+ARM_WEIGHTS=(0.02 0.01 0.02 0.04 0.06 0.08 0.10)
+ARM_GPUS=(0 1 2 3 4 5 6)
+SHARED_EVAL_LOCK="${TEMP_ROOT}/gpu_${SHARED_EVAL_GPU}_evaluation.lock"
+
+for index in "${!ARM_LABELS[@]}"; do
+  label="${ARM_LABELS[index]}"
+  queue_root="${TEMP_ROOT}/queues/${label}"
+  eval_root="${OUTPUT_ROOT}/oracle/${label}"
+  mkdir -p "${queue_root}" "${eval_root}"
+  (run_worker "${SHARED_EVAL_GPU}" 8 "${label}" "${queue_root}" "${eval_root}" \
+    --allow-empty --eval-lock "${SHARED_EVAL_LOCK}" \
+    > "${OUTPUT_ROOT}/logs/${label}_worker_8.log" 2>&1) &
+  BACKGROUND_PIDS+=("$!")
+  echo "launched arm=${label} shared_evaluator=8 CUDA_VISIBLE_DEVICES=${SHARED_EVAL_GPU}"
+done
+
+for index in "${!ARM_LABELS[@]}"; do
+  gpu="${ARM_GPUS[index]}"
+  helper_worker_id=$((gpu + 1))
+  (run_arm_pipeline "${gpu}" "${helper_worker_id}" \
+    "${ARM_LABELS[index]}" "${ARM_SCOPES[index]}" "${ARM_WEIGHTS[index]}") &
+  BACKGROUND_PIDS+=("$!")
+  echo "launched arm=${ARM_LABELS[index]} trainer CUDA_VISIBLE_DEVICES=${gpu}"
+done
+
+declare -a ACTIVE_PIDS=("${BACKGROUND_PIDS[@]}")
+while (( ${#ACTIVE_PIDS[@]} > 0 )); do
+  finished_pid=""
+  if wait -n -p finished_pid "${ACTIVE_PIDS[@]}"; then
+    status=0
+  else
+    status=$?
+    echo "background process failed: pid=${finished_pid:-unknown} status=${status}" >&2
+    terminate_background
+    exit "${status}"
+  fi
+  declare -a remaining=()
+  for pid in "${ACTIVE_PIDS[@]}"; do
+    [[ "${pid}" == "${finished_pid}" ]] || remaining+=("${pid}")
   done
-  WORKER_PIDS=()
-  if (( worker_failures > 0 )); then
-    echo "arm=${label} has ${worker_failures} failed evaluator workers" >&2
-    exit 1
+  ACTIVE_PIDS=("${remaining[@]}")
+done
+BACKGROUND_PIDS=()
+
+for index in "${!ARM_LABELS[@]}"; do
+  label="${ARM_LABELS[index]}"
+  scope="${ARM_SCOPES[index]}"
+  weight="${ARM_WEIGHTS[index]}"
+  arm_root="${OUTPUT_ROOT}/arms/${label}"
+  eval_root="${OUTPUT_ROOT}/oracle/${label}"
+  queue_root="${TEMP_ROOT}/queues/${label}"
+  historical_args=()
+  if [[ "${label}" == seq_010 ]]; then
+    historical_args=(--historical-arm-root "${SEQ_HISTORICAL_ROOT}")
+  elif [[ "${label}" == cum_002 ]]; then
+    historical_args=(--historical-arm-root "${CUM_HISTORICAL_ROOT}")
   fi
   if compgen -G "${queue_root}/step_*.ready.json" >/dev/null || \
      compgen -G "${queue_root}/step_*.claimed.*.json" >/dev/null || \
@@ -290,33 +340,18 @@ PY
     echo "arm=${label} checkpoint queue is not drained" >&2
     exit 1
   fi
-
-  if [[ "${label}" == seq_010 ]]; then
-    historical_args=(--historical-arm-root "${SEQ_HISTORICAL_ROOT}")
-  elif [[ "${label}" == cum_002 ]]; then
-    historical_args=(--historical-arm-root "${CUM_HISTORICAL_ROOT}")
-  fi
   CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${SWEEP}" analyze-arm \
     --arm "${label}" --scope "${scope}" --weight "${weight}" \
     --arm-root "${arm_root}" --eval-root "${eval_root}" \
-    --query-steps 38805 --eval-steps 200 --worker-count 7 \
+    --query-steps 38805 --eval-steps 200 --worker-count 2 \
     --joint-min-r10 "${JOINT_MIN_R10}" --joint-min-r50 "${JOINT_MIN_R50}" \
     "${historical_args[@]}"
-
   case "${queue_root}" in
     "${TEMP_ROOT}"/queues/*) rm -rf -- "${queue_root}" ;;
     *) echo "refusing to remove unexpected queue path: ${queue_root}" >&2; exit 1 ;;
   esac
   echo "completed arm=${label} summary=${arm_root}/checkpoint_sweep_summary.json"
-}
-
-run_arm cum_002 cumulative 0.02
-run_arm seq_001 sequence_only 0.01
-run_arm seq_002 sequence_only 0.02
-run_arm seq_004 sequence_only 0.04
-run_arm seq_006 sequence_only 0.06
-run_arm seq_008 sequence_only 0.08
-run_arm seq_010 sequence_only 0.10
+done
 trap - INT TERM
 
 CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${SWEEP}" analyze-matrix \

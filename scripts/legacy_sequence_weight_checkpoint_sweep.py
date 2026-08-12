@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -154,6 +155,21 @@ def _worker_payload(
     }
 
 
+def _evaluate_with_optional_lock(
+    args: argparse.Namespace, ready: dict[str, Any]
+) -> dict[str, Any]:
+    if args.eval_lock is None:
+        return _evaluate_checkpoint(args, ready)
+
+    args.eval_lock.parent.mkdir(parents=True, exist_ok=True)
+    with args.eval_lock.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return _evaluate_checkpoint(args, ready)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def command_worker(args: argparse.Namespace) -> None:
     args.queue_root = args.queue_root.resolve(strict=True)
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -178,7 +194,7 @@ def command_worker(args: argparse.Namespace) -> None:
                 time.sleep(args.poll_seconds)
                 continue
             ready = json.loads(current_claim.read_text(encoding="utf-8"))
-            result = _evaluate_checkpoint(args, ready)
+            result = _evaluate_with_optional_lock(args, ready)
             result["artifact_format"] = "legacy_sequence_weight_checkpoint_step_v1"
             result["arm"] = args.arm
             step = int(result["step"])
@@ -240,8 +256,11 @@ def command_worker(args: argparse.Namespace) -> None:
         _write_json_atomic(args.queue_root / "worker.failed.json", failure)
         raise
 
-    if top1_record is None or not top1_path.is_dir():
-        raise RuntimeError(f"worker {args.worker_id} processed no checkpoints")
+    if top1_record is None:
+        if not args.allow_empty:
+            raise RuntimeError(f"worker {args.worker_id} processed no checkpoints")
+    elif not top1_path.is_dir():
+        raise RuntimeError(f"worker {args.worker_id} retained checkpoint is missing")
     _write_json_atomic(
         worker_root / "done.json",
         _worker_payload(
@@ -672,6 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--joint-min-r10", type=float, default=DEFAULT_JOINT_MIN_R10)
     worker.add_argument("--joint-min-r50", type=float, default=DEFAULT_JOINT_MIN_R50)
     worker.add_argument("--poll-seconds", type=float, default=0.5)
+    worker.add_argument("--eval-lock", type=Path)
+    worker.add_argument("--allow-empty", action="store_true")
     worker.set_defaults(func=command_worker)
 
     arm = subparsers.add_parser("analyze-arm")

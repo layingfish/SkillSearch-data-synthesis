@@ -1,8 +1,11 @@
+import argparse
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.legacy_sequence_weight_checkpoint_sweep import (
+    _evaluate_with_optional_lock,
     _matrix_winner,
     _replace_retained,
     joint_eligible,
@@ -99,6 +102,33 @@ class DualCheckpointRetentionTest(unittest.TestCase):
             self.assertEqual(joint_file.read_text(encoding="utf-8"), "third")
 
 
+class SharedEvaluationLockTest(unittest.TestCase):
+    def test_evaluation_without_lock_calls_evaluator_directly(self):
+        args = argparse.Namespace(eval_lock=None)
+        with mock.patch(
+            "scripts.legacy_sequence_weight_checkpoint_sweep._evaluate_checkpoint",
+            return_value={"step": 200},
+        ) as evaluate:
+            self.assertEqual(
+                _evaluate_with_optional_lock(args, {"step": 200}), {"step": 200}
+            )
+        evaluate.assert_called_once_with(args, {"step": 200})
+
+    def test_evaluation_lock_file_is_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "locks" / "gpu7.lock"
+            args = argparse.Namespace(eval_lock=lock_path)
+            with mock.patch(
+                "scripts.legacy_sequence_weight_checkpoint_sweep._evaluate_checkpoint",
+                return_value={"step": 200},
+            ) as evaluate:
+                self.assertEqual(
+                    _evaluate_with_optional_lock(args, {"step": 200}), {"step": 200}
+                )
+            self.assertTrue(lock_path.is_file())
+            evaluate.assert_called_once_with(args, {"step": 200})
+
+
 class SweepLauncherOrderingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -108,17 +138,25 @@ class SweepLauncherOrderingTest(unittest.TestCase):
             / "run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh"
         ).read_text(encoding="utf-8")
 
+    def test_seven_trainers_are_pinned_to_distinct_gpus(self):
+        self.assertIn("ARM_GPUS=(0 1 2 3 4 5 6)", self.launcher)
+        self.assertIn('run_training "${gpu}"', self.launcher)
+
+    def test_shared_evaluators_are_serialized_on_gpu7(self):
+        self.assertIn("SHARED_EVAL_GPU=7", self.launcher)
+        self.assertIn('--eval-lock "${SHARED_EVAL_LOCK}"', self.launcher)
+
+    def test_completed_trainer_gpu_becomes_helper_evaluator(self):
+        self.assertIn('run_worker "${gpu}" "${helper_worker_id}"', self.launcher)
+
     def test_trainer_and_evaluators_use_separate_roots(self):
-        run_arm = self.launcher.index("run_arm() {")
-        run_arm_end = self.launcher.index("\n}", run_arm)
-        body = self.launcher[run_arm:run_arm_end]
-        self.assertIn('local eval_root="${OUTPUT_ROOT}/oracle/${label}"', body)
-        self.assertIn('"${queue_root}" "${eval_root}"', body)
-        self.assertIn('--arm-root "${arm_root}" --eval-root "${eval_root}"', body)
-        self.assertNotIn('mkdir -p "${arm_root}"', body)
+        self.assertIn('eval_root="${OUTPUT_ROOT}/oracle/${label}"', self.launcher)
+        self.assertIn(
+            '--arm-root "${arm_root}" --eval-root "${eval_root}"', self.launcher
+        )
 
     def test_failure_cleanup_waits_only_explicit_pids(self):
-        cleanup_start = self.launcher.index("terminate_workers() {")
+        cleanup_start = self.launcher.index("terminate_background() {")
         cleanup_end = self.launcher.index("\n}", cleanup_start)
         cleanup = self.launcher[cleanup_start:cleanup_end]
         self.assertNotIn("wait || true", cleanup)
