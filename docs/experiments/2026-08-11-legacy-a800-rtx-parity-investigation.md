@@ -125,6 +125,35 @@ that small early numerical differences can be amplified by the
 `2,730`-update catalog phase, the shared AdamW state, and the subsequent
 `38,805`-update query phase.
 
+## Full-trajectory checkpoint oracle
+
+The 2026-08-12 strict-base rerun evaluated every query-dev checkpoint at
+steps `{200,400,...,38,800,38,805}`. All `195` checkpoints used Official
+core75=`75` queries, beam=`50`, beam-order, and CE log-prob. The test-oracle
+checkpoint is step=`37,000`, with Overall R@1/R@10/R@50
+`25.4794/69.3556/76.3333` and dev loss `0.797698909`. The exact dev-best anchor
+is step=`38,200`, with Overall `20.9238/69.5556/75.3333` and dev loss
+`0.770134370` under the same evaluation condition.
+
+Selecting by test R@1 therefore recovers `4.5556` R@1 points relative to the
+dev-best checkpoint. It explains `61.1940%` of the original `7.4444`-point
+dev-best-to-RTX R@1 gap. The best checkpoint remains `2.8889` R@1 points below
+RTX=`28.3683` and fails the within-one-point threshold R@1=`27.3683`; conditions
+are the same Official core75 protocol. R@10 and R@50 at the oracle checkpoint
+are `0.3556` and `1.3333` points above RTX=`69.0000/75.0000`, respectively.
+
+The `195`-point dev-loss/R@1 Pearson and Spearman correlations are `-0.9002`
+and `-0.8942`. Dev loss is globally informative along this trajectory, while
+its local ordering near convergence is inadequate for Top-1 checkpoint
+selection. Because this diagnostic selects on Official core75, it is an oracle
+upper bound and cannot serve as a leakage-free reported result.
+
+The step=`38,200` model-state, prediction, Overall/Single/Multi metrics, dev
+loss, and complete loss-history hash exactly match the historical strict-base
+control. The terminal step=`38,805` was captured before best-model restore.
+This closes the snapshot instrumentation loop without changing the training
+trajectory.
+
 ## Current conclusion
 
 The first divergence occurs in GPU numerical execution during the first
@@ -134,6 +163,12 @@ evaluation protocol have been tested or matched and do not explain the full
 gap. The leading unresolved cause is the BF16/GEMM execution path on different
 GPU architectures and drivers, with optimization amplifying the resulting
 trajectory difference.
+
+Checkpoint selection is now also quantified: dev-loss selection accounts for
+`4.5556` of the `7.4444` R@1 points separating the strict-base A800 dev-best
+from RTX under Official core75=`75` queries, beam=`50`, and beam-order. A
+residual `2.8889`-point R@1 gap remains even with test-oracle selection, so
+checkpoint selection alone does not recover RTX parity on this A800 trajectory.
 
 The 2026-08-11 fixed-pool diagnostic localizes the final Top-1 failure more
 precisely. For every Official core75 query, it exhaustively rescored the union
