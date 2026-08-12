@@ -354,7 +354,8 @@ def _historical_anchor(
 
 def command_analyze_arm(args: argparse.Namespace) -> None:
     expected_steps = oracle_eval_steps(args.query_steps, args.eval_steps)
-    results = _load_results(args.arm_root, expected_steps, args.arm)
+    eval_root = args.eval_root if args.eval_root is not None else args.arm_root
+    results = _load_results(eval_root, expected_steps, args.arm)
     results_by_step = {int(result["step"]): result for result in results}
     loss_history = args.arm_root / "train" / "loss_history.jsonl"
     loss_events = [
@@ -375,7 +376,7 @@ def command_analyze_arm(args: argparse.Namespace) -> None:
     ):
         raise ValueError(f"checkpoint/dev-loss alignment mismatch for {args.arm}")
 
-    worker_paths = sorted((args.arm_root / "workers").glob("worker_*/done.json"))
+    worker_paths = sorted((eval_root / "workers").glob("worker_*/done.json"))
     workers = [json.loads(path.read_text(encoding="utf-8")) for path in worker_paths]
     if len(workers) != args.worker_count:
         raise ValueError(
@@ -678,6 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     arm.add_argument("--scope", required=True)
     arm.add_argument("--weight", type=float, required=True)
     arm.add_argument("--arm-root", type=Path, required=True)
+    arm.add_argument("--eval-root", type=Path)
     arm.add_argument("--historical-arm-root", type=Path)
     arm.add_argument("--query-steps", type=int, default=38805)
     arm.add_argument("--eval-steps", type=int, default=200)

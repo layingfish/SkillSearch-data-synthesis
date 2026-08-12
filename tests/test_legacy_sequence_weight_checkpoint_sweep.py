@@ -108,21 +108,20 @@ class SweepLauncherOrderingTest(unittest.TestCase):
             / "run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh"
         ).read_text(encoding="utf-8")
 
-    def test_trainer_owns_arm_root_before_evaluators_start(self):
+    def test_trainer_and_evaluators_use_separate_roots(self):
         run_arm = self.launcher.index("run_arm() {")
-        trainer_started = self.launcher.index('TRAINING_PID="$!"', run_arm)
-        worker_loop = self.launcher.index(
-            "for worker_id in 1 2 3 4 5 6 7; do", trainer_started
-        )
-        self.assertLess(trainer_started, worker_loop)
-        self.assertNotIn('mkdir -p "${arm_root}"', self.launcher[run_arm:worker_loop])
+        run_arm_end = self.launcher.index("\n}", run_arm)
+        body = self.launcher[run_arm:run_arm_end]
+        self.assertIn('local eval_root="${OUTPUT_ROOT}/oracle/${label}"', body)
+        self.assertIn('"${queue_root}" "${eval_root}"', body)
+        self.assertIn('--arm-root "${arm_root}" --eval-root "${eval_root}"', body)
+        self.assertNotIn('mkdir -p "${arm_root}"', body)
 
     def test_failure_cleanup_waits_only_explicit_pids(self):
         cleanup_start = self.launcher.index("terminate_workers() {")
         cleanup_end = self.launcher.index("\n}", cleanup_start)
         cleanup = self.launcher[cleanup_start:cleanup_end]
         self.assertNotIn("wait || true", cleanup)
-        self.assertIn('wait "${TRAINING_PID}"', cleanup)
         self.assertIn('wait "${pid}"', cleanup)
 
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v2"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v3"
 CONTROL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_core75_checkpoint_oracle_20260812_v1"
 CONTROL_SUMMARY_SHA256=36ebaa1e7942867ac0a14b233024671d76bb1162e6de1975fd7606307bc85b0a
 HISTORICAL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_conditional_prefix_hybrid_20260812_v1/arms"
@@ -189,14 +189,8 @@ Path(sys.argv[1]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n
 PY
 
 declare -a WORKER_PIDS=()
-TRAINING_PID=""
 terminate_workers() {
   local pid
-  if [[ -n "${TRAINING_PID}" ]]; then
-    kill "${TRAINING_PID}" 2>/dev/null || true
-    wait "${TRAINING_PID}" 2>/dev/null || true
-    TRAINING_PID=""
-  fi
   for pid in "${WORKER_PIDS[@]}"; do kill "${pid}" 2>/dev/null || true; done
   for pid in "${WORKER_PIDS[@]}"; do wait "${pid}" 2>/dev/null || true; done
   WORKER_PIDS=()
@@ -245,45 +239,22 @@ run_training() {
 run_arm() {
   local label="$1" scope="$2" weight="$3"
   local arm_root="${OUTPUT_ROOT}/arms/${label}"
+  local eval_root="${OUTPUT_ROOT}/oracle/${label}"
   local queue_root="${TEMP_ROOT}/queues/${label}"
   local historical_args=()
   local training_status=0
-  local root_wait_iteration
-  mkdir -p "${queue_root}"
+  mkdir -p "${queue_root}" "${eval_root}"
   WORKER_PIDS=()
 
-  (run_training "${label}" "${scope}" "${weight}" "${arm_root}" "${queue_root}" \
-    > "${OUTPUT_ROOT}/logs/${label}_train.log" 2>&1) &
-  TRAINING_PID="$!"
-  for root_wait_iteration in {1..600}; do
-    if [[ -d "${arm_root}" ]]; then
-      break
-    fi
-    if ! kill -0 "${TRAINING_PID}" 2>/dev/null; then
-      wait "${TRAINING_PID}" || training_status=$?
-      TRAINING_PID=""
-      if (( training_status == 0 )); then training_status=1; fi
-      echo "arm=${label} exited before creating its output directory, status=${training_status}" >&2
-      exit "${training_status}"
-    fi
-    sleep 0.1
-  done
-  if [[ ! -d "${arm_root}" ]]; then
-    terminate_workers
-    echo "arm=${label} did not create its output directory within 60 seconds" >&2
-    exit 1
-  fi
-  echo "launched arm=${label} trainer CUDA_VISIBLE_DEVICES=0 pid=${TRAINING_PID}"
-
   for worker_id in 1 2 3 4 5 6 7; do
-    (run_worker "${worker_id}" "${worker_id}" "${label}" "${queue_root}" "${arm_root}" \
+    (run_worker "${worker_id}" "${worker_id}" "${label}" "${queue_root}" "${eval_root}" \
       > "${OUTPUT_ROOT}/logs/${label}_worker_${worker_id}.log" 2>&1) &
     WORKER_PIDS+=("$!")
     echo "launched arm=${label} evaluator=${worker_id} CUDA_VISIBLE_DEVICES=${worker_id}"
   done
 
-  wait "${TRAINING_PID}" || training_status=$?
-  TRAINING_PID=""
+  run_training "${label}" "${scope}" "${weight}" "${arm_root}" "${queue_root}" \
+    > "${OUTPUT_ROOT}/logs/${label}_train.log" 2>&1 || training_status=$?
 
   if (( training_status != 0 )); then
     "${PYTHON_BIN}" - "${queue_root}/producer.failed.json" "${training_status}" <<'PY'
@@ -327,7 +298,7 @@ PY
   fi
   CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" "${SWEEP}" analyze-arm \
     --arm "${label}" --scope "${scope}" --weight "${weight}" \
-    --arm-root "${arm_root}" \
+    --arm-root "${arm_root}" --eval-root "${eval_root}" \
     --query-steps 38805 --eval-steps 200 --worker-count 7 \
     --joint-min-r10 "${JOINT_MIN_R10}" --joint-min-r50 "${JOINT_MIN_R50}" \
     "${historical_args[@]}"
