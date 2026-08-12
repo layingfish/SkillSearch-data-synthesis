@@ -99,6 +99,11 @@ except ModuleNotFoundError:
         attach_prefix_ranking_forward,
     )
 
+try:
+    from legacy_core75_checkpoint_oracle import EvalCheckpointSnapshotQueue
+except ModuleNotFoundError:
+    from scripts.legacy_core75_checkpoint_oracle import EvalCheckpointSnapshotQueue
+
 
 QUERY_STEPS = 38805
 EVAL_STEPS = 200
@@ -633,6 +638,10 @@ def command_run(args: argparse.Namespace) -> None:
         )
     if args.eval_steps != EVAL_STEPS:
         raise ValueError(f"full-query sweep requires eval_steps={EVAL_STEPS}")
+    if args.oracle_checkpoint_queue is None and args.oracle_max_queued != 14:
+        raise ValueError(
+            "--oracle-max-queued is only valid with --oracle-checkpoint-queue"
+        )
     if args.cublas_workspace_config != "auto":
         observed_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
         if observed_workspace != args.cublas_workspace_config:
@@ -761,6 +770,16 @@ def command_run(args: argparse.Namespace) -> None:
     pipeline = load_module(args.pipeline, f"full_query_optimizer_lr_{args.arm}")
     original_factory = pipeline.make_structured_t5_sid_model
     original_saver = pipeline.save_structured_decoder_checkpoint
+    original_append_loss_history = pipeline.append_loss_history
+    snapshot_queue = (
+        EvalCheckpointSnapshotQueue(
+            args.oracle_checkpoint_queue,
+            expected_steps=expected_eval_steps(args.query_steps, args.eval_steps),
+            max_queued=args.oracle_max_queued,
+        )
+        if args.oracle_checkpoint_queue is not None
+        else None
+    )
     prefix_rank_trace: dict[str, Any] = {}
     prefix_rank_runtime = None
     if prefix_rank_active:
@@ -806,10 +825,48 @@ def command_run(args: argparse.Namespace) -> None:
     batch_builder = pipeline.structured_sid_batch
     if prefix_rank_runtime is not None:
         batch_builder = prefix_rank_runtime.wrap_batch_builder(batch_builder)
-    pipeline.structured_sid_batch = observer.wrap_batch_builder(batch_builder)
-    pipeline.save_structured_decoder_checkpoint = observer.wrap_checkpoint_saver(
-        original_saver
-    )
+    observed_batch_builder = observer.wrap_batch_builder(batch_builder)
+    if snapshot_queue is not None:
+
+        def snapshot_aware_batch_builder(*batch_args: Any, **batch_kwargs: Any) -> Any:
+            snapshot_queue.flush(
+                observer.model, torch, reason="before_next_query_batch"
+            )
+            return observed_batch_builder(*batch_args, **batch_kwargs)
+
+        pipeline.structured_sid_batch = snapshot_aware_batch_builder
+
+        def snapshot_aware_append_loss_history(
+            path: Path, row: dict[str, Any]
+        ) -> None:
+            original_append_loss_history(path, row)
+            snapshot_queue.observe_loss_event(row)
+
+        pipeline.append_loss_history = snapshot_aware_append_loss_history
+    else:
+        pipeline.structured_sid_batch = observed_batch_builder
+
+    controlled_saver = observer.wrap_checkpoint_saver(original_saver)
+    if snapshot_queue is not None:
+
+        def snapshot_aware_saver(*save_args: Any, **save_kwargs: Any) -> Any:
+            snapshot_queue.capture_saver_template(
+                original_saver, save_args, save_kwargs
+            )
+            checkpoint_name = Path(save_args[0]).name
+            if checkpoint_name == "best":
+                snapshot_queue.flush(
+                    observer.model, torch, reason="before_dev_best_save"
+                )
+            elif checkpoint_name == "last":
+                snapshot_queue.flush(
+                    observer.model, torch, reason="before_terminal_best_restore"
+                )
+            return controlled_saver(*save_args, **save_kwargs)
+
+        pipeline.save_structured_decoder_checkpoint = snapshot_aware_saver
+    else:
+        pipeline.save_structured_decoder_checkpoint = controlled_saver
 
     train_dir = args.output_dir / "train"
     original_argv = sys.argv
@@ -822,6 +879,11 @@ def command_run(args: argparse.Namespace) -> None:
         torch.optim.AdamW = original_adamw
 
     observer.validate()
+    snapshot_payload = (
+        snapshot_queue.validate()
+        if snapshot_queue is not None
+        else {"enabled": False}
+    )
     prefix_rank_execution = (
         prefix_rank_runtime.validate()
         if prefix_rank_runtime is not None
@@ -1041,6 +1103,7 @@ def command_run(args: argparse.Namespace) -> None:
             "best": best_checkpoint,
             "final": final_checkpoint,
         },
+        "checkpoint_oracle_snapshots": snapshot_payload,
         "execution": {
             "batch_calls": observer.batch_calls,
             "forward_calls": observer.forward_calls,
@@ -1123,6 +1186,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catalog-steps", type=int, default=CATALOG_STEPS)
     parser.add_argument("--query-steps", type=int, default=QUERY_STEPS)
     parser.add_argument("--eval-steps", type=int, default=EVAL_STEPS)
+    parser.add_argument("--oracle-checkpoint-queue", type=Path)
+    parser.add_argument("--oracle-max-queued", type=int, default=14)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-source-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=20260626)
