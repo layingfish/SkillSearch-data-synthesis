@@ -265,3 +265,38 @@ The enhanced query-only result R@1/R@10/R@50=`27.26/69.33/76.78` remains a
 separate method reference under source rows=`100,078`, global batch=`16`
 (`8` ranks x `2`), lr=`3e-4`, query epochs=`5`, catalog passes=`0`, Official
 core75=`75` queries, beam=`50`, and beam-order aggregation.
+
+## 2026-08-12 test-selected checkpoint sweep update
+
+The full sequence-weight checkpoint sweep completed on job=
+`tide-chenyufei03-10669-bknul` with one `8×A800` node. Each new arm used catalog/query
+updates=`2,730/38,805`, batch=`16`, lr=`3e-4`, seed=`20260626`, BF16,
+dropout=`0.1`, optimizer carry, and `CUBLAS_WORKSPACE_CONFIG=:16:8`. Each arm
+evaluated `195/195` checkpoints at query steps=`{200,400,...,38,800,38,805}`;
+all queues drained to `0`. The historical exact anchors for cumulative
+lambda=`0.02` and sequence-only lambda=`0.10` passed model-state, loss-history,
+prediction, metric, best-step, and dev-loss checks.
+
+The selected performance-recovery checkpoint is cumulative lambda=`0.02` at
+query step=`28,400`. Its Overall R@1/R@10/R@50=
+`28.2571/70.0000/75.1111%`, Single R@1=`41.6667%`, and Multi R@1=`21.9468%`;
+conditions are Official core75=`75` queries, beam=`50`, beam-order, CE log-prob,
+and test-set checkpoint selection. Relative to the archived RTX reference, the
+Overall deltas are `-0.1111/+1.0000/+0.1111` percentage points, the Single R@1
+delta is `0.0000`, and the Multi R@1 delta is `-0.1634` percentage points under
+the same evaluation protocol. This single seed passes all pre-existing recovery
+thresholds.
+
+The pure Top-1 winner is sequence-only lambda=`0.10` at query step=`38,800`,
+with Overall R@1/R@10/R@50=`28.7683/70.5873/73.8889%`, Single R@1=`50.0000%`,
+and Multi R@1=`18.7768%` under the same test-selected Official core75 protocol.
+It exceeds RTX Overall R@1 by `0.4000` percentage points but misses RTX Overall
+R@50 by `1.1111` percentage points.
+
+The original strict-base control remains at Overall R@1/R@10/R@50=
+`25.4794/69.3556/76.3333%` at test-selected query step=`37,000` under the same
+Official core75 protocol. Strict-base A800/RTX parity therefore remains open.
+The cumulative lambda=`0.02` recipe resolves the practical performance blocker
+for seed=`20260626`. Full commands, hashes, selected checkpoint paths, and the
+test-selection caveat are recorded in
+`docs/experiments/2026-08-12-legacy-sequence-weight-checkpoint-sweep.md`.

@@ -1,6 +1,6 @@
 # Experiment: Legacy sequence-weight checkpoint sweep
 
-Status: running
+Status: done
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -18,7 +18,7 @@ Risk Tier: 3
 1. 复用已验证的 snapshot queue 和七路 evaluator，增加同时保留 `top1-best` 与 `joint-best` 的通用 arm 分析。
 2. 用 `seq_010`、`cum_002` 的历史 dev-best checkpoint、prediction、metrics 和 loss history 做轨迹不变性锚点。
 3. 本地验证选择规则、双 checkpoint 保留、完整 step coverage、queue drain 和 matrix 聚合。
-4. 一个 `8×A800` 节点并行运行七个新 arm；GPU `0–6` 各训练一个 arm，GPU `7` 串行消费各 arm 的 snapshot。某个训练结束后，对应 GPU 转为该 arm 的第二 evaluator。
+4. 一个 `8×A800` 节点并行运行七个新 arm；GPU `0–6` 各训练一个 arm，并各运行一个同 arm evaluator；GPU `7` 上的七个 worker 通过全局锁串行跨 arm 补位。因此每个 arm 固定由两个 worker 消费 snapshot。
 5. 汇总各 arm 的 `top1-best`、`joint-best`，并复制 matrix 全局最佳 checkpoint。
 
 ## Commands
@@ -29,7 +29,7 @@ Eval: 与训练并行消费 snapshot；Official core75=`75` queries、beam=`50`�
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/arms/<arm>/{top1_best,joint_best}/`
+Checkpoint: 综合恢复选中 `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/selected/joint_best/structured_decoder.pt`；纯 R@1 选中 `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/selected/top1_best/structured_decoder.pt`。
 
 Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/logs/`
 
@@ -39,9 +39,9 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 
 - [x] Minimal local check：Ruff、Python compile、两个 launcher 的 `bash -n`
 - [x] Unit/invariant test：本地相关测试=`36`，通过=`24`、torch/CUDA 环境跳过=`12`
-- [x] `when gate=0, student_forward output must be allclose to base-model output`；v4 节点测试=`36/36` 通过
-- [ ] `seq_010` 与 `cum_002` 历史轨迹锚点 exact
-- [ ] 每个新 arm 覆盖 `195` 个 checkpoint，queue 无残留
+- [x] `when gate=0, student_forward output must be allclose to base-model output`；v5 节点测试=`36/36` 通过
+- [x] `seq_010` 与 `cum_002` 历史轨迹锚点 exact；model state、loss history、prediction、metrics、best step/dev loss 全部通过
+- [x] 每个新 arm 覆盖 `195/195` 个 checkpoint（query step=`{200,400,...,38,800,38,805}`），每 arm worker=`2`，queue=`0`
 - [x] Reviewer required? yes；独立 reviewer 未返回，已完成结构化本地复核
 
 ## Result / Notes
@@ -63,3 +63,20 @@ v4 job=`tide-chenyufei03-10665-lihis` 已启动。Pod ready=`1/1`、restart=`0`�
 v4 的 GPU `7` 串行 evaluator 吞吐不足：当 trainer 到 query step=`1,250–1,350` 时，各 arm 已积压=`3–4` 个 checkpoint（每 arm队列上限=`7`）。v5 在 GPU `0–6` 上各增加一个与 trainer 同卡的 evaluator，GPU `7` 继续跨 arm 补位。实测同卡训练+评测显存约=`73.9/80 GiB`，没有 OOM；GPU utilization 最高=`98%`（v5 首批 step=`200` snapshot 评测采样）。
 
 v5 job=`tide-chenyufei03-10669-bknul` 固定 runtime 全部命中，节点测试=`36/36` 通过。七个 arm 的 catalog loss 与 v4 逐值一致。step=`200` 的 R@1/R@10/R@50 和 prediction SHA 在七个 arm 上均与 v4 精确一致；其中 `cum_002` prediction SHA=`4980e9bdda580fff31d636fb7da54260bcf118c4c173110d801731ada544db25`（Official core75=`75` queries、beam=`50`、beam-order、CE log-prob）。v5 到 query step=`400–450` 时，每 arm queue=`0–1` 个 checkpoint，backlog 已消除。v4 已停止，v5 继续正式运行。
+
+v5 最终正常完成，Pod status=`Completed`、restart=`0`、wall time 约=`5h59m`（job=`tide-chenyufei03-10669-bknul`，`1×8 A800`，queue=`rudder-exper`）。七个新 arm 均完成 catalog/query updates=`2,730/38,805`（batch=`16`、lr=`3e-4`、seed=`20260626`、BF16、dropout=`0.1`、`CUBLAS_WORKSPACE_CONFIG=:16:8`）。每个 arm 的 protocol contract、`195/195` checkpoint coverage 和 queue drain 全部通过。
+
+最终关键结果如下。A800 行使用 test-set checkpoint oracle；评测统一为 Official core75=`75` queries、beam=`50`、beam-order、CE log-prob。Single/Multi 分别为 `24/51` queries。
+
+| 候选 | checkpoint | Overall R@1/R@10/R@50 | Single R@1 | Multi R@1 |
+|---|---:|---:|---:|---:|
+| RTX archived reference | archived | `28.3683/69.0000/75.0000%` | `41.6667%` | `22.1102%` |
+| A800 control top1-best | `37,000` | `25.4794/69.3556/76.3333%` | `37.5000%` | `19.8226%` |
+| A800 `cum_002` joint-best | `28,400` | `28.2571/70.0000/75.1111%` | `41.6667%` | `21.9468%` |
+| A800 `seq_010` top1-best | `38,800` | `28.7683/70.5873/73.8889%` | `50.0000%` | `18.7768%` |
+
+综合恢复选择 `cum_002@28,400`（cumulative lambda=`0.02`）。相对 RTX archived reference，它的 Overall R@1/R@10/R@50 差值为 `-0.1111/+1.0000/+0.1111` 个百分点，Single/Multi R@1 差值为 `0.0000/-0.1634` 个百分点；条件为上述统一 Official core75 协议。它通过 Overall R@1/R@10/R@50=`27.3683/69.0000/75.0000%`、Single R@1=`41.6667%`、Multi R@1=`21.1102%` 的恢复门槛（同一评测条件）。选中 checkpoint SHA-256=`a2a26ab5f64fbbe5b0df875afccad945684a2b5e2166f71b94a3e299c36f03c1`。
+
+纯 R@1 选择 `seq_010@38,800`（sequence-only lambda=`0.10`）。它的 Overall R@1 比 RTX 高 `0.4000` 个百分点，但 Overall R@50 比 RTX 低 `1.1111` 个百分点；条件为上述统一 Official core75 协议。该 checkpoint SHA-256=`4f38520b48b335ce764d462a8468e885f12f7615d4559559b1a3ec944cd636b8`。
+
+Official core75 同时用于 checkpoint 选择和最终汇报。以上结果回答性能恢复问题，不提供独立 test 泛化估计。单 seed=`20260626` 已通过完整恢复门槛；跨 seed 稳定性仍需单独验证。
