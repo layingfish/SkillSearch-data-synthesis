@@ -3,7 +3,7 @@ set -euo pipefail
 
 CODE_ROOT="$(pwd)"
 PHYSICAL_OUTPUT_BASE=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis
-OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4"
+OUTPUT_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5"
 CONTROL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_core75_checkpoint_oracle_20260812_v1"
 CONTROL_SUMMARY_SHA256=36ebaa1e7942867ac0a14b233024671d76bb1162e6de1975fd7606307bc85b0a
 HISTORICAL_ROOT="${PHYSICAL_OUTPUT_BASE}/experiments/a800_legacy_conditional_prefix_hybrid_20260812_v1/arms"
@@ -189,7 +189,8 @@ payload = {
         "parallel_trainers": 7,
         "trainer_gpus": [0, 1, 2, 3, 4, 5, 6],
         "shared_evaluator_gpu": 7,
-        "post_training_helper_evaluators": True,
+        "trainer_gpu_evaluators": True,
+        "workers_per_arm": 2,
     },
 }
 Path(sys.argv[1]).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -246,7 +247,7 @@ run_training() {
 }
 
 run_arm_pipeline() {
-  local gpu="$1" helper_worker_id="$2" label="$3" scope="$4" weight="$5"
+  local gpu="$1" label="$2" scope="$3" weight="$4"
   local arm_root="${OUTPUT_ROOT}/arms/${label}"
   local eval_root="${OUTPUT_ROOT}/oracle/${label}"
   local queue_root="${TEMP_ROOT}/queues/${label}"
@@ -270,9 +271,7 @@ PY
     return "${training_status}"
   fi
   touch "${queue_root}/producer.done"
-  echo "arm=${label} training complete; GPU ${gpu} joins checkpoint evaluation"
-  run_worker "${gpu}" "${helper_worker_id}" "${label}" "${queue_root}" "${eval_root}" \
-    --allow-empty > "${OUTPUT_ROOT}/logs/${label}_worker_${helper_worker_id}.log" 2>&1
+  echo "arm=${label} training complete"
 }
 
 ARM_LABELS=(cum_002 seq_001 seq_002 seq_004 seq_006 seq_008 seq_010)
@@ -296,10 +295,18 @@ done
 for index in "${!ARM_LABELS[@]}"; do
   gpu="${ARM_GPUS[index]}"
   helper_worker_id=$((gpu + 1))
-  (run_arm_pipeline "${gpu}" "${helper_worker_id}" \
-    "${ARM_LABELS[index]}" "${ARM_SCOPES[index]}" "${ARM_WEIGHTS[index]}") &
+  label="${ARM_LABELS[index]}"
+  queue_root="${TEMP_ROOT}/queues/${label}"
+  eval_root="${OUTPUT_ROOT}/oracle/${label}"
+  (run_worker "${gpu}" "${helper_worker_id}" "${label}" "${queue_root}" "${eval_root}" \
+    --allow-empty > "${OUTPUT_ROOT}/logs/${label}_worker_${helper_worker_id}.log" 2>&1) &
   BACKGROUND_PIDS+=("$!")
-  echo "launched arm=${ARM_LABELS[index]} trainer CUDA_VISIBLE_DEVICES=${gpu}"
+  echo "launched arm=${label} local_evaluator=${helper_worker_id} CUDA_VISIBLE_DEVICES=${gpu}"
+
+  (run_arm_pipeline "${gpu}" \
+    "${label}" "${ARM_SCOPES[index]}" "${ARM_WEIGHTS[index]}") &
+  BACKGROUND_PIDS+=("$!")
+  echo "launched arm=${label} trainer CUDA_VISIBLE_DEVICES=${gpu}"
 done
 
 declare -a ACTIVE_PIDS=("${BACKGROUND_PIDS[@]}")

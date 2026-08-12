@@ -146,8 +146,9 @@ class SweepLauncherOrderingTest(unittest.TestCase):
         self.assertIn("SHARED_EVAL_GPU=7", self.launcher)
         self.assertIn('--eval-lock "${SHARED_EVAL_LOCK}"', self.launcher)
 
-    def test_completed_trainer_gpu_becomes_helper_evaluator(self):
+    def test_each_trainer_gpu_has_a_colocated_evaluator(self):
         self.assertIn('run_worker "${gpu}" "${helper_worker_id}"', self.launcher)
+        self.assertIn("trainer_gpu_evaluators", self.launcher)
 
     def test_trainer_and_evaluators_use_separate_roots(self):
         self.assertIn('eval_root="${OUTPUT_ROOT}/oracle/${label}"', self.launcher)

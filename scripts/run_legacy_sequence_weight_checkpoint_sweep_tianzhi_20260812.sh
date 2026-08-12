@@ -3,7 +3,7 @@ set -euo pipefail
 
 ALIAS_HELPER=/mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh
 PHYSICAL_REPO=/mnt/cfs_algo_bj/workspace/chenyufei03/SkillSearch-data-synthesis
-BOOTSTRAP_LOG=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/bootstrap_logs/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4.log
+BOOTSTRAP_LOG=/mnt/cfs_algo_bj/models/experiments/chenyufei03/SkillSearch-data-synthesis/bootstrap_logs/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5.log
 LAUNCH_COMMIT="${SKILLGR_LAUNCH_COMMIT:?set SKILLGR_LAUNCH_COMMIT to the verified experiment commit}"
 
 cd /tmp
