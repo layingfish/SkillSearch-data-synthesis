@@ -1,6 +1,6 @@
 # Experiment: Legacy sequence-weight checkpoint sweep
 
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -23,7 +23,7 @@ Risk Tier: 3
 
 ## Commands
 
-Train: `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。Tianzhi 使用 `1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`；正式 job 和 launch commit 待提交后记录。
+Train: job=`tide-chenyufei03-10664-kmoen`，pod=`tide-chenyufei03-10664-kmoen-worker-0`，launch commit=`08ecca84ddf90fe69c75e26da9836a6622b896a3`，`1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。节点入口为 `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。
 
 Eval: 与训练并行消费 snapshot；Official core75=`75` queries、beam=`50`、beam-order、CE log-prob。
 
@@ -39,7 +39,7 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 
 - [x] Minimal local check：Ruff、Python compile、两个 launcher 的 `bash -n`
 - [x] Unit/invariant test：本地相关测试=`31`，通过=`19`、torch/CUDA 环境跳过=`12`
-- [ ] `when gate=0, student_forward output must be allclose to base-model output`
+- [x] `when gate=0, student_forward output must be allclose to base-model output`；v3 节点测试=`31/31` 通过
 - [ ] `seq_010` 与 `cum_002` 历史轨迹锚点 exact
 - [ ] 每个新 arm 覆盖 `195` 个 checkpoint，queue 无残留
 - [x] Reviewer required? yes；独立 reviewer 未返回，已完成结构化本地复核
@@ -53,3 +53,5 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 首次 job=`tide-chenyufei03-10662-bawkh` 使用 launch commit=`5b88e67`，节点识别 GPU count=`8`，固定 runtime 全部命中，节点测试=`29/29` 通过。随后在 optimizer step=`0` 前失败：worker 先创建了 `arms/cum_002`，训练器按 fail-closed overwrite guard 拒绝该目录。失败清理又因裸 `wait` 等待 node-level tee 而挂起；作业已取消，v1 日志保留，没有训练更新或 checkpoint。v2 改为训练进程先原子创建 arm root，再启动七个 evaluator；清理只等待显式 PID。
 
 第二次 job=`tide-chenyufei03-10663-naxfb` 使用 launch commit=`31b5329`，固定 runtime 与节点测试=`31/31` 全部通过。训练器在 optimizer step=`0` 前执行 train/dev tokenizer audit；该 audit 覆盖 expanded train/dev rows=`124,175/2,501`，超过 launcher 等待 arm root 的 `60` 秒后被终止。v2 没有训练更新或 checkpoint。v3 将 evaluator 输出移到独立 `oracle/<arm>`，训练器独占 `arms/<arm>`，移除基于初始化耗时的同步假设。
+
+v3 job=`tide-chenyufei03-10664-kmoen` 已进入正式训练。Pod ready=`1/1`、restart=`0`，识别 GPU count=`8`；Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA package=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2` 全部命中。节点测试=`31/31` 通过。首个 arm=`cum_002` 已到 catalog step=`50/2,730`，train loss=`4.171228`（batch=`16`、lr=`3e-4`、seed=`20260626`、BF16、dropout=`0.1`、`CUBLAS_WORKSPACE_CONFIG=:16:8`）。GPU `1–7` 的 evaluator 已启动，等待 query snapshot。
