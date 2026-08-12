@@ -1,6 +1,6 @@
 # Experiment: Legacy core75 checkpoint oracle
 
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -21,15 +21,15 @@ Risk Tier: 3
 
 ## Commands
 
-Train: pending.
+Train: job=`tide-chenyufei03-10655-wiaba`，queue=`rudder-exper`，node=`1×8 A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`192cff306060b8ff8b0a82aa9357a59623b99596`。
 
-Eval: pending.
+Eval: GPU `1–7` 动态领取 GPU `0` 产生的 checkpoint；Official core75=`75` queries、beam=`50`、beam-order、CE log-prob、K=`{1,10,50}`。
 
 ## Outputs
 
 Checkpoint: pending.
 
-Log: pending.
+Log: `/models_rw/SkillSearch-data-synthesis/bootstrap_logs/a800_legacy_core75_checkpoint_oracle_20260812_v1.log`；node log 位于 output root 的 `logs/node.log`。
 
 Metrics: pending.
 
