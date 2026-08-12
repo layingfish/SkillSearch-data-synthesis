@@ -23,7 +23,7 @@ Risk Tier: 3
 
 ## Commands
 
-Train: v3 profiling job=`tide-chenyufei03-10664-kmoen`，pod=`tide-chenyufei03-10664-kmoen-worker-0`，launch commit=`08ecca84ddf90fe69c75e26da9836a6622b896a3`，`1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。v4 正式 job 待提交。节点入口为 `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。
+Train: v4 job=`tide-chenyufei03-10665-lihis`，pod=`tide-chenyufei03-10665-lihis-worker-0`，launch commit=`14d320698591841181038d2ed2c8d1c3767348b0`，`1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。节点入口为 `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。
 
 Eval: 与训练并行消费 snapshot；Official core75=`75` queries、beam=`50`、beam-order、CE log-prob。
 
@@ -38,8 +38,8 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 ## Verification
 
 - [x] Minimal local check：Ruff、Python compile、两个 launcher 的 `bash -n`
-- [x] Unit/invariant test：本地相关测试=`31`，通过=`19`、torch/CUDA 环境跳过=`12`
-- [x] `when gate=0, student_forward output must be allclose to base-model output`；v3 节点测试=`31/31` 通过
+- [x] Unit/invariant test：本地相关测试=`36`，通过=`24`、torch/CUDA 环境跳过=`12`
+- [x] `when gate=0, student_forward output must be allclose to base-model output`；v4 节点测试=`36/36` 通过
 - [ ] `seq_010` 与 `cum_002` 历史轨迹锚点 exact
 - [ ] 每个新 arm 覆盖 `195` 个 checkpoint，queue 无残留
 - [x] Reviewer required? yes；独立 reviewer 未返回，已完成结构化本地复核
@@ -57,3 +57,5 @@ Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence
 v3 job=`tide-chenyufei03-10664-kmoen` 已完成调度 profiling。Pod ready=`1/1`、restart=`0`，识别 GPU count=`8`；Python=`3.10.12`、torch=`2.10.0+cu128`、CUDA package=`12.8`、cuDNN=`9.10.2`、Transformers=`5.3.0`、Tokenizers=`0.22.2` 全部命中。节点测试=`31/31` 通过。`cum_002` 的首个 query checkpoint 在 step=`200` 完成评测，Overall R@1/R@10/R@50=`1.61%/9.64%/15.22%`（Official core75=`75` queries、beam=`50`、beam-order、CE log-prob；训练 batch=`16`、lr=`3e-4`、seed=`20260626`、BF16、dropout=`0.1`）。单个 evaluator 约 `20–30` 秒完成一次评测，训练约 `60–90` 秒才产生一个 snapshot；原先 `1` trainer + `7` evaluator 的调度让多数 GPU 长时间空闲。
 
 v4 调度固定 GPU `0–6` 同时训练七个 arm。GPU `7` 上的七个 arm worker 通过同一个 `fcntl` 文件锁串行评测，避免同卡并发占显存。每个 trainer 完成后，其 GPU 立即加入对应 arm 的 queue drain。训练协议、snapshot 内容、评测协议和 checkpoint 选择规则均未改变。本地相关测试=`36`，通过=`24`、因本机无 torch/CUDA 跳过=`12`；Ruff、Python compile、shell syntax、`wait -n -p` 行为和 git diff check 均通过。
+
+v4 job=`tide-chenyufei03-10665-lihis` 已启动。Pod ready=`1/1`、restart=`0`；固定 runtime 全部命中，节点测试=`36/36` 通过。七个 trainer 分别绑定 GPU `0–6`，均到 catalog step=`50/2,730` 且 train loss=`4.171228`（各 arm：batch=`16`、lr=`3e-4`、seed=`20260626`、BF16、dropout=`0.1`、`CUBLAS_WORKSPACE_CONFIG=:16:8`）。采样时 GPU `0–6` utilization=`77%–100%`、显存约=`47.4 GiB/card`；GPU `7` 等待 query snapshot。
