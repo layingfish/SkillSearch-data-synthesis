@@ -23,17 +23,17 @@ Risk Tier: 3
 
 ## Commands
 
-Train: v4 job=`tide-chenyufei03-10665-lihis`，pod=`tide-chenyufei03-10665-lihis-worker-0`，launch commit=`14d320698591841181038d2ed2c8d1c3767348b0`，`1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。节点入口为 `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。
+Train: v5 job=`tide-chenyufei03-10669-bknul`，pod=`tide-chenyufei03-10669-bknul-worker-0`，launch commit=`16a7ca33940c43306e0ec88803c7423fa2eabc9a`，`1×8 A800`、queue=`rudder-exper`、image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`。节点入口为 `bash scripts/run_legacy_sequence_weight_checkpoint_sweep_node_20260812.sh`。
 
 Eval: 与训练并行消费 snapshot；Official core75=`75` queries、beam=`50`、beam-order、CE log-prob。
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4/arms/<arm>/{top1_best,joint_best}/`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/arms/<arm>/{top1_best,joint_best}/`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4/logs/`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/logs/`
 
-Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v4/sequence_weight_checkpoint_sweep_summary.json`
+Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/sequence_weight_checkpoint_sweep_summary.json`
 
 ## Verification
 
@@ -59,3 +59,7 @@ v3 job=`tide-chenyufei03-10664-kmoen` 已完成调度 profiling。Pod ready=`1/1
 v4 调度固定 GPU `0–6` 同时训练七个 arm。GPU `7` 上的七个 arm worker 通过同一个 `fcntl` 文件锁串行评测，避免同卡并发占显存。每个 trainer 完成后，其 GPU 立即加入对应 arm 的 queue drain。训练协议、snapshot 内容、评测协议和 checkpoint 选择规则均未改变。本地相关测试=`36`，通过=`24`、因本机无 torch/CUDA 跳过=`12`；Ruff、Python compile、shell syntax、`wait -n -p` 行为和 git diff check 均通过。
 
 v4 job=`tide-chenyufei03-10665-lihis` 已启动。Pod ready=`1/1`、restart=`0`；固定 runtime 全部命中，节点测试=`36/36` 通过。七个 trainer 分别绑定 GPU `0–6`，均到 catalog step=`50/2,730` 且 train loss=`4.171228`（各 arm：batch=`16`、lr=`3e-4`、seed=`20260626`、BF16、dropout=`0.1`、`CUBLAS_WORKSPACE_CONFIG=:16:8`）。采样时 GPU `0–6` utilization=`77%–100%`、显存约=`47.4 GiB/card`；GPU `7` 等待 query snapshot。
+
+v4 的 GPU `7` 串行 evaluator 吞吐不足：当 trainer 到 query step=`1,250–1,350` 时，各 arm 已积压=`3–4` 个 checkpoint（每 arm队列上限=`7`）。v5 在 GPU `0–6` 上各增加一个与 trainer 同卡的 evaluator，GPU `7` 继续跨 arm 补位。实测同卡训练+评测显存约=`73.9/80 GiB`，没有 OOM；GPU utilization 最高=`98%`（v5 首批 step=`200` snapshot 评测采样）。
+
+v5 job=`tide-chenyufei03-10669-bknul` 固定 runtime 全部命中，节点测试=`36/36` 通过。七个 arm 的 catalog loss 与 v4 逐值一致。step=`200` 的 R@1/R@10/R@50 和 prediction SHA 在七个 arm 上均与 v4 精确一致；其中 `cum_002` prediction SHA=`4980e9bdda580fff31d636fb7da54260bcf118c4c173110d801731ada544db25`（Official core75=`75` queries、beam=`50`、beam-order、CE log-prob）。v5 到 query step=`400–450` 时，每 arm queue=`0–1` 个 checkpoint，backlog 已消除。v4 已停止，v5 继续正式运行。
