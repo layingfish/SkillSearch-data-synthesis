@@ -269,6 +269,8 @@ def exhaustive_score_candidate_pool(
     depth: int,
     dedup_size: int,
     semantic_id_mode: str,
+    forward_batch_size: int | None = None,
+    replay_prefix_size: int = 0,
 ) -> tuple[
     list[str],
     dict[str, float],
@@ -277,6 +279,11 @@ def exhaustive_score_candidate_pool(
 ]:
     import torch
     import torch.nn.functional as F
+
+    if forward_batch_size is not None and forward_batch_size <= 0:
+        raise ValueError("forward_batch_size must be positive when provided")
+    if replay_prefix_size < 0:
+        raise ValueError("replay_prefix_size must be non-negative")
 
     trie, sequence_to_skill_id = pipeline._semantic_id_trie_from_ids(
         dict(candidate_semantic_ids), semantic_id_mode
@@ -302,6 +309,7 @@ def exhaustive_score_candidate_pool(
         }
     ]
     frontier_sizes: list[int] = []
+    forward_batch_sizes: list[list[int]] = []
     for target_type in range(semantic_length + 1):
         candidates = []
         active_items = []
@@ -323,60 +331,77 @@ def exhaustive_score_candidate_pool(
                     f"exhaustive pool reached a dead prefix at target_type={target_type}"
                 )
             active_items.append((beam, allowed))
-        max_decoder_length = max(
-            len(beam["decoder_input_ids"]) for beam, _ in active_items
-        )
-        decoder_input_rows = []
-        decoder_mask_rows = []
-        for beam, _ in active_items:
-            decoder_ids = list(beam["decoder_input_ids"])
-            pad_length = max_decoder_length - len(decoder_ids)
-            decoder_input_rows.append(decoder_ids + [bos_id] * pad_length)
-            decoder_mask_rows.append([1] * len(decoder_ids) + [0] * pad_length)
-        decoder_input_ids = torch.tensor(
-            decoder_input_rows,
-            dtype=torch.long,
-            device=encoder_hidden_states.device,
-        )
-        decoder_attention_mask = torch.tensor(
-            decoder_mask_rows,
-            dtype=torch.long,
-            device=encoder_hidden_states.device,
-        )
-        batch_size = len(active_items)
-        logits_batch = model.logits_for_next_type_from_encoder(
-            encoder_hidden_states.repeat(batch_size, 1, 1),
-            encoder_attention_mask.repeat(batch_size, 1),
-            decoder_input_ids,
-            decoder_attention_mask,
-            target_type,
-            ripor_score=False,
-        )
-        score_batch = F.log_softmax(logits_batch, dim=-1)
-        for (beam, allowed), step_scores in zip(active_items, score_batch):
-            ranked_allowed = sorted(
-                (
-                    (float(step_scores[value].detach().cpu()), int(value))
-                    for value in allowed
-                ),
-                reverse=True,
+        chunk_sizes: list[int] = []
+        if replay_prefix_size and len(active_items) > replay_prefix_size:
+            chunks = [active_items[:replay_prefix_size]]
+            remaining = active_items[replay_prefix_size:]
+        else:
+            chunks = []
+            remaining = active_items
+        if forward_batch_size is None:
+            if remaining:
+                chunks.append(remaining)
+        else:
+            chunks.extend(
+                remaining[start : start + forward_batch_size]
+                for start in range(0, len(remaining), forward_batch_size)
             )
-            for log_prob, value in ranked_allowed:
-                advanced = pipeline.advance_structured_beam(
-                    beam,
-                    target_type,
-                    value,
-                    log_prob,
-                    codebook_size,
-                    depth,
-                    dedup_size,
-                    semantic_id_mode,
+        for active_chunk in chunks:
+            max_decoder_length = max(
+                len(beam["decoder_input_ids"]) for beam, _ in active_chunk
+            )
+            decoder_input_rows = []
+            decoder_mask_rows = []
+            for beam, _ in active_chunk:
+                decoder_ids = list(beam["decoder_input_ids"])
+                pad_length = max_decoder_length - len(decoder_ids)
+                decoder_input_rows.append(decoder_ids + [bos_id] * pad_length)
+                decoder_mask_rows.append([1] * len(decoder_ids) + [0] * pad_length)
+            decoder_input_ids = torch.tensor(
+                decoder_input_rows,
+                dtype=torch.long,
+                device=encoder_hidden_states.device,
+            )
+            decoder_attention_mask = torch.tensor(
+                decoder_mask_rows,
+                dtype=torch.long,
+                device=encoder_hidden_states.device,
+            )
+            batch_size = len(active_chunk)
+            chunk_sizes.append(batch_size)
+            logits_batch = model.logits_for_next_type_from_encoder(
+                encoder_hidden_states.repeat(batch_size, 1, 1),
+                encoder_attention_mask.repeat(batch_size, 1),
+                decoder_input_ids,
+                decoder_attention_mask,
+                target_type,
+                ripor_score=False,
+            )
+            score_batch = F.log_softmax(logits_batch, dim=-1)
+            for (beam, allowed), step_scores in zip(active_chunk, score_batch):
+                ranked_allowed = sorted(
+                    (
+                        (float(step_scores[value].detach().cpu()), int(value))
+                        for value in allowed
+                    ),
+                    reverse=True,
                 )
-                advanced["score_components"] = [
-                    *beam.get("score_components", []),
-                    log_prob,
-                ]
-                candidates.append(advanced)
+                for log_prob, value in ranked_allowed:
+                    advanced = pipeline.advance_structured_beam(
+                        beam,
+                        target_type,
+                        value,
+                        log_prob,
+                        codebook_size,
+                        depth,
+                        dedup_size,
+                        semantic_id_mode,
+                    )
+                    advanced["score_components"] = [
+                        *beam.get("score_components", []),
+                        log_prob,
+                    ]
+                    candidates.append(advanced)
         if len(candidates) > capacity:
             raise ValueError(
                 f"pool frontier={len(candidates)} exceeds exhaustive capacity={capacity}"
@@ -385,6 +410,7 @@ def exhaustive_score_candidate_pool(
             candidates, key=lambda item: float(item["score"]), reverse=True
         )
         frontier_sizes.append(len(beams))
+        forward_batch_sizes.append(chunk_sizes)
 
     if len(beams) != capacity or not all(beam["stopped"] for beam in beams):
         raise ValueError(
@@ -430,7 +456,13 @@ def exhaustive_score_candidate_pool(
         ranked,
         scores,
         score_components,
-        {"frontier_sizes": frontier_sizes, "capacity": capacity},
+        {
+            "frontier_sizes": frontier_sizes,
+            "capacity": capacity,
+            "forward_batch_size": forward_batch_size,
+            "replay_prefix_size": replay_prefix_size,
+            "forward_batch_sizes": forward_batch_sizes,
+        },
     )
 
 

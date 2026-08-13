@@ -207,6 +207,45 @@ class FixedPoolScoreSemanticsTest(unittest.TestCase):
                 places=6,
             )
 
+    def test_chunked_exhaustive_scoring_preserves_scores_and_ranking(self):
+        semantic_ids = {
+            "a": [0, 1],
+            "b": [2, 3],
+            "c": [0, 2],
+            "d": [1, 0],
+        }
+        encoder = torch.zeros((1, 1, 3))
+        mask = torch.ones((1, 1), dtype=torch.long)
+        model = self.FakeModel()
+        reference = exhaustive_score_candidate_pool(
+            model,
+            encoder,
+            mask,
+            semantic_ids,
+            codebook_size=4,
+            depth=2,
+            dedup_size=0,
+            semantic_id_mode=pipeline.SEMANTIC_ID_MODE_LEARNED,
+        )
+        chunked = exhaustive_score_candidate_pool(
+            model,
+            encoder,
+            mask,
+            semantic_ids,
+            codebook_size=4,
+            depth=2,
+            dedup_size=0,
+            semantic_id_mode=pipeline.SEMANTIC_ID_MODE_LEARNED,
+            forward_batch_size=2,
+            replay_prefix_size=1,
+        )
+        self.assertEqual(chunked[0], reference[0])
+        self.assertEqual(chunked[1], reference[1])
+        self.assertEqual(chunked[2], reference[2])
+        self.assertEqual(chunked[3]["forward_batch_size"], 2)
+        self.assertEqual(chunked[3]["replay_prefix_size"], 1)
+        self.assertTrue(all(chunked[3]["forward_batch_sizes"]))
+
 
 def fixed_row(label, position, raw, fixed, gold, scores):
     pool = sorted(scores)
