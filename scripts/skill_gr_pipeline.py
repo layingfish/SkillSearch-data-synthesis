@@ -86,7 +86,11 @@ PAG_SEQUENTIAL_ONLY_PREFIXES = (
     "dedup_head.",
     "control_head.",
 )
-RIPOR_OPTIONAL_STATE_PREFIXES = ("ripor_heads.", "ripor_doc_embeddings.")
+RIPOR_OPTIONAL_STATE_PREFIXES = (
+    "ripor_heads.",
+    "ripor_doc_embeddings.",
+    "pro_codebook_embeddings",
+)
 
 
 def pag_quadratic_regularization_weight(
@@ -3037,6 +3041,80 @@ def command_train_ripor_relevance_encoder(args: argparse.Namespace) -> None:
             },
         )
     barrier(context)
+
+    # Export the exact M0 query vector used by PRO-style residual geometry.
+    # Row order and row-file hash close the tokenizer input contract.
+    indexed_queries = [
+        (index, decoder_source_text(row), retrieval_row_keys(row)[0])
+        for index, row in enumerate(rows)
+    ]
+    local_query_rows = [
+        item for item in indexed_queries if item[0] % context.world_size == context.rank
+    ]
+    local_query_vectors: list[tuple[int, str, list[float]]] = []
+    with torch.no_grad():
+        for start in range(0, len(local_query_rows), args.batch_size):
+            chunk = local_query_rows[start : start + args.batch_size]
+            encoded = tokenizer(
+                [item[1] for item in chunk],
+                padding=True,
+                truncation=True,
+                max_length=args.max_query_length,
+                return_tensors="pt",
+            )
+            vectors = model_core(
+                encoded["input_ids"].to(context.device),
+                encoded["attention_mask"].to(context.device),
+            )
+            local_query_vectors.extend(
+                (item[0], item[2], vector.cpu().float().tolist())
+                for item, vector in zip(chunk, vectors)
+            )
+    gathered_queries = all_gather_object(local_query_vectors, context)
+    if context.is_main:
+        merged_queries = sorted(
+            (item for part in gathered_queries for item in part), key=lambda item: item[0]
+        )
+        if len(merged_queries) != len(rows):
+            raise RuntimeError(
+                f"M0 query export produced {len(merged_queries)} vectors for {len(rows)} rows"
+            )
+        m0_checkpoint_path = output_dir / "relevance_encoder.pt"
+        m0_checkpoint_sha256 = file_sha256(m0_checkpoint_path)
+        query_artifact_path = output_dir / "query_embeddings.pt"
+        torch.save(
+            {
+                "artifact_format": "ripor_m0_query_embeddings_v1",
+                "row_keys": [item[1] for item in merged_queries],
+                "embeddings": torch.tensor(
+                    [item[2] for item in merged_queries], dtype=torch.float32
+                ),
+                "source_rows": str(args.rows),
+                "source_rows_sha256": file_sha256(args.rows),
+                "source_relevance_checkpoint": str(m0_checkpoint_path),
+                "source_relevance_checkpoint_sha256": m0_checkpoint_sha256,
+                "source_relevance_model": args.model,
+                "source_relevance_model_config_sha256": m0_config_sha256,
+                "source_relevance_decoder_length": int(args.decoder_length),
+                "source_relevance_state_keys": m0_state_keys,
+                "pooling": "T5 decoder first hidden state at decoder_start_token",
+            },
+            query_artifact_path,
+        )
+        write_json(
+            output_dir / "query_embeddings_manifest.json",
+            {
+                "rows": str(args.rows),
+                "rows_sha256": file_sha256(args.rows),
+                "queries": len(merged_queries),
+                "embedding_dim": len(merged_queries[0][2]) if merged_queries else 0,
+                "query_embeddings": str(query_artifact_path),
+                "relevance_checkpoint_sha256": m0_checkpoint_sha256,
+                "decoder_length": int(args.decoder_length),
+                "world_size": context.world_size,
+            },
+        )
+    barrier(context)
     destroy_distributed(context)
 
 
@@ -4427,10 +4505,14 @@ def _load_ripor_codebook_embeddings(
         # position-specific T5 hidden-space vectors E_i.  A learned
         # bottleneck encoder would put them in an unrelated coordinate
         # system even when the width happens to match.
-        if payload.get("artifact_format") != "ripor_m0_rq_codebook_v1":
+        supported_formats = {
+            "ripor_m0_rq_codebook_v1",
+            "query_aligned_collaborative_rq_codebook_v1",
+        }
+        if payload.get("artifact_format") not in supported_formats:
             raise ValueError(
-                "strict RIPOR codebook initialization requires the provenance-bearing "
-                "codebook_embeddings.pt artifact from train-rqvae"
+                "M0-space codebook initialization requires a provenance-bearing RQ artifact; "
+                f"got format={payload.get('artifact_format')!r}"
             )
         if payload.get("identity_latent") is not True:
             raise ValueError(
@@ -4479,6 +4561,47 @@ def _load_ripor_codebook_embeddings(
             f"expected={expected}, got={tuple(values.shape)} from {path}"
         )
     return values
+
+
+def pro_residual_geometry_scores(
+    query_vector,
+    codebook_embeddings,
+    current_prefix: list[int] | tuple[int, ...],
+    target_level: int,
+    allowed_values,
+):
+    """Compute PRO's residual codebook score for legal next-code values."""
+    import torch
+
+    codebooks = torch.as_tensor(codebook_embeddings)
+    query = torch.as_tensor(query_vector, device=codebooks.device, dtype=torch.float32).reshape(-1)
+    if codebooks.ndim != 3:
+        raise ValueError(
+            "PRO codebooks must have shape [depth, codebook_size, dim], "
+            f"got {tuple(codebooks.shape)}"
+        )
+    if query.numel() != codebooks.shape[-1]:
+        raise ValueError(
+            f"PRO query width={query.numel()} does not match codebook width={codebooks.shape[-1]}"
+        )
+    if target_level < 0 or target_level >= codebooks.shape[0]:
+        raise ValueError(f"invalid PRO target level: {target_level}")
+    if len(current_prefix) != target_level:
+        raise ValueError(
+            f"PRO prefix length={len(current_prefix)} must equal target level={target_level}"
+        )
+    allowed = torch.as_tensor(allowed_values, dtype=torch.long, device=codebooks.device)
+    if allowed.ndim != 1 or allowed.numel() == 0:
+        raise ValueError("PRO fusion requires at least one legal next-code value")
+    if bool(((allowed < 0) | (allowed >= codebooks.shape[1])).any()):
+        raise ValueError("PRO legal value is outside the codebook")
+    residual = query
+    if current_prefix:
+        prefix_values = torch.as_tensor(current_prefix, dtype=torch.long, device=codebooks.device)
+        prefix_levels = torch.arange(target_level, dtype=torch.long, device=codebooks.device)
+        residual = residual - codebooks[prefix_levels, prefix_values].float().sum(dim=0)
+    centers = codebooks[target_level].index_select(0, allowed).float()
+    return 2.0 * (centers @ residual) - centers.square().sum(dim=-1)
 
 
 def cross_entropy_with_label_exclusions(logits, labels, exclusions=None):
@@ -4548,6 +4671,11 @@ def make_structured_t5_sid_model(
             )
             self.control_head = nn.Linear(d_model, 2)
             self.ripor_codebook_init = str(ripor_codebook_embeddings) if ripor_codebook_embeddings else None
+            self.register_buffer(
+                "pro_codebook_embeddings",
+                torch.zeros(self.depth, self.codebook_size, d_model, dtype=torch.float32),
+                persistent=True,
+            )
             if ripor_codebook_embeddings:
                 codebooks = _load_ripor_codebook_embeddings(
                     ripor_codebook_embeddings,
@@ -4557,6 +4685,7 @@ def make_structured_t5_sid_model(
                     expected_relevance_checkpoint=ripor_relevance_checkpoint,
                 )
                 with torch.no_grad():
+                    self.pro_codebook_embeddings.copy_(codebooks)
                     for level in range(self.depth):
                         start = level * self.codebook_size
                         stop = start + self.codebook_size
@@ -4592,6 +4721,37 @@ def make_structured_t5_sid_model(
         def encode_source(self, input_ids, attention_mask):
             encoder_outputs = self.backbone.encoder(input_ids=input_ids, attention_mask=attention_mask)
             return encoder_outputs.last_hidden_state
+
+        def m0_query_vector_from_encoder(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            decoder_length: int,
+        ):
+            """Reproduce the M0 relevance encoder's decoder-start pooling."""
+            decoder_length = int(decoder_length)
+            if decoder_length <= 0:
+                raise ValueError(f"M0 decoder length must be positive, got {decoder_length}")
+            start_id = self.backbone.config.decoder_start_token_id
+            if start_id is None:
+                start_id = self.backbone.config.pad_token_id
+            decoder_input_ids = torch.full(
+                (encoder_hidden_states.shape[0], decoder_length),
+                int(self.backbone.config.pad_token_id),
+                dtype=torch.long,
+                device=encoder_hidden_states.device,
+            )
+            decoder_input_ids[:, 0] = int(start_id)
+            decoder_attention_mask = torch.ones_like(decoder_input_ids)
+            outputs = self.backbone.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            return outputs.last_hidden_state[:, 0, :]
 
         def _decoder_hidden_from_encoder(
             self,
@@ -4731,6 +4891,278 @@ def make_structured_t5_sid_model(
                 decoder_prefix_input_ids=decoder_prefix_input_ids,
                 decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
+
+        def ce_prefix_log_scores(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_codes,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            """Return cumulative CE log-probabilities for every candidate prefix."""
+            batch_size, candidate_count, rank_depth = candidate_codes.shape
+            if rank_depth != self.depth:
+                raise ValueError(
+                    f"prefix-distillation depth={rank_depth} does not match model depth={self.depth}"
+                )
+            bos_id = structured_sid_bos_id(
+                self.codebook_size,
+                self.depth,
+                self.dedup_size,
+                self.semantic_id_mode,
+            )
+            decoder_input_ids = candidate_codes.new_full(
+                (batch_size, candidate_count, rank_depth), bos_id
+            )
+            for level in range(1, rank_depth):
+                decoder_input_ids[:, :, level] = (
+                    (level - 1) * self.codebook_size + candidate_codes[:, :, level - 1]
+                )
+            flat_decoder_ids = decoder_input_ids.reshape(batch_size * candidate_count, rank_depth)
+            flat_decoder_mask = torch.ones_like(flat_decoder_ids)
+            flat_encoder = encoder_hidden_states.repeat_interleave(candidate_count, dim=0)
+            flat_encoder_mask = encoder_attention_mask.repeat_interleave(candidate_count, dim=0)
+            flat_prefix_ids = None
+            flat_prefix_mask = None
+            if decoder_prefix_input_ids is not None:
+                flat_prefix_ids = decoder_prefix_input_ids.repeat_interleave(candidate_count, dim=0)
+                if decoder_prefix_attention_mask is not None:
+                    flat_prefix_mask = decoder_prefix_attention_mask.repeat_interleave(
+                        candidate_count, dim=0
+                    )
+            hidden = self._decoder_hidden_from_encoder(
+                flat_encoder,
+                flat_encoder_mask,
+                flat_decoder_ids,
+                flat_decoder_mask,
+                decoder_prefix_input_ids=flat_prefix_ids,
+                decoder_prefix_attention_mask=flat_prefix_mask,
+            )
+            cumulative = hidden.new_zeros(batch_size * candidate_count, dtype=torch.float32)
+            prefixes = []
+            flat_codes = candidate_codes.reshape(batch_size * candidate_count, rank_depth)
+            for level, head in enumerate(self.code_heads):
+                log_probs = F.log_softmax(head(hidden[:, level, :]).float(), dim=-1)
+                selected = log_probs.gather(
+                    1, flat_codes[:, level : level + 1]
+                ).squeeze(1)
+                cumulative = cumulative + selected
+                prefixes.append(cumulative)
+            return torch.stack(prefixes, dim=-1).reshape(
+                batch_size, candidate_count, rank_depth
+            )
+
+        def prefix_distribution_distillation_loss(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_codes,
+            candidate_valid,
+            candidate_teacher_scores,
+            *,
+            teacher_temperature: float,
+            student_temperature: float,
+            row_weights=None,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            """Match conditional teacher mass over the SID tree at every level."""
+            if teacher_temperature <= 0.0 or student_temperature <= 0.0:
+                raise ValueError("prefix-distillation temperatures must be positive")
+            if candidate_valid.shape != candidate_teacher_scores.shape:
+                raise ValueError("prefix-distillation validity and teacher scores must match")
+            if candidate_codes.shape[:2] != candidate_valid.shape:
+                raise ValueError("prefix-distillation candidates and masks must share axes")
+            prefix_scores = self.ce_prefix_log_scores(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                candidate_codes,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
+            )
+            loss_sum = prefix_scores.new_tensor(0.0)
+            row_count = prefix_scores.new_tensor(0.0)
+            for row_index in range(prefix_scores.shape[0]):
+                valid_indices = torch.nonzero(
+                    candidate_valid[row_index], as_tuple=False
+                ).flatten()
+                if valid_indices.numel() < 2:
+                    continue
+                row_codes = candidate_codes[row_index].index_select(0, valid_indices)
+                row_prefix_scores = prefix_scores[row_index].index_select(0, valid_indices)
+                teacher_probability = F.softmax(
+                    candidate_teacher_scores[row_index]
+                    .index_select(0, valid_indices)
+                    .float()
+                    / teacher_temperature,
+                    dim=0,
+                )
+                row_loss = prefix_scores.new_tensor(0.0)
+                for level in range(self.depth):
+                    parent_groups: dict[tuple[int, ...], list[int]] = {}
+                    for local_index, parent in enumerate(
+                        row_codes[:, :level].detach().cpu().tolist()
+                    ):
+                        parent_groups.setdefault(
+                            tuple(int(value) for value in parent), []
+                        ).append(local_index)
+                    for member_indices in parent_groups.values():
+                        members = torch.tensor(
+                            member_indices,
+                            dtype=torch.long,
+                            device=prefix_scores.device,
+                        )
+                        parent_mass = teacher_probability.index_select(0, members).sum()
+                        child_groups: dict[int, list[int]] = {}
+                        child_values = row_codes.index_select(0, members)[:, level]
+                        for member_offset, child in enumerate(
+                            child_values.detach().cpu().tolist()
+                        ):
+                            child_groups.setdefault(int(child), []).append(member_offset)
+                        child_model_scores = []
+                        child_teacher_mass = []
+                        for child in sorted(child_groups):
+                            offsets = torch.tensor(
+                                child_groups[child],
+                                dtype=torch.long,
+                                device=prefix_scores.device,
+                            )
+                            candidate_members = members.index_select(0, offsets)
+                            child_model_scores.append(
+                                row_prefix_scores.index_select(0, candidate_members)[:, level].mean()
+                            )
+                            child_teacher_mass.append(
+                                teacher_probability.index_select(0, candidate_members).sum()
+                            )
+                        model_scores = torch.stack(child_model_scores)
+                        target = torch.stack(child_teacher_mass) / parent_mass.clamp_min(
+                            torch.finfo(torch.float32).tiny
+                        )
+                        row_loss = row_loss - parent_mass * (
+                            target
+                            * F.log_softmax(model_scores / student_temperature, dim=0)
+                        ).sum()
+                row_loss = row_loss / float(self.depth)
+                row_weight = (
+                    row_weights[row_index].to(
+                        device=prefix_scores.device, dtype=prefix_scores.dtype
+                    )
+                    if row_weights is not None
+                    else prefix_scores.new_tensor(1.0)
+                )
+                loss_sum = loss_sum + row_loss * row_weight
+                row_count = row_count + row_weight
+            return loss_sum, row_count, prefix_scores
+
+        def pro_geometry_distribution_loss(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_codes,
+            candidate_valid,
+            candidate_teacher_scores,
+            *,
+            decoder_length: int,
+            teacher_temperature: float,
+            student_temperature: float,
+            row_weights=None,
+        ):
+            """Align the M0 query vector and immutable RQ geometry to teacher prefix mass."""
+            if teacher_temperature <= 0.0 or student_temperature <= 0.0:
+                raise ValueError("PRO geometry-distillation temperatures must be positive")
+            if candidate_valid.shape != candidate_teacher_scores.shape:
+                raise ValueError("PRO geometry validity and teacher scores must match")
+            if candidate_codes.shape[:2] != candidate_valid.shape:
+                raise ValueError("PRO geometry candidates and masks must share axes")
+            query_vectors = self.m0_query_vector_from_encoder(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                decoder_length,
+            ).float()
+            codebooks = self.pro_codebook_embeddings.float()
+            loss_sum = query_vectors.new_tensor(0.0)
+            row_count = query_vectors.new_tensor(0.0)
+            for row_index in range(query_vectors.shape[0]):
+                valid_indices = torch.nonzero(
+                    candidate_valid[row_index], as_tuple=False
+                ).flatten()
+                if valid_indices.numel() < 2:
+                    continue
+                row_codes = candidate_codes[row_index].index_select(0, valid_indices)
+                teacher_probability = F.softmax(
+                    candidate_teacher_scores[row_index]
+                    .index_select(0, valid_indices)
+                    .float()
+                    / teacher_temperature,
+                    dim=0,
+                )
+                row_loss = query_vectors.new_tensor(0.0)
+                for level in range(self.depth):
+                    parent_groups: dict[tuple[int, ...], list[int]] = {}
+                    for local_index, parent in enumerate(
+                        row_codes[:, :level].detach().cpu().tolist()
+                    ):
+                        parent_groups.setdefault(
+                            tuple(int(value) for value in parent), []
+                        ).append(local_index)
+                    for parent, member_indices in parent_groups.items():
+                        members = torch.tensor(
+                            member_indices,
+                            dtype=torch.long,
+                            device=query_vectors.device,
+                        )
+                        parent_mass = teacher_probability.index_select(0, members).sum()
+                        child_groups: dict[int, list[int]] = {}
+                        child_values = row_codes.index_select(0, members)[:, level]
+                        for member_offset, child in enumerate(
+                            child_values.detach().cpu().tolist()
+                        ):
+                            child_groups.setdefault(int(child), []).append(member_offset)
+                        children = sorted(child_groups)
+                        child_tensor = torch.tensor(
+                            children, dtype=torch.long, device=query_vectors.device
+                        )
+                        target_mass = []
+                        for child in children:
+                            offsets = torch.tensor(
+                                child_groups[child],
+                                dtype=torch.long,
+                                device=query_vectors.device,
+                            )
+                            candidate_members = members.index_select(0, offsets)
+                            target_mass.append(
+                                teacher_probability.index_select(0, candidate_members).sum()
+                            )
+                        target = torch.stack(target_mass) / parent_mass.clamp_min(
+                            torch.finfo(torch.float32).tiny
+                        )
+                        residual = query_vectors[row_index]
+                        if parent:
+                            residual = residual - torch.stack(
+                                [
+                                    codebooks[parent_level, parent_code]
+                                    for parent_level, parent_code in enumerate(parent)
+                                ],
+                                dim=0,
+                            ).sum(dim=0)
+                        centers = codebooks[level].index_select(0, child_tensor)
+                        geometry = 2.0 * (centers @ residual) - centers.square().sum(dim=-1)
+                        row_loss = row_loss - parent_mass * (
+                            target
+                            * F.log_softmax(geometry / student_temperature, dim=0)
+                        ).sum()
+                row_loss = row_loss / float(self.depth)
+                row_weight = (
+                    row_weights[row_index].to(
+                        device=query_vectors.device, dtype=query_vectors.dtype
+                    )
+                    if row_weights is not None
+                    else query_vectors.new_tensor(1.0)
+                )
+                loss_sum = loss_sum + row_loss * row_weight
+                row_count = row_count + row_weight
+            return loss_sum, row_count
 
         def sequence_candidate_logprob_scores(
             self,
@@ -4991,6 +5423,11 @@ def make_structured_t5_sid_model(
             ripor_temperature: float = 1.0,
             ripor_alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
             ripor_prefix_max_length: int | None = None,
+            prefix_distill_loss_weight: float = 0.0,
+            prefix_distill_teacher_temperature: float = 0.05,
+            prefix_distill_student_temperature: float = 1.0,
+            pro_geometry_loss_weight: float = 0.0,
+            pro_geometry_decoder_length: int = 0,
             sequence_contrastive_loss_weight: float = 0.0,
             sequence_contrastive_temperature: float = 1.0,
             pag_query_prefix: bool = False,
@@ -5120,6 +5557,71 @@ def make_structured_t5_sid_model(
                     for parameter in head.parameters():
                         if parameter.requires_grad:
                             loss = loss + parameter.reshape(-1)[0] * 0.0
+            prefix_distill_loss_sum = hidden.new_tensor(0.0)
+            prefix_distill_row_count = hidden.new_tensor(0.0)
+            prefix_distill_loss = hidden.new_tensor(0.0)
+            if float(prefix_distill_loss_weight) != 0.0:
+                if (
+                    ripor_candidate_codes is None
+                    or ripor_candidate_valid is None
+                    or ripor_candidate_teacher_scores is None
+                ):
+                    raise ValueError(
+                        "prefix distribution distillation requires candidate codes, validity, and teacher scores"
+                    )
+                prefix_distill_loss_sum, prefix_distill_row_count, _ = (
+                    self.prefix_distribution_distillation_loss(
+                        encoder_hidden_states,
+                        attention_mask,
+                        ripor_candidate_codes,
+                        ripor_candidate_valid,
+                        ripor_candidate_teacher_scores,
+                        teacher_temperature=prefix_distill_teacher_temperature,
+                        student_temperature=prefix_distill_student_temperature,
+                        row_weights=training_sample_weights,
+                        decoder_prefix_input_ids=pag_prefix_ids,
+                        decoder_prefix_attention_mask=pag_prefix_mask,
+                    )
+                )
+                prefix_distill_loss = self._normalize_loss(
+                    prefix_distill_loss_sum,
+                    prefix_distill_row_count,
+                    global_loss_normalization,
+                )
+                loss = loss + float(prefix_distill_loss_weight) * prefix_distill_loss
+            pro_geometry_loss_sum = hidden.new_tensor(0.0)
+            pro_geometry_row_count = hidden.new_tensor(0.0)
+            pro_geometry_loss = hidden.new_tensor(0.0)
+            if float(pro_geometry_loss_weight) != 0.0:
+                if (
+                    ripor_candidate_codes is None
+                    or ripor_candidate_valid is None
+                    or ripor_candidate_teacher_scores is None
+                ):
+                    raise ValueError(
+                        "PRO geometry distillation requires candidate codes, validity, and teacher scores"
+                    )
+                if int(pro_geometry_decoder_length) <= 0:
+                    raise ValueError("PRO geometry distillation requires the M0 decoder length")
+                pro_geometry_loss_sum, pro_geometry_row_count = (
+                    self.pro_geometry_distribution_loss(
+                        encoder_hidden_states,
+                        attention_mask,
+                        ripor_candidate_codes,
+                        ripor_candidate_valid,
+                        ripor_candidate_teacher_scores,
+                        decoder_length=pro_geometry_decoder_length,
+                        teacher_temperature=prefix_distill_teacher_temperature,
+                        student_temperature=prefix_distill_student_temperature,
+                        row_weights=training_sample_weights,
+                    )
+                )
+                pro_geometry_loss = self._normalize_loss(
+                    pro_geometry_loss_sum,
+                    pro_geometry_row_count,
+                    global_loss_normalization,
+                )
+                loss = loss + float(pro_geometry_loss_weight) * pro_geometry_loss
             sequence_loss_sum = hidden.new_tensor(0.0)
             sequence_row_count = hidden.new_tensor(0.0)
             sequence_contrastive_loss = hidden.new_tensor(0.0)
@@ -5242,6 +5744,12 @@ def make_structured_t5_sid_model(
                     "local_ce_token_count": token_count,
                     "local_ripor_loss_sum": ripor_loss_sum,
                     "local_ripor_pair_count": ripor_pair_count,
+                    "prefix_distill_loss": prefix_distill_loss,
+                    "local_prefix_distill_loss_sum": prefix_distill_loss_sum,
+                    "local_prefix_distill_row_count": prefix_distill_row_count,
+                    "pro_geometry_loss": pro_geometry_loss,
+                    "local_pro_geometry_loss_sum": pro_geometry_loss_sum,
+                    "local_pro_geometry_row_count": pro_geometry_row_count,
                     "sequence_contrastive_loss": sequence_contrastive_loss,
                     "local_sequence_contrastive_loss_sum": sequence_loss_sum,
                     "local_sequence_contrastive_row_count": sequence_row_count,
@@ -5486,10 +5994,24 @@ def _structured_global_train_metrics(components: dict[str, Any], context: Distri
         components["local_sequence_contrastive_row_count"],
         context,
     )
+    prefix_distill_sum, prefix_distill_count = reduce_sum_count(
+        components["local_prefix_distill_loss_sum"],
+        components["local_prefix_distill_row_count"],
+        context,
+    )
+    pro_geometry_sum, pro_geometry_count = reduce_sum_count(
+        components["local_pro_geometry_loss_sum"],
+        components["local_pro_geometry_row_count"],
+        context,
+    )
     return {
         "ce_loss": ce_sum / max(1, ce_count),
         "ripor_loss": ripor_sum / max(1, ripor_count),
         "ripor_pairs": float(ripor_count),
+        "prefix_distill_loss": prefix_distill_sum / max(1, prefix_distill_count),
+        "prefix_distill_rows": float(prefix_distill_count),
+        "pro_geometry_loss": pro_geometry_sum / max(1, pro_geometry_count),
+        "pro_geometry_rows": float(pro_geometry_count),
         "pag_set_loss": pag_sum / max(1, pag_count),
         "sequence_contrastive_loss": sequence_sum / max(1, sequence_count),
         "sequence_contrastive_rows": float(sequence_count),
@@ -5603,6 +6125,12 @@ def _run_distributed_structured_training(
     from transformers import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
 
     device = context.device
+    prefix_distill_enabled = float(
+        getattr(args, "prefix_distill_loss_weight", 0.0)
+    ) > 0.0
+    pro_geometry_enabled = float(
+        getattr(args, "pro_geometry_loss_weight", 0.0)
+    ) > 0.0
     eval_batch_size = args.eval_batch_size or args.batch_size
     loss_history_path = args.output_dir / "loss_history.jsonl"
     if not 0.0 <= args.warmup_ratio < 1.0:
@@ -5971,6 +6499,21 @@ def _run_distributed_structured_training(
                                 if args.ripor_progressive_prefix
                                 else depth
                             ),
+                            "prefix_distill_loss_weight": float(
+                                getattr(args, "prefix_distill_loss_weight", 0.0)
+                            ),
+                            "prefix_distill_teacher_temperature": float(
+                                getattr(args, "prefix_distill_teacher_temperature", 0.05)
+                            ),
+                            "prefix_distill_student_temperature": float(
+                                getattr(args, "prefix_distill_student_temperature", 1.0)
+                            ),
+                            "pro_geometry_loss_weight": float(
+                                getattr(args, "pro_geometry_loss_weight", 0.0)
+                            ),
+                            "pro_geometry_decoder_length": int(
+                                getattr(args, "pro_geometry_decoder_length", 0)
+                            ),
                         }
                     )
                 use_sequence_contrastive = sequence_contrastive_enabled and stage_name == "query"
@@ -6042,9 +6585,23 @@ def _run_distributed_structured_training(
                     sequence_weight = float(
                         getattr(args, "sequence_contrastive_loss_weight", 0.0)
                     )
+                    prefix_distill_weight = float(
+                        getattr(args, "prefix_distill_loss_weight", 0.0)
+                    )
+                    pro_geometry_weight = float(
+                        getattr(args, "pro_geometry_loss_weight", 0.0)
+                    )
                     ce_weight = stage_ce_weight
                     train_loss = ce_weight * last_metrics["ce_loss"] + (
                         ripor_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
+                    ) + (
+                        prefix_distill_weight * last_metrics["prefix_distill_loss"]
+                        if prefix_distill_enabled and stage_name == "query"
+                        else 0.0
+                    ) + (
+                        pro_geometry_weight * last_metrics["pro_geometry_loss"]
+                        if pro_geometry_enabled and stage_name == "query"
+                        else 0.0
                     ) + (
                         sequence_weight * last_metrics["sequence_contrastive_loss"]
                         if use_sequence_contrastive
@@ -6066,6 +6623,26 @@ def _run_distributed_structured_training(
                             "sequential_ce_weight": ce_weight,
                             "ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
                             "ripor_pairs": int(last_metrics["ripor_pairs"]) if use_ripor else 0,
+                            "prefix_distill_loss": (
+                                last_metrics["prefix_distill_loss"]
+                                if prefix_distill_enabled and stage_name == "query"
+                                else None
+                            ),
+                            "prefix_distill_rows": (
+                                int(last_metrics["prefix_distill_rows"])
+                                if prefix_distill_enabled and stage_name == "query"
+                                else 0
+                            ),
+                            "pro_geometry_loss": (
+                                last_metrics["pro_geometry_loss"]
+                                if pro_geometry_enabled and stage_name == "query"
+                                else None
+                            ),
+                            "pro_geometry_rows": (
+                                int(last_metrics["pro_geometry_rows"])
+                                if pro_geometry_enabled and stage_name == "query"
+                                else 0
+                            ),
                             "sequence_contrastive_loss": (
                                 last_metrics["sequence_contrastive_loss"]
                                 if use_sequence_contrastive
@@ -6194,6 +6771,16 @@ def _run_distributed_structured_training(
             "last_train_loss": stage_ce_weight * last_metrics["ce_loss"] + (
                 float(getattr(args, "ripor_loss_weight", 0.0)) * last_metrics["ripor_loss"] if use_ripor else 0.0
             ) + (
+                float(getattr(args, "prefix_distill_loss_weight", 0.0))
+                * last_metrics["prefix_distill_loss"]
+                if prefix_distill_enabled and stage_name == "query"
+                else 0.0
+            ) + (
+                float(getattr(args, "pro_geometry_loss_weight", 0.0))
+                * last_metrics["pro_geometry_loss"]
+                if pro_geometry_enabled and stage_name == "query"
+                else 0.0
+            ) + (
                 float(getattr(args, "sequence_contrastive_loss_weight", 0.0))
                 * last_metrics["sequence_contrastive_loss"]
                 if sequence_contrastive_enabled and stage_name == "query"
@@ -6238,7 +6825,7 @@ def _run_distributed_structured_training(
         query_train_rows,
         query_total_steps,
         query_dev_rows,
-        use_ripor=ripor_enabled,
+        use_ripor=ripor_enabled or prefix_distill_enabled or pro_geometry_enabled,
         step_offset=args.step_offset,
         initial_best_loss=args.initial_best_dev_loss,
     )
@@ -6381,6 +6968,9 @@ def _initialize_structured_training_model(
     sparse_initialization = False
     merge_semantic_heads_verified = False
     ripor_head_initialized_from_code_heads = False
+    relevance_decoder_length = None
+    codebook_artifact_format = None
+    codebook_checkpoint_sha256 = None
     init_checkpoint_provenance = None
     if getattr(args, "ripor_relevance_checkpoint", None):
         if args.init_model_dir or getattr(args, "pag_set_init_model_dir", None) or getattr(args, "pag_seq_init_model_dir", None):
@@ -6443,6 +7033,7 @@ def _initialize_structured_training_model(
             )
         if not relevance_checkpoint.get("decoder_length"):
             raise ValueError("M0 relevance checkpoint is missing decoder_length provenance")
+        relevance_decoder_length = int(relevance_checkpoint["decoder_length"])
         if args.ripor_codebook_embeddings:
             try:
                 codebook_payload = torch.load(
@@ -6454,6 +7045,8 @@ def _initialize_structured_training_model(
                 codebook_payload = torch.load(args.ripor_codebook_embeddings, map_location="cpu")
             if not isinstance(codebook_payload, dict):
                 raise ValueError("RIPOR codebook artifact must be a provenance-bearing dictionary")
+            codebook_artifact_format = str(codebook_payload.get("artifact_format") or "")
+            codebook_checkpoint_sha256 = file_sha256(args.ripor_codebook_embeddings)
             if str(codebook_payload.get("source_relevance_model")) != str(relevance_checkpoint.get("model")):
                 raise ValueError("RIPOR codebook/M0 model provenance mismatch")
             if str(codebook_payload.get("source_relevance_model_config_sha256")) != str(m0_config_hash):
@@ -6745,6 +7338,9 @@ def _initialize_structured_training_model(
         "ripor_codebook_initialization": bool(getattr(args, "ripor_codebook_embeddings", None)),
         "ripor_head_initialized_from_code_heads": ripor_head_initialized_from_code_heads,
         "ripor_head_trainable": ripor_head_trainable,
+        "relevance_decoder_length": relevance_decoder_length,
+        "codebook_artifact_format": codebook_artifact_format,
+        "codebook_checkpoint_sha256": codebook_checkpoint_sha256,
         "pag_sparse_initialization": sparse_initialization,
         "merge_semantic_heads_verified": merge_semantic_heads_verified,
         "init_checkpoint": init_checkpoint_provenance,
@@ -6759,6 +7355,17 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     context = initialize_distributed(cpu=args.cpu)
     method_setting = validate_method_setting_contract(args, pag_set_enabled=False)
     sequence_contrastive_enabled = float(args.sequence_contrastive_loss_weight) > 0.0
+    prefix_distill_enabled = float(args.prefix_distill_loss_weight) > 0.0
+    pro_geometry_enabled = float(args.pro_geometry_loss_weight) > 0.0
+    if args.prefix_distill_loss_weight < 0.0:
+        raise ValueError("prefix-distillation loss weight must be non-negative")
+    if (
+        args.prefix_distill_teacher_temperature <= 0.0
+        or args.prefix_distill_student_temperature <= 0.0
+    ):
+        raise ValueError("prefix-distillation temperatures must be positive")
+    if args.pro_geometry_loss_weight < 0.0:
+        raise ValueError("PRO geometry loss weight must be non-negative")
     if args.sequence_contrastive_loss_weight < 0.0:
         raise ValueError("sequence contrastive loss weight must be non-negative")
     if sequence_contrastive_enabled and args.sequence_contrastive_hard_negatives is None:
@@ -6769,22 +7376,28 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         raise ValueError("sequence contrastive temperature must be positive")
     if args.sequence_contrastive_max_negatives <= 0:
         raise ValueError("sequence contrastive max negatives must be positive")
-    if sequence_contrastive_enabled and args.ripor_loss_weight > 0.0:
-        raise ValueError("run sequence contrastive and RIPOR objectives in separate experiments")
-    if args.ripor_loss_weight > 0 and args.ripor_hard_negatives is None and not args.ripor_allow_weak_teacher:
+    if sequence_contrastive_enabled and (
+        args.ripor_loss_weight > 0.0 or prefix_distill_enabled or pro_geometry_enabled
+    ):
+        raise ValueError("run full-path contrastive and prefix objectives in separate experiments")
+    if (
+        (args.ripor_loss_weight > 0 or prefix_distill_enabled or pro_geometry_enabled)
+        and args.ripor_hard_negatives is None
+        and not args.ripor_allow_weak_teacher
+    ):
         raise ValueError(
-            "RIPOR prefix ranking requires --ripor-hard-negatives with frozen teacher scores; "
+            "prefix training requires --ripor-hard-negatives with frozen teacher scores; "
             "pass --ripor-allow-weak-teacher only for an explicitly labeled ablation"
         )
     if (
         method_setting == METHOD_SETTING_CUSTOM
-        and args.ripor_loss_weight > 0
+        and (args.ripor_loss_weight > 0 or prefix_distill_enabled or pro_geometry_enabled)
         and not args.ripor_allow_weak_teacher
         and not args.init_model_dir
     ):
         if not args.ripor_relevance_checkpoint or not args.ripor_codebook_embeddings:
             raise ValueError(
-                "strict RIPOR reproduction from a fresh decoder requires both "
+                "fresh M0-space prefix training requires both "
                 "--ripor-relevance-checkpoint (M0) and --ripor-codebook-embeddings (RQ centroids)"
             )
     torch.manual_seed(args.seed + context.rank)
@@ -6856,6 +7469,9 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         semantic_id_mode=semantic_id_mode,
         context=context,
     )
+    args.pro_geometry_decoder_length = int(init_info["relevance_decoder_length"] or 0)
+    if pro_geometry_enabled and args.pro_geometry_decoder_length <= 0:
+        raise ValueError("PRO geometry training requires M0 decoder-length provenance")
     model = wrap_ddp(core_model, context)
     checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
     checkpoint_metadata["query_loss"] = str(args.query_loss)
@@ -6894,6 +7510,48 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "rq_codebook_embeddings": str(args.ripor_codebook_embeddings) if args.ripor_codebook_embeddings else None,
         "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),
         "initialized_from_rq_centroids": bool(init_info["ripor_codebook_initialization"]),
+    }
+    checkpoint_metadata["prefix_distillation"] = {
+        "enabled": prefix_distill_enabled,
+        "loss_weight": float(args.prefix_distill_loss_weight),
+        "teacher_temperature": float(args.prefix_distill_teacher_temperature),
+        "student_temperature": float(args.prefix_distill_student_temperature),
+        "max_negatives": int(args.ripor_max_negatives),
+        "teacher_distribution": "conditional_mass_over_children_at_each_rq_prefix",
+        "student_score": "cumulative_ce_log_probability",
+        "hard_negative_predictions": (
+            str(args.ripor_hard_negatives) if args.ripor_hard_negatives else None
+        ),
+        "hard_negative_predictions_sha256": (
+            file_sha256(args.ripor_hard_negatives)
+            if prefix_distill_enabled and args.ripor_hard_negatives
+            else None
+        ),
+    }
+    checkpoint_metadata["pro_fusion"] = {
+        "compatible": bool(
+            init_info["ripor_relevance_initialization"]
+            and init_info["ripor_codebook_initialization"]
+            and init_info["relevance_decoder_length"]
+        ),
+        "formula": "logP + omega * (2 residual_dot_code - code_norm_squared)",
+        "query_pooling": "M0 T5 decoder-start first hidden state",
+        "query_encoder": "frozen_external_m0_relevance_encoder",
+        "relevance_m0_checkpoint": (
+            str(args.ripor_relevance_checkpoint)
+            if args.ripor_relevance_checkpoint
+            else None
+        ),
+        "relevance_m0_checkpoint_sha256": (
+            file_sha256(args.ripor_relevance_checkpoint)
+            if args.ripor_relevance_checkpoint
+            else None
+        ),
+        "relevance_decoder_length": init_info["relevance_decoder_length"],
+        "codebook_artifact_format": init_info["codebook_artifact_format"],
+        "codebook_checkpoint_sha256": init_info["codebook_checkpoint_sha256"],
+        "catalog_scoring": False,
+        "geometry_distillation_weight": float(args.pro_geometry_loss_weight),
     }
     sequence_contrastive_candidate_map = load_sequence_contrastive_candidates(
         args.sequence_contrastive_hard_negatives if sequence_contrastive_enabled else None,
@@ -6963,6 +7621,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "semantic_ids_sha256": checkpoint_metadata["semantic_ids_sha256"],
             "allow_source_truncation": args.allow_source_truncation,
             "ripor": checkpoint_metadata["ripor"],
+            "prefix_distillation": checkpoint_metadata["prefix_distillation"],
+            "pro_fusion": checkpoint_metadata["pro_fusion"],
             "sequence_contrastive": checkpoint_metadata["sequence_contrastive"],
             "query_train_length_audit": query_train_length_audit,
             "query_dev_length_audit": query_dev_length_audit,
@@ -7003,6 +7663,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             if args.document_augmentation
             else "letter_single_sid_ripor_prefix_margin_mse"
             if method_setting == METHOD_SETTING_RIPOR
+            else "single_sid_catalog_indexing_with_prefix_distribution_distillation"
+            if prefix_distill_enabled or pro_geometry_enabled
             else "single_sid_catalog_indexing_with_official_ripor_prefix_margin_mse"
             if args.ripor_loss_weight > 0
             else "single_sid_full_path_hard_negative_listwise_ce"
@@ -7010,7 +7672,9 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             else f"single_sid_catalog_indexing_then_{args.query_loss}"
         ),
         wandb_run=wandb_run,
-        ripor_enabled=args.ripor_loss_weight > 0,
+        ripor_enabled=(
+            args.ripor_loss_weight > 0 or prefix_distill_enabled or pro_geometry_enabled
+        ),
         ripor_hard_negative_map=ripor_hard_negative_map,
         ripor_teacher_score_map=ripor_teacher_score_map,
         sequence_contrastive_enabled=sequence_contrastive_enabled,
@@ -7057,6 +7721,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "query_dev_length_audit": query_dev_length_audit,
                 "catalog_length_audit": catalog_length_audit,
                 "ripor": checkpoint_metadata["ripor"],
+                "prefix_distillation": checkpoint_metadata["prefix_distillation"],
+                "pro_fusion": checkpoint_metadata["pro_fusion"],
                 "sequence_contrastive": checkpoint_metadata["sequence_contrastive"],
                 "checkpointing": checkpoint_metadata["checkpointing"],
                 "query_loss": args.query_loss,
@@ -7561,6 +8227,8 @@ def advance_structured_beam(
     planner_increment: float = 0.0,
     planner_weight: float = 0.0,
     planner_absolute_score: float | None = None,
+    geometry_increment: float = 0.0,
+    geometry_weight: float = 0.0,
 ) -> dict[str, Any]:
     new_prefix = list(beam["current_prefix"])
     new_completed = list(beam["completed"])
@@ -7597,7 +8265,12 @@ def advance_structured_beam(
         planner_score = float(beam.get("planner_score", 0.0)) + float(planner_increment)
     else:
         planner_score = float(planner_absolute_score)
-    combined_score = model_score + float(planner_weight) * planner_score
+    geometry_score = float(beam.get("geometry_score", 0.0)) + float(geometry_increment)
+    combined_score = (
+        model_score
+        + float(planner_weight) * planner_score
+        + float(geometry_weight) * geometry_score
+    )
     if target_type == semantic_length:
         completion_decoder_length = len(beam["decoder_input_ids"]) + 1
         new_completed_records.append(
@@ -7605,6 +8278,7 @@ def advance_structured_beam(
                 "semantic_id": tuple(new_completed[-1]),
                 "model_score": model_score,
                 "planner_score": planner_score,
+                "geometry_score": geometry_score,
                 "score": combined_score,
                 "decoder_length": completion_decoder_length,
             }
@@ -7616,6 +8290,7 @@ def advance_structured_beam(
         "completed_records": new_completed_records,
         "model_score": model_score,
         "planner_score": planner_score,
+        "geometry_score": geometry_score,
         "score": combined_score,
         "stopped": new_stopped,
     }
@@ -7751,6 +8426,86 @@ def validate_rank_capacity(num_beams: int, max_skills: int, max_rank: int) -> No
         )
 
 
+def load_frozen_pro_relevance_encoder(
+    checkpoint_path: Path | str,
+    *,
+    architecture_model: Path | str,
+    device,
+):
+    """Load the exact frozen M0 query encoder used to learn the RQ geometry."""
+    import torch
+    from transformers import T5Model
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or checkpoint.get("artifact_format") != "ripor_m0_relevance_v1":
+        raise ValueError("PRO query encoder must be a provenance-bearing RIPOR M0 checkpoint")
+    state = checkpoint.get("state_dict")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("PRO M0 checkpoint is missing its state_dict")
+    decoder_length = int(checkpoint.get("decoder_length") or 0)
+    max_query_length = int(checkpoint.get("max_query_length") or 0)
+    if decoder_length <= 0 or max_query_length <= 0:
+        raise ValueError("PRO M0 checkpoint requires positive decoder/query lengths")
+
+    model = T5Model.from_pretrained(architecture_model)
+    expected_config_hash = checkpoint.get("model_config_sha256")
+    actual_config_hash = stable_payload_sha256(model.config.to_dict())
+    if not expected_config_hash or str(expected_config_hash) != actual_config_hash:
+        raise ValueError(
+            "PRO M0/model configuration mismatch: "
+            f"m0={expected_config_hash}, model={actual_config_hash}"
+        )
+    normalized_state = {
+        (key[len("backbone.") :] if key.startswith("backbone.") else key): value
+        for key, value in state.items()
+    }
+    expected_keys = set(model.state_dict())
+    if set(normalized_state) != expected_keys:
+        raise ValueError(
+            "PRO M0 state schema mismatch: "
+            f"missing={sorted(expected_keys - set(normalized_state))[:5]}, "
+            f"extra={sorted(set(normalized_state) - expected_keys)[:5]}"
+        )
+    model.load_state_dict(normalized_state, strict=True)
+    model.to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model, decoder_length, max_query_length
+
+
+def frozen_pro_query_vector(
+    relevance_encoder,
+    input_ids,
+    attention_mask,
+    decoder_length: int,
+):
+    """Apply the exact decoder-start pooling contract used by M0 training."""
+    import torch
+
+    decoder_length = int(decoder_length)
+    if decoder_length <= 0:
+        raise ValueError(f"PRO M0 decoder length must be positive, got {decoder_length}")
+    start_id = relevance_encoder.config.decoder_start_token_id
+    if start_id is None:
+        start_id = relevance_encoder.config.pad_token_id
+    decoder_input_ids = torch.full(
+        (input_ids.shape[0], decoder_length),
+        int(relevance_encoder.config.pad_token_id),
+        dtype=torch.long,
+        device=input_ids.device,
+    )
+    decoder_input_ids[:, 0] = int(start_id)
+    return relevance_encoder(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        decoder_input_ids=decoder_input_ids,
+        return_dict=True,
+    ).last_hidden_state[:, 0, :]
+
+
 def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     import torch
     import torch.nn.functional as F
@@ -7791,6 +8546,42 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         raise ValueError(f"unknown decoder head: {decoder_head}")
     if score_transform not in {"raw", "logprob"}:
         raise ValueError(f"unknown decoder score transform: {score_transform}")
+    pro_fusion_weight = float(getattr(args, "pro_fusion_weight", 0.0))
+    if pro_fusion_weight < 0.0:
+        raise ValueError("PRO fusion weight must be non-negative")
+    checkpoint_pro_fusion = checkpoint.get("pro_fusion") or {}
+    pro_decoder_length = int(
+        checkpoint_pro_fusion.get("relevance_decoder_length") or 0
+    )
+    pro_relevance_checkpoint = None
+    if pro_fusion_weight != 0.0:
+        if decoder_head != "ce" or score_transform != "logprob":
+            raise ValueError("PRO fusion requires the CE decoder with log-probability scoring")
+        if not checkpoint_pro_fusion.get("compatible") or pro_decoder_length <= 0:
+            raise ValueError(
+                "PRO fusion requires a checkpoint initialized from one verified M0-space RQ codebook"
+            )
+        if "pro_codebook_embeddings" not in checkpoint.get("state_dict", {}):
+            raise ValueError("PRO-compatible checkpoint is missing its immutable RQ codebook tensor")
+        pro_relevance_checkpoint_value = str(
+            checkpoint_pro_fusion.get("relevance_m0_checkpoint") or ""
+        )
+        expected_pro_relevance_hash = str(
+            checkpoint_pro_fusion.get("relevance_m0_checkpoint_sha256") or ""
+        )
+        if not pro_relevance_checkpoint_value or not expected_pro_relevance_hash:
+            raise ValueError("PRO-compatible checkpoint is missing frozen M0 path/hash provenance")
+        pro_relevance_checkpoint = Path(pro_relevance_checkpoint_value)
+        if not pro_relevance_checkpoint.is_file():
+            raise ValueError(
+                f"PRO frozen M0 checkpoint does not exist: {pro_relevance_checkpoint}"
+            )
+        actual_pro_relevance_hash = file_sha256(pro_relevance_checkpoint)
+        if actual_pro_relevance_hash != expected_pro_relevance_hash:
+            raise ValueError(
+                "PRO frozen M0 checkpoint hash mismatch: "
+                f"expected={expected_pro_relevance_hash}, actual={actual_pro_relevance_hash}"
+            )
     source_text_policy_verified = validate_checkpoint_source_text_policy(
         checkpoint,
         args.allow_checkpoint_config_mismatch,
@@ -7915,6 +8706,23 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     ),
                     flush=True,
                 )
+    pro_relevance_encoder = None
+    pro_max_query_length = 0
+    if pro_relevance_checkpoint is not None:
+        (
+            pro_relevance_encoder,
+            loaded_pro_decoder_length,
+            pro_max_query_length,
+        ) = load_frozen_pro_relevance_encoder(
+            pro_relevance_checkpoint,
+            architecture_model=architecture_model,
+            device=device,
+        )
+        if loaded_pro_decoder_length != pro_decoder_length:
+            raise ValueError(
+                "PRO M0 decoder-length mismatch: "
+                f"metadata={pro_decoder_length}, checkpoint={loaded_pro_decoder_length}"
+            )
     model = make_structured_t5_sid_model(
         architecture_model,
         codebook_size,
@@ -7967,6 +8775,18 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         )
         input_ids = encoded["input_ids"].to(device)
         attention_mask = encoded["attention_mask"].to(device)
+        pro_encoded = None
+        if pro_relevance_encoder is not None:
+            pro_encoded = tokenizer(
+                [decoder_source_text(row)],
+                padding=True,
+                truncation=True,
+                max_length=pro_max_query_length,
+                return_tensors="pt",
+            )
+            pro_encoded = {
+                key: value.to(device) for key, value in pro_encoded.items()
+            }
         pag_prefix_ids = pag_prefix_mask = None
         if pag_method_checkpoint:
             pag_prefix_ids, pag_prefix_mask = truncate_pag_query_prefix(
@@ -7976,6 +8796,15 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             )
         with torch.no_grad():
             encoder_hidden_states = model.encode_source(input_ids, attention_mask)
+            pro_query_vector = None
+            if pro_relevance_encoder is not None:
+                assert pro_encoded is not None
+                pro_query_vector = frozen_pro_query_vector(
+                    pro_relevance_encoder,
+                    pro_encoded["input_ids"],
+                    pro_encoded["attention_mask"],
+                    pro_decoder_length,
+                )[0]
             if pag_set_weight != 0.0 or args.pag_set_top_n > 0:
                 set_logits = model.pag_set_logits_from_encoder(
                     encoder_hidden_states,
@@ -8017,6 +8846,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                 "score": 0.0,
                 "model_score": 0.0,
                 "planner_score": 0.0,
+                "geometry_score": 0.0,
                 "stopped": False,
             }
         ]
@@ -8079,8 +8909,20 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                 for (beam, allowed), step_scores in zip(active_items, score_batch):
                     allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
                     allowed_scores = step_scores.index_select(0, allowed_tensor)
+                    if pro_fusion_weight != 0.0 and target_type < depth:
+                        geometry_scores = pro_residual_geometry_scores(
+                            pro_query_vector,
+                            model.pro_codebook_embeddings,
+                            beam["current_prefix"],
+                            target_type,
+                            allowed,
+                        ).detach().cpu().tolist()
+                    else:
+                        geometry_scores = [0.0] * len(allowed)
                     ranked_with_planner = []
-                    for raw_score, value in zip(allowed_scores.detach().cpu().tolist(), allowed):
+                    for raw_score, geometry_score, value in zip(
+                        allowed_scores.detach().cpu().tolist(), geometry_scores, allowed
+                    ):
                         planner_absolute_score = float(beam.get("planner_score", 0.0))
                         if pag_set_weight != 0.0 and target_type < semantic_length:
                             completed_skill_ids = {
@@ -8095,12 +8937,22 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                                 args.pag_set_aggregation,
                                 excluded_skill_ids=completed_skill_ids,
                             )
-                        combined_score = float(raw_score) + pag_set_weight * planner_absolute_score
+                        combined_score = (
+                            float(raw_score)
+                            + pag_set_weight * planner_absolute_score
+                            + pro_fusion_weight * float(geometry_score)
+                        )
                         ranked_with_planner.append(
-                            (combined_score, float(raw_score), int(value), planner_absolute_score)
+                            (
+                                combined_score,
+                                float(raw_score),
+                                int(value),
+                                planner_absolute_score,
+                                float(geometry_score),
+                            )
                         )
                     ranked = sorted(ranked_with_planner, reverse=True)[: args.num_beams]
-                    for _, log_prob, value, planner_absolute_score in ranked:
+                    for _, log_prob, value, planner_absolute_score, geometry_score in ranked:
                         candidates.append(
                             advance_structured_beam(
                                 beam,
@@ -8113,6 +8965,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                                 semantic_id_mode,
                                 planner_absolute_score=planner_absolute_score,
                                 planner_weight=pag_set_weight,
+                                geometry_increment=geometry_score,
+                                geometry_weight=pro_fusion_weight,
                             )
                         )
             beams = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)[: args.num_beams]
@@ -8170,6 +9024,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                 "score": best["score"],
                 "model_score": best.get("model_score", best["score"]),
                 "planner_score": best.get("planner_score", 0.0),
+                "geometry_score": best.get("geometry_score", 0.0),
                 "hit_count": hit_count,
                 "recall": float(hit_count / len(gold_set)) if gold_set else 0.0,
                 "hit_rate": 1.0 if hit_count > 0 else 0.0,
@@ -8237,6 +9092,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "method_setting": checkpoint_method_setting,
             "decoder_head": decoder_head,
             "score_transform": score_transform,
+            "pro_fusion_weight": pro_fusion_weight,
+            "pro_fusion": checkpoint_pro_fusion if pro_fusion_weight != 0.0 else None,
             "docid_control_score": "excluded" if decoder_head == "ripor" else "included",
             "pag_set_ids": str(args.pag_set_ids) if args.pag_set_ids else None,
             "pag_set_weight": pag_set_weight,
@@ -8785,6 +9642,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="ranked GR/dense prediction JSONL used as a refreshable hard-negative pool",
     )
     p.add_argument(
+        "--prefix-distill-loss-weight",
+        type=float,
+        default=0.0,
+        help="hierarchical conditional teacher-distribution loss on CE SID prefixes",
+    )
+    p.add_argument(
+        "--prefix-distill-teacher-temperature",
+        type=float,
+        default=0.05,
+    )
+    p.add_argument(
+        "--prefix-distill-student-temperature",
+        type=float,
+        default=1.0,
+    )
+    p.add_argument(
+        "--pro-geometry-loss-weight",
+        type=float,
+        default=0.0,
+        help="align M0 query residual geometry to the same hierarchical teacher distribution",
+    )
+    p.add_argument(
         "--sequence-contrastive-loss-weight",
         type=float,
         default=0.0,
@@ -8835,6 +9714,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--decoder-head", choices=["auto", "ce", "ripor"], default="auto")
     p.add_argument("--score-transform", choices=["auto", "logprob", "raw"], default="auto")
+    p.add_argument(
+        "--pro-fusion-weight",
+        type=float,
+        default=0.0,
+        help="PRO residual-geometry weight omega; requires an M0-space codebook checkpoint",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)
     p.add_argument("--pag-set-weight", type=float, default=0.0)
@@ -8877,6 +9762,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--decoder-head", choices=["auto", "ce", "ripor"], default="auto")
     p.add_argument("--score-transform", choices=["auto", "logprob", "raw"], default="auto")
+    p.add_argument(
+        "--pro-fusion-weight",
+        type=float,
+        default=0.0,
+        help="PRO residual-geometry weight omega; requires an M0-space codebook checkpoint",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)
     p.add_argument("--pag-set-weight", type=float, default=0.0)

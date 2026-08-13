@@ -54,6 +54,7 @@ from skill_gr_pipeline import (  # noqa: E402
     encode_structured_sid_target,
     format_skillrouter_query,
     format_skillrouter_skill,
+    frozen_pro_query_vector,
     global_sid_token_id,
     infer_structured_sid_config,
     load_semantic_ids_with_mode,
@@ -69,6 +70,7 @@ from skill_gr_pipeline import (  # noqa: E402
     ripor_prefix_alphas,
     pag_prefix_planner_score,
     prepared_selected_skill_ids,
+    pro_residual_geometry_scores,
     ranked_skill_ids_from_structured_beams,
     ranked_skill_ids_from_marginal_structured_beams,
     remap_row_skill_aliases,
@@ -102,6 +104,179 @@ from train_letter_rqvae_official import (  # noqa: E402
 
 
 class SkillGRPipelineTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_pro_residual_geometry_matches_closed_form_and_legal_order(self) -> None:
+        import torch
+
+        codebooks = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                [[0.5, 0.0], [0.0, 0.5], [0.5, 0.5]],
+            ]
+        )
+        query = torch.tensor([2.0, 1.0])
+
+        scores = pro_residual_geometry_scores(
+            query,
+            codebooks,
+            current_prefix=[0],
+            target_level=1,
+            allowed_values=[2, 0],
+        )
+
+        residual = query - codebooks[0, 0]
+        expected = torch.stack(
+            [
+                2.0 * residual.dot(codebooks[1, value])
+                - codebooks[1, value].square().sum()
+                for value in (2, 0)
+            ]
+        )
+        self.assertTrue(torch.allclose(scores, expected))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_frozen_pro_query_vector_reproduces_m0_decoder_start_pooling(self) -> None:
+        import torch
+
+        class DummyM0(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(
+                    decoder_start_token_id=7,
+                    pad_token_id=0,
+                )
+                self.seen_decoder_input_ids = None
+
+            def forward(
+                self,
+                *,
+                input_ids,
+                attention_mask,
+                decoder_input_ids,
+                return_dict,
+            ):
+                self.seen_decoder_input_ids = decoder_input_ids.clone()
+                hidden = decoder_input_ids.float().unsqueeze(-1).expand(-1, -1, 3)
+                return types.SimpleNamespace(last_hidden_state=hidden)
+
+        model = DummyM0()
+        vectors = frozen_pro_query_vector(
+            model,
+            torch.tensor([[1, 2], [3, 4]]),
+            torch.ones((2, 2), dtype=torch.long),
+            decoder_length=3,
+        )
+
+        self.assertEqual(
+            model.seen_decoder_input_ids.tolist(),
+            [[7, 0, 0], [7, 0, 0]],
+        )
+        self.assertEqual(vectors.tolist(), [[7.0, 7.0, 7.0], [7.0, 7.0, 7.0]])
+
+    def test_pro_fusion_zero_weight_preserves_beam_scores_and_order(self) -> None:
+        parent = {
+            "decoder_input_ids": [99],
+            "current_prefix": [],
+            "completed": [],
+            "completed_records": [],
+            "score": -2.0,
+            "model_score": -2.0,
+            "planner_score": 0.0,
+            "geometry_score": 0.0,
+            "stopped": False,
+        }
+        raw_scores = {0: -0.1, 1: -0.2, 2: -0.3}
+        geometry = {0: -1000.0, 1: 5000.0, 2: 1000.0}
+        baseline = [
+            advance_structured_beam(
+                parent,
+                0,
+                value,
+                raw_scores[value],
+                codebook_size=3,
+                depth=1,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+            for value in raw_scores
+        ]
+        fused_zero = [
+            advance_structured_beam(
+                parent,
+                0,
+                value,
+                raw_scores[value],
+                codebook_size=3,
+                depth=1,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+                geometry_increment=geometry[value],
+                geometry_weight=0.0,
+            )
+            for value in raw_scores
+        ]
+
+        self.assertEqual(
+            [beam["score"] for beam in fused_zero],
+            [beam["score"] for beam in baseline],
+        )
+        self.assertEqual(
+            [beam["current_prefix"] for beam in sorted(fused_zero, key=lambda row: row["score"], reverse=True)],
+            [beam["current_prefix"] for beam in sorted(baseline, key=lambda row: row["score"], reverse=True)],
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_prefix_distribution_distillation_aggregates_teacher_mass_by_parent(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=4)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=2,
+                depth=2,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+        prefix_scores = torch.tensor(
+            [[[-0.1, -0.3], [-0.1, -0.7], [-0.2, -0.4]]]
+        )
+        model.ce_prefix_log_scores = lambda *_args, **_kwargs: prefix_scores
+        codes = torch.tensor([[[0, 0], [0, 1], [1, 0]]])
+        teacher_scores = torch.log(torch.tensor([[0.2, 0.3, 0.5]]))
+        valid = torch.ones((1, 3), dtype=torch.bool)
+
+        loss_sum, row_count, _ = model.prefix_distribution_distillation_loss(
+            torch.zeros((1, 1, 4)),
+            torch.ones((1, 1), dtype=torch.long),
+            codes,
+            valid,
+            teacher_scores,
+            teacher_temperature=1.0,
+            student_temperature=1.0,
+        )
+
+        root_target = torch.tensor([0.5, 0.5])
+        root_loss = -(root_target * torch.log_softmax(torch.tensor([-0.1, -0.2]), dim=0)).sum()
+        child_target = torch.tensor([0.4, 0.6])
+        child_loss = -0.5 * (
+            child_target * torch.log_softmax(torch.tensor([-0.3, -0.7]), dim=0)
+        ).sum()
+        expected = (root_loss + child_loss) / 2.0
+        self.assertTrue(torch.allclose(loss_sum, expected, atol=1e-6))
+        self.assertEqual(float(row_count), 1.0)
+
     def test_structured_query_resume_keeps_exact_total_step_contract(self) -> None:
         stage, total_steps = validate_structured_resume_plan(
             {
@@ -920,6 +1095,12 @@ class SkillGRPipelineTest(unittest.TestCase):
         baseline = model(**common)
         gated = model(
             **common,
+            ripor_candidate_codes=torch.tensor([[[1, 2, 3, 4], [4, 3, 2, 1]]]),
+            ripor_candidate_valid=torch.tensor([[True, True]]),
+            ripor_candidate_positive=torch.tensor([[True, False]]),
+            ripor_candidate_teacher_scores=torch.tensor([[1.0, 0.0]]),
+            prefix_distill_loss_weight=0.0,
+            pro_geometry_loss_weight=0.0,
             sequence_candidate_paths=torch.tensor([[[1, 2, 3, 4], [4, 3, 2, 1]]]),
             sequence_candidate_valid=torch.tensor([[True, True]]),
             sequence_candidate_positive=torch.tensor([[True, False]]),
@@ -928,6 +1109,8 @@ class SkillGRPipelineTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(gated["loss"], baseline["loss"]))
         self.assertTrue(torch.equal(gated["ce_loss"], baseline["ce_loss"]))
+        self.assertEqual(float(gated["prefix_distill_loss"]), 0.0)
+        self.assertEqual(float(gated["pro_geometry_loss"]), 0.0)
         self.assertEqual(float(gated["sequence_contrastive_loss"]), 0.0)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
