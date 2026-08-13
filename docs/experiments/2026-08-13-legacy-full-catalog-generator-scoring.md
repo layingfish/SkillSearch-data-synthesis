@@ -1,5 +1,5 @@
 # Experiment: Legacy full-catalog generator scoring
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -14,7 +14,7 @@ Risk Tier: 2
 
 Train: N/A
 
-Eval: `bash scripts/run_legacy_core75_full_catalog_node_20260813.sh`。复用同一 checkpoint 已保存且 SHA-256=`78386bffac0944fed624db2d9948023cc6407fedea32ec988df6d99f66a29a7b` 的 Official core75 beam=`50` predictions；随后运行 `scripts/score_legacy_core75_full_catalog.py score` 的 `8` 个 GPU shard，再运行 `analyze` 合并。
+Eval: job=`tide-chenyufei03-10679-cvgac`，queue=`rudder-exper`，node=`1×8 A800`，image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`，launch commit=`7994dc5af377c38b1ac8698a3c0185516cbfa5ee`。节点入口为 `bash scripts/run_legacy_core75_full_catalog_node_20260813.sh`。复用同一 checkpoint 已保存且 SHA-256=`78386bffac0944fed624db2d9948023cc6407fedea32ec988df6d99f66a29a7b` 的 Official core75 beam=`50` predictions；随后运行 `scripts/score_legacy_core75_full_catalog.py score` 的 `8` 个 GPU shard，再运行 `analyze` 合并。
 
 ## Outputs
 
