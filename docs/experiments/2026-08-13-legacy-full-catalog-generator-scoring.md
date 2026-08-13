@@ -1,5 +1,5 @@
 # Experiment: Legacy full-catalog generator scoring
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -24,16 +24,34 @@ Log: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_core75_full_catal
 
 Metrics: `/models_rw/SkillSearch-data-synthesis/experiments/legacy_core75_full_catalog_generator_scoring_20260813_v1/full_catalog_summary.json`
 
+- `full_catalog_summary.json` SHA-256=`754ef28e059f648f37fb426dc09d248583a9eef2f9e4a373aed7c766666c91eb`
+- `full_catalog_per_query.jsonl` SHA-256=`56f2928fc8caa7d208a70c1a7537e873bb403a1a96b2cba893874cc0fefa709f`
+- `full_catalog_report.md` SHA-256=`af685a8c54b7754f06798daa69663827aac364028dc85c4bb30a2fe18704551a`
+
 ## Verification
 
 - [x] Minimal local check：相关单测通过=`11`、因本地无 torch 跳过=`2`；Ruff、`py_compile`、launcher `bash -n`、`git diff --check` 通过
-- [ ] Archived beam candidate score replay at absolute tolerance=`5e-5`
-- [ ] Full sequence score equals five position contributions within absolute tolerance=`1e-6`
-- [ ] All `8` shards are disjoint and cover Official core75=`75` queries
+- [x] Archived beam candidate score replay：最大绝对误差=`1.9073486328125e-05`（允许误差=`5e-5`），Top-1/5/10/50 集合全部保持
+- [x] Full sequence score equals five position contributions within absolute tolerance=`1e-6`
+- [x] All `8` shards are disjoint and cover Official core75=`75` queries
 - [ ] Reviewer required? no; perform structured local semantic review
 
 ## Result / Notes
 
-Pending.
-
 本地输入闭合检查通过：Official rows=`75` 与归档 predictions=`75` 逐行对齐，prediction SHA-256 命中选中 checkpoint 在 step=`28,400` 的记录。结构化自审确认 score 仍由 `c0/c1/c2/c3/stop=1` 五项 full-vocabulary log-prob 相加；完整 catalog 只移除 beam frontier 截断，没有改变模型、SID 或归一化域。
+
+Job=`tide-chenyufei03-10679-cvgac` 正常完成，pod status=`Completed`、restart=`0`、wall time 约=`8m18s`（queue=`rudder-exper`、`1×8 A800`）。下表条件统一为 checkpoint=`cum_002@28,400`、Official core75=`75` queries、catalog=`14,551` frozen LETTER SIDs、CE full-vocabulary log-prob；beam 列使用 beam=`50`、beam-order，exhaustive 列完整展开全部 SID。
+
+| group | exhaustive R@1/R@10/R@50 | beam R@1/R@10/R@50 |
+|---|---:|---:|
+| Overall=`75` | `28.2571/70.0000/76.6667%` | `28.2571/70.0000/75.1111%` |
+| Single=`24` | `41.6667/50.0000/54.1667%` | `41.6667/50.0000/58.3333%` |
+| Multi=`51` | `21.9468/79.4118/87.2549%` | `21.9468/79.4118/83.0065%` |
+
+Top-1 结论：beam 与 exhaustive 的命中 query 完全相同。Overall 的 `29/75` 个 Top-1 miss、Single 的 `14/24` 个 Top-1 miss、Multi 的 `15/51` 个 Top-1 miss，在完整 catalog 排名下仍全部 miss；扩大 beam 无法恢复任何 Top-1。
+
+Single 的 exhaustive gold rank 分布为 rank=`1` 共 `10/24`、rank=`2–10` 共 `2/24`、rank=`11–50` 共 `1/24`、rank=`>50` 共 `11/24`。beam=`50` 额外把 full-catalog rank=`140` 的 `gt/nlp-research-repo-package-installment` 提升到 beam rank=`44`，所以 Single exhaustive R@50 比 beam 低 `1/24=4.1667` 个百分点；这是搜索剪掉更高分 nongold 后的偶然提升。
+
+一个明确的数据问题是 index=`12`：gold=`gt/timeseries-detrending` 的 exhaustive rank=`5`，Top-1=`other/timeseries-detrending`。两条 catalog body 去掉 `gt` 版本 YAML frontmatter 后完全相同，规范化文本 SHA-256 均为 `03274863ba9d516da03340c4e1fed9d61d7790c64a3589daa21b9093c0f5c97e`；当前 canonicalization 没把它们合成 alias。即使把这一条按语义正确计入，Single R@1 也只有 `11/24=45.8333%`（同一 exhaustive 条件）。
+
+后续纯 GR 优先级因此确定：停止扩大 beam；用当前生成器的完整 catalog 高分 nongold 做 listwise hard-negative training，并继续使用 mode3 query augmentation 处理 Single OOD。推理仍只运行一个生成模型。
