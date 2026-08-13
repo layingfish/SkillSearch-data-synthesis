@@ -6,7 +6,7 @@ bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.s
 CODE_ROOT=/workspace/SkillSearch-data-synthesis
 cd "${CODE_ROOT}"
 
-OUTPUT_ROOT="${SKILLGR_SEQUENCE_CONTRASTIVE_OUTPUT_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v1}"
+OUTPUT_ROOT="${SKILLGR_SEQUENCE_CONTRASTIVE_OUTPUT_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v2}"
 if [[ -e "${OUTPUT_ROOT}" ]]; then
   echo "refusing to overwrite sequence-contrastive output: ${OUTPUT_ROOT}" >&2
   exit 1
@@ -29,11 +29,12 @@ PIPELINE_SHA256=c37d7b809c1b689c0ae268d87aaa65fb001b54885e6c18ed171390a71a7d650e
 ANALYZER="${CODE_ROOT}/scripts/analyze_sequence_contrastive_checkpoint_sweep.py"
 ANALYZER_SHA256=a528145faa614125e1118fb73ce819744e67284d081d1db4676a31bf12ca6d7b
 
-SINGLE_ROWS=/dataset_rw/SkillSearch-data-synthesis/assets-data/outputs/train/skillrouter_repro_task5_mode3_single82621_20260716/inputs/decoder_rows.single_only.jsonl
+DATASET_RW_ROOT=/mnt/cfs_algo_bj/workspace/chenyufei03/datasets
+SINGLE_ROWS="${DATASET_RW_ROOT}/SkillSearch-data-synthesis/assets-data/outputs/train/skillrouter_repro_task5_mode3_single82621_20260716/inputs/decoder_rows.single_only.jsonl"
 SINGLE_ROWS_SHA256=df7046845745d144592a9d91469be5fa9447b8a1c61df8724faf5a20f1129cb0
-CANDIDATES=/dataset_rw/SkillSearch-data-synthesis/processed/sequence_contrastive_hn10_20260813/candidates.jsonl
+CANDIDATES="${DATASET_RW_ROOT}/SkillSearch-data-synthesis/processed/sequence_contrastive_hn10_20260813/candidates.jsonl"
 CANDIDATES_SHA256=c60b53655bf389340de1a791061c264d4dc3c65feb4390f20c62f1720cbad330
-CANDIDATE_MANIFEST=/dataset_rw/SkillSearch-data-synthesis/processed/sequence_contrastive_hn10_20260813/manifest.json
+CANDIDATE_MANIFEST="${DATASET_RW_ROOT}/SkillSearch-data-synthesis/processed/sequence_contrastive_hn10_20260813/manifest.json"
 CANDIDATE_MANIFEST_SHA256=5ba2e9a26803cf374aa8710c7b687bf6e429cceb0e506b88d727c0862f09f06d
 INIT_MODEL_DIR=/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_weight_checkpoint_sweep_20260812_v5/selected/joint_best
 INIT_CHECKPOINT_SHA256=a2a26ab5f64fbbe5b0df875afccad945684a2b5e2166f71b94a3e299c36f03c1
@@ -114,6 +115,8 @@ set -a
 export SKILLGR_EXACT_MODEL="${MODEL_SAFE}"
 source "${CODE_ROOT}/configs/legacy_catalog_base_exact_runtime_20260808.env"
 set +a
+SKILLGR_OFFICIAL_ROWS="${DATASET_RW_ROOT}/SkillSearch-data-synthesis/assets-data/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_core75_learned_d4_inputs/rows_003.skillsbench_core75.rows.jsonl"
+SKILLGR_SKILLS="${DATASET_RW_ROOT}/SkillSearch-data-synthesis/assets-data/outputs/train/skill_gr_full_catalog_task5_gpt4o_20260713/canonical_alias_core75_learned_d4_inputs/canonical_skills.jsonl"
 
 for required in \
   "${SINGLE_ROWS}" "${CANDIDATES}" "${CANDIDATE_MANIFEST}" \

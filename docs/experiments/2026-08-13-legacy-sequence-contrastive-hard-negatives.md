@@ -22,9 +22,9 @@ Eval: the launcher first anchors `cum_002@28,400`, then evaluates periodic step=
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v1`
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v2`
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v1/logs/node.log`
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_sequence_contrastive_hn10_20260813_v2/logs/node.log`
 
 Metrics: pending.
 
@@ -40,3 +40,5 @@ Metrics: pending.
 ## Result / Notes
 
 Pending.
+
+首次 job=`tide-chenyufei03-10680-pglnl` 命中固定 runtime 和 GPU count=`8`，随后在输入检查阶段失败：该 pod 没有 `/dataset_rw` alias。失败发生在模型加载、锚点评测和 optimizer step=`0` 之前。v2 launcher 改用 `/mnt/cfs_algo_bj/workspace/chenyufei03/datasets` 物理 CFS 路径。
