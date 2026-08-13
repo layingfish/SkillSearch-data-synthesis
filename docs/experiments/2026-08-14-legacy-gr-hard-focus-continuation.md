@@ -1,6 +1,6 @@
 # Experiment: A800 GR hard-focus continuation
 
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -16,7 +16,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: `bash scripts/run_legacy_gr_hard_focus_node_20260814.sh` (one node=`8×A800`, queue=`rudder-exper`).
+Train: job=`tide-chenyufei03-10685-tadnk`; `SKILLGR_LAUNCH_COMMIT=453682a bash scripts/run_legacy_gr_hard_focus_node_20260814.sh` (one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`).
 
 Eval: pending.
 
@@ -33,7 +33,7 @@ Metrics: pending.
 - [x] Focused rows and candidates form an exact one-to-one query-bound closure (`34,706` rows, output hashes reproduced byte-for-byte from the frozen `82,621`-row source and eight mining prediction shards).
 - [x] Selection contains all `17,353` mining top-1 errors plus `17,353` lowest-margin correct rows (step=`2,400` mining checkpoint, beam=`50`, training split=`82,621` single-GT queries).
 - [x] Local checks pass (`3/3` focus-builder tests; `2/2` analyzer tests; four torch-dependent loss tests deferred to the fixed GPU runtime).
-- [ ] Job requests one node=`8×A800` on queue=`rudder-exper`.
+- [x] Job requests one node=`8×A800` on queue=`rudder-exper` (job=`tide-chenyufei03-10685-tadnk`).
 - [x] Focused semantic self-review complete: row indices are reindexed, positive SID and query SHA-256 bindings are exact, each row has `10` unique non-gold candidates, and the training loader repeats the same closure audit.
 
 ## Result / Notes
