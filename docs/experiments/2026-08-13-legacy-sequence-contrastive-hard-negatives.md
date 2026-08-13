@@ -1,6 +1,6 @@
 # Experiment: A800 sequence-level hard-negative contrastive fine-tuning
 
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -16,7 +16,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: `bash scripts/run_legacy_sequence_contrastive_hn10_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, queue=`rudder-exper`, node=`1×8 A800`.
+Train: job=`tide-chenyufei03-10680-pglnl`, launch commit=`b8719de2f1baedc3a45d0fe5cc0d16e958367226`; `bash scripts/run_legacy_sequence_contrastive_hn10_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, queue=`rudder-exper`, node=`1×8 A800`.
 
 Eval: the launcher first anchors `cum_002@28,400`, then evaluates periodic step=`{200,400,...,5,000}` and final step=`5,164` in parallel over all `8×A800`; each evaluation uses Official core75=`75`, beam=`50`, beam-order, CE log-prob.
 
@@ -34,7 +34,7 @@ Metrics: pending.
 - [x] Disabled sequence loss preserves the original forward output exactly.
 - [x] Batched path scores equal stepwise decoder log-probability sums including STOP (FP32 allclose, atol=`1e-6`, rtol=`0`).
 - [x] Minimal local check: pipeline tests=`74/74`; focused new tests=`6/6`; Python compile、Ruff（忽略项目既有的 `2` 个 F401）和 shell syntax 通过。
-- [ ] Launch dry-run requests one node and all `8×A800` processes.
+- [x] Launch dry-run requests node=`1` on queue=`rudder-exper`; launcher asserts GPU count=`8` and starts DDP world size=`8`.
 - [ ] Reviewer required? no; focused local semantic review and invariant tests required.
 
 ## Result / Notes
