@@ -11,7 +11,8 @@ fi
 
 CODE_ROOT=/workspace/SkillSearch-data-synthesis
 cd "${CODE_ROOT}"
-git config --global --add safe.directory "${CODE_ROOT}"
+CODE_ROOT_PHYSICAL="$(pwd -P)"
+git config --global --add safe.directory "${CODE_ROOT_PHYSICAL}"
 
 EXPECTED_COMMIT="${SKILLGR_LAUNCH_COMMIT:-}"
 ACTUAL_COMMIT="$(git rev-parse HEAD)"
