@@ -1,5 +1,5 @@
 # Experiment: Query-aligned collaborative RQ with PRO fusion
-Status: planned
+Status: running
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -38,13 +38,13 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 ## Verification
 
 - [x] Minimal local check: Python compile, shell syntax, and complete pipeline unit suite (79 tests)
-- [ ] Unit/invariant test: M0 query pooling and codebook provenance
+- [x] Unit/invariant test: M0 query pooling and codebook provenance
 - [x] Unit/invariant test: teacher prefix mass and conditional loss
 - [x] Unit/invariant test: omega=0 preserves decoder output and beam ordering exactly
 - [x] Unit/invariant test: fusion scores only legal trie children
 - [x] Unit/invariant test: gate=0 student output is allclose to base-model output
 - [x] Unit/invariant test: collision-free four-code SIDs
-- [ ] 8-GPU two-step preflight
+- [x] 8-GPU two-step preflight
 - [x] Structured local cross-review complete
 - [x] Reviewer required? yes; fulfilled by structured local review because no delegated reviewer was requested
 
@@ -53,3 +53,5 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 Local cross-review found two HIGH launch/semantic issues and fixed both before submission: a mistyped frozen-runtime SHA-256 and use of the trainable decoder copy for PRO query geometry. Fusion now loads the exact frozen M0 checkpoint, verifies its hash/config/state schema, uses its recorded query truncation and decoder-start pooling, and rejects mismatched codebook provenance. No unresolved CRITICAL/HIGH finding remains.
 
 Method reference: PRO arXiv v3 (`2606.09241`, 2026-08-05), Eq. 7 and Appendix C; official implementation `layingfish/MGR_PRO@a9c47fda9cebc7a93a13aa8d19c0415f6c690b0d`. The implemented bias is `2 * residual dot code - squared_code_norm`; the paper default is `omega=10 (beam=50)`, and this run evaluates the local sensitivity set above.
+
+The 8-GPU preflight completed in Tianzhi job `tide-chenyufei03-10691-tibwq`. It ran on one rudder-exper node with 8xA800, passed all 9 focused node tests, completed 2 M0 optimizer steps, 2 RQ optimizer steps, 2 decoder optimizer steps, and an 8-query constrained-decoding smoke evaluation. Preflight output: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_preflight_v6/`.
