@@ -1,6 +1,6 @@
 # Experiment: A800 GR-self-mined near-miss ranking
 
-Status: planned
+Status: running
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -16,15 +16,15 @@ Risk Tier: 2
 
 ## Commands
 
-Train: `bash scripts/run_legacy_gr_self_mined_nearmiss_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`; planned queue=`rudder-exper`, node=`1×8 A800`.
+Train: active job=`tide-chenyufei03-10684-iskwv`, launch commit=`b33f573`; `bash scripts/run_legacy_gr_self_mined_nearmiss_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, queue=`rudder-exper`, node=`1×8 A800`.
 
 Eval: pending.
 
 ## Outputs
 
-Checkpoint: pending.
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_gr_self_mined_nearmiss_20260813_v1`.
 
-Log: pending.
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_legacy_gr_self_mined_nearmiss_20260813_v1/logs/node.log`.
 
 Metrics: pending.
 
@@ -33,7 +33,7 @@ Metrics: pending.
 - [x] Local shard dry-run closes exactly over all `82,621` training rows with source SHA-256=`df7046845745d144592a9d91469be5fa9447b8a1c61df8724faf5a20f1129cb0`; shard sizes are `10,328×5 + 10,327×3` across `8` workers.
 - [ ] Every row has one matching gold and `10` unique known non-gold SIDs.
 - [x] Minimal local check: focused tests=`9/9`; Python compile, Ruff, shell syntax, and embedded helper SHA verification pass.
-- [ ] Job requests one node=`8×A800` on queue=`rudder-exper`.
+- [x] Tianzhi dry-run and submitted job request one node=`8×A800` on queue=`rudder-exper`.
 - [ ] Focused semantic self-review complete.
 
 ## Result / Notes
