@@ -36,6 +36,7 @@ from skill_gr_pipeline import (  # noqa: E402
     build_decoder_target,
     build_arg_parser,
     build_ripor_candidate_batch,
+    build_sequence_contrastive_candidate_batch,
     build_teacher_rank_examples,
     build_single_sid_catalog_rows,
     expand_single_sid_query_rows,
@@ -60,6 +61,7 @@ from skill_gr_pipeline import (  # noqa: E402
     make_structured_t5_sid_model,
     merge_pag_set_sequence_states,
     load_ranked_skill_candidates_with_scores,
+    load_sequence_contrastive_candidates,
     load_pag_set_token_ids,
     native_semantic_id_text,
     pag_quadratic_regularization_weight,
@@ -75,6 +77,7 @@ from skill_gr_pipeline import (  # noqa: E402
     semantic_ids_sha256,
     setting_contract_provenance,
     sibling_negative_exclusion_values,
+    sequence_contrastive_candidate_audit,
     split_and_expand_single_sid_query_rows,
     stratified_split_rows,
     structured_allowed_values,
@@ -795,6 +798,234 @@ class SkillGRPipelineTest(unittest.TestCase):
         )
         components["loss"].backward()
         self.assertIsNotNone(hidden.grad)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sequence_candidate_scores_match_stepwise_sid_and_stop_logprob(self) -> None:
+        import torch
+        import torch.nn.functional as F
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        torch.manual_seed(20260813)
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        def causal_hidden(
+            _encoder_hidden_states,
+            _encoder_attention_mask,
+            decoder_input_ids,
+            _decoder_attention_mask,
+            **_kwargs,
+        ):
+            prefix_sum = decoder_input_ids.float().cumsum(dim=1)
+            basis = torch.arange(1, 9, dtype=torch.float32).view(1, 1, -1)
+            return torch.sin(prefix_sum.unsqueeze(-1) * 0.01 + basis * 0.1)
+
+        model._decoder_hidden_from_encoder = causal_hidden
+        candidate_paths = torch.tensor([[[1, 2, 3, 4], [4, 3, 2, 1]]])
+        encoder_hidden = torch.zeros((1, 2, 8))
+        encoder_mask = torch.ones((1, 2), dtype=torch.long)
+        batched_scores = model.sequence_candidate_logprob_scores(
+            encoder_hidden,
+            encoder_mask,
+            candidate_paths,
+        )
+
+        bos_id = global_sid_token_id(5, 0, 16, 4, 0, SEMANTIC_ID_MODE_LEARNED)
+        manual_scores = []
+        for path_values in candidate_paths[0].tolist():
+            decoder_ids = [bos_id]
+            score = torch.tensor(0.0)
+            for level, value in enumerate(path_values):
+                decoder_tensor = torch.tensor([decoder_ids], dtype=torch.long)
+                hidden = causal_hidden(
+                    encoder_hidden,
+                    encoder_mask,
+                    decoder_tensor,
+                    torch.ones_like(decoder_tensor),
+                )
+                score = score + F.log_softmax(
+                    model.code_heads[level](hidden[:, -1, :]).float(), dim=-1
+                )[0, value]
+                decoder_ids.append(level * 16 + value)
+            decoder_tensor = torch.tensor([decoder_ids], dtype=torch.long)
+            hidden = causal_hidden(
+                encoder_hidden,
+                encoder_mask,
+                decoder_tensor,
+                torch.ones_like(decoder_tensor),
+            )
+            score = score + F.log_softmax(
+                model.control_head(hidden[:, -1, :]).float(), dim=-1
+            )[0, 1]
+            manual_scores.append(score)
+
+        self.assertTrue(
+            torch.allclose(batched_scores[0], torch.stack(manual_scores), atol=1e-6, rtol=0.0),
+            (batched_scores[0] - torch.stack(manual_scores)).abs().max().item(),
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sequence_contrastive_zero_weight_preserves_forward_exactly(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+        hidden = torch.arange(40, dtype=torch.float32).reshape(1, 5, 8) / 40.0
+        model.encode_source = lambda input_ids, attention_mask: torch.zeros((1, 2, 8))
+        model._decoder_hidden_from_encoder = lambda *args, **kwargs: hidden
+        common = {
+            "input_ids": torch.zeros((1, 2), dtype=torch.long),
+            "attention_mask": torch.ones((1, 2), dtype=torch.long),
+            "decoder_input_ids": torch.zeros((1, 5), dtype=torch.long),
+            "decoder_attention_mask": torch.ones((1, 5), dtype=torch.long),
+            "target_types": torch.tensor([[0, 1, 2, 3, 4]]),
+            "labels": torch.tensor([[1, 2, 3, 4, 1]]),
+            "return_components": True,
+        }
+        baseline = model(**common)
+        gated = model(
+            **common,
+            sequence_candidate_paths=torch.tensor([[[1, 2, 3, 4], [4, 3, 2, 1]]]),
+            sequence_candidate_valid=torch.tensor([[True, True]]),
+            sequence_candidate_positive=torch.tensor([[True, False]]),
+            sequence_contrastive_loss_weight=0.0,
+        )
+
+        self.assertTrue(torch.equal(gated["loss"], baseline["loss"]))
+        self.assertTrue(torch.equal(gated["ce_loss"], baseline["ce_loss"]))
+        self.assertEqual(float(gated["sequence_contrastive_loss"]), 0.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sequence_listwise_loss_is_candidate_cross_entropy_and_honors_zero_weight(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=16,
+                depth=4,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+        candidate_scores = torch.tensor([[3.0, 1.0, 0.0], [5.0, 2.0, 1.0]])
+        model.sequence_candidate_logprob_scores = lambda *_args, **_kwargs: candidate_scores
+        loss_sum, row_count, scores = model.sequence_listwise_rank_loss(
+            torch.zeros((2, 1, 8)),
+            torch.ones((2, 1), dtype=torch.long),
+            torch.zeros((2, 3, 4), dtype=torch.long),
+            torch.ones((2, 3), dtype=torch.bool),
+            torch.tensor([[True, False, False], [True, False, False]]),
+            temperature=1.0,
+            row_weights=torch.tensor([1.0, 0.0]),
+        )
+
+        expected = torch.logsumexp(candidate_scores[0], dim=0) - candidate_scores[0, 0]
+        self.assertTrue(torch.equal(scores, candidate_scores))
+        self.assertAlmostEqual(float(loss_sum), float(expected), places=7)
+        self.assertEqual(float(row_count), 1.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sequence_contrastive_candidate_manifest_closes_and_builds_exact_paths(self) -> None:
+        import torch
+
+        semantic_ids = {
+            "skill/a": [1, 2, 3, 4],
+            "skill/b": [4, 3, 2, 1],
+            "skill/c": [5, 6, 7, 8],
+        }
+        rows = [
+            {"index": 0, "source_index": 10, "query": "alpha", "selected_skill_ids": ["skill/a"]},
+            {"index": 1, "source_index": 11, "query": "beta", "selected_skill_ids": ["skill/b"]},
+        ]
+        records = [
+            {
+                "row_index": 0,
+                "source_index": 10,
+                "query": "alpha",
+                "positive_skill_id": "skill/a",
+                "negative_skill_ids": ["skill/b", "skill/c"],
+            },
+            {
+                "row_index": 1,
+                "source_index": 11,
+                "query": "beta",
+                "positive_skill_id": "skill/b",
+                "negative_skill_ids": ["skill/a", "skill/c"],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "candidates.jsonl"
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+            )
+            candidate_map = load_sequence_contrastive_candidates(
+                path, semantic_ids, expected_negatives=2
+            )
+        audit = sequence_contrastive_candidate_audit(
+            rows, candidate_map, semantic_ids, expected_negatives=2
+        )
+        batch = build_sequence_contrastive_candidate_batch(
+            rows,
+            semantic_ids,
+            candidate_map=candidate_map,
+            expected_negatives=2,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            depth=4,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(audit["rows"], 2)
+        self.assertEqual(tuple(batch["sequence_candidate_paths"].shape), (2, 3, 4))
+        self.assertEqual(batch["sequence_candidate_paths"][0, 0].tolist(), semantic_ids["skill/a"])
+        self.assertEqual(batch["sequence_candidate_paths"][0, 1].tolist(), semantic_ids["skill/b"])
+        self.assertEqual(batch["sequence_candidate_positive"].tolist(), [[True, False, False], [True, False, False]])
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_ripor_progressive_prefix_slices_divergence_mask_and_count(self) -> None:

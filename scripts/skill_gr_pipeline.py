@@ -276,6 +276,7 @@ def save_structured_decoder_checkpoint(
     extra: dict[str, Any] | None = None,
     optimizer=None,
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    include_optimizer_state: bool = True,
 ) -> None:
     import torch
 
@@ -295,7 +296,7 @@ def save_structured_decoder_checkpoint(
         payload["ce_code_head_state_sha256"] = module_state_sha256(model.code_heads)
     if hasattr(model, "ripor_heads"):
         payload["ripor_head_state_sha256"] = module_state_sha256(model.ripor_heads)
-    if optimizer is not None:
+    if optimizer is not None and include_optimizer_state:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     if extra:
         payload.update(extra)
@@ -1435,6 +1436,201 @@ def ranking_excluded_skill_ids(row: dict[str, Any], known_skill_ids: set[str]) -
     source_ids = row.get("source_selected_skill_ids")
     values = source_ids if source_ids is not None else row.get("selected_skill_ids", [])
     return {str(value) for value in values or [] if str(value) in known_skill_ids}
+
+
+def load_sequence_contrastive_candidates(
+    path: Path | None,
+    semantic_ids: dict[str, list[int]],
+    *,
+    expected_negatives: int,
+) -> dict[str, dict[str, Any]]:
+    """Stream an exact gold+hard-negative manifest keyed by decoder row index.
+
+    The original SkillsRouter mining artifact is several GiB because it embeds
+    every skill document.  Sequence-level GR needs only IDs and a query digest,
+    so this loader never retains the large text fields in memory.
+    """
+    if path is None:
+        return {}
+    if expected_negatives <= 0:
+        raise ValueError(
+            f"sequence contrastive expected negatives must be positive, got {expected_negatives}"
+        )
+    known_skill_ids = set(semantic_ids)
+    result: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            row_index = row.get("row_index")
+            if row_index is None:
+                row_index = row.get("index")
+            if row_index is None or str(row_index) == "":
+                raise ValueError(
+                    f"sequence contrastive row {line_number} has no row_index: {path}"
+                )
+            key = f"row_index:{row_index}"
+            if key in result:
+                raise ValueError(f"duplicate sequence contrastive row_index: {row_index}")
+            positive = str(row.get("positive_skill_id") or "")
+            if positive not in known_skill_ids:
+                raise ValueError(
+                    f"unknown sequence contrastive positive skill={positive!r} at line={line_number}"
+                )
+            negatives = [str(value) for value in row.get("negative_skill_ids", []) or []]
+            if len(negatives) != expected_negatives:
+                raise ValueError(
+                    "sequence contrastive row must contain the exact mined negative count: "
+                    f"expected={expected_negatives}, got={len(negatives)}, row_index={row_index}"
+                )
+            if len(set(negatives)) != expected_negatives:
+                raise ValueError(
+                    f"sequence contrastive negatives are not unique: row_index={row_index}"
+                )
+            if positive in negatives:
+                raise ValueError(
+                    f"sequence contrastive negatives contain the positive: row_index={row_index}"
+                )
+            unknown = [sid for sid in negatives if sid not in known_skill_ids]
+            if unknown:
+                raise ValueError(
+                    "sequence contrastive negatives contain unknown skills: "
+                    f"row_index={row_index}, first={unknown[:5]}"
+                )
+            query_sha256 = str(row.get("query_sha256") or "")
+            if not query_sha256:
+                query = str(row.get("query") or row.get("query_text") or "")
+                if not query:
+                    raise ValueError(
+                        f"sequence contrastive row has no query binding: row_index={row_index}"
+                    )
+                query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+            result[key] = {
+                "positive_skill_id": positive,
+                "negative_skill_ids": negatives,
+                "query_sha256": query_sha256,
+                "row_index": row_index,
+                "source_index": row.get("source_index"),
+            }
+    if not result:
+        raise ValueError(f"sequence contrastive candidate manifest is empty: {path}")
+    return result
+
+
+def sequence_contrastive_candidate_audit(
+    rows: list[dict[str, Any]],
+    candidate_map: dict[str, dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    *,
+    expected_negatives: int,
+) -> dict[str, Any]:
+    """Require a one-to-one, query-bound candidate record for every train row."""
+    seen_keys: set[str] = set()
+    for row in rows:
+        row_index = row.get("_sequence_contrastive_row_index", row.get("index"))
+        if row_index is None or str(row_index) == "":
+            raise ValueError(
+                "sequence contrastive training row has no index"
+            )
+        key = f"row_index:{row_index}"
+        if key in seen_keys:
+            raise ValueError(f"duplicate sequence contrastive training index: {row_index}")
+        seen_keys.add(key)
+        record = candidate_map.get(key)
+        if record is None:
+            raise ValueError(
+                f"sequence contrastive candidates are missing index={row_index}"
+            )
+        positives = ripor_positive_skill_ids(row, semantic_ids)
+        if len(positives) != 1 or positives[0] != record["positive_skill_id"]:
+            raise ValueError(
+                "sequence contrastive positive mismatch: "
+                f"index={row_index}, train={positives}, candidates={record['positive_skill_id']}"
+            )
+        query = str(row.get("query") or row.get("query_text") or row.get("decoder_input") or "")
+        query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        if query_sha256 != record["query_sha256"]:
+            raise ValueError(
+                f"sequence contrastive query mismatch: index={row_index}"
+            )
+        negatives = list(record["negative_skill_ids"])
+        excluded = ranking_excluded_skill_ids(row, set(semantic_ids))
+        false_negatives = [sid for sid in negatives if sid in excluded]
+        if false_negatives:
+            raise ValueError(
+                "sequence contrastive candidate list contains another query gold: "
+                f"index={row_index}, skills={false_negatives}"
+            )
+        if len(negatives) != expected_negatives:
+            raise ValueError(
+                f"sequence contrastive negative count drifted for index={row_index}"
+            )
+    extra_keys = set(candidate_map) - seen_keys
+    if extra_keys:
+        raise ValueError(
+            "sequence contrastive candidate manifest has rows outside the training closure: "
+            f"count={len(extra_keys)}, first={sorted(extra_keys)[:5]}"
+        )
+    return {
+        "rows": len(rows),
+        "candidate_records": len(candidate_map),
+        "negatives_per_row": expected_negatives,
+        "candidate_paths_per_row": expected_negatives + 1,
+        "join_key": "zero_based_training_row_ordinal_to_candidates.row_index",
+        "query_binding": "sha256",
+        "false_negative_exclusion": "all_source_selected_skill_ids",
+    }
+
+
+def build_sequence_contrastive_candidate_batch(
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    *,
+    candidate_map: dict[str, dict[str, Any]],
+    expected_negatives: int,
+    semantic_id_mode: str,
+    depth: int,
+    device,
+) -> dict[str, Any]:
+    """Build one gold and the exact static hard-negative SID paths per row."""
+    import torch
+
+    sid_length = structured_sid_length(depth, semantic_id_mode)
+    paths = torch.zeros(
+        (len(rows), expected_negatives + 1, sid_length), dtype=torch.long, device=device
+    )
+    valid = torch.ones(
+        (len(rows), expected_negatives + 1), dtype=torch.bool, device=device
+    )
+    positive = torch.zeros_like(valid)
+    positive[:, 0] = True
+    for row_index, row in enumerate(rows):
+        row_id = row.get("_sequence_contrastive_row_index", row.get("index"))
+        key = f"row_index:{row_id}"
+        record = candidate_map.get(key)
+        if record is None:
+            raise ValueError(f"missing sequence candidates for index={row_id}")
+        positives = ripor_positive_skill_ids(row, semantic_ids)
+        if len(positives) != 1 or positives[0] != record["positive_skill_id"]:
+            raise ValueError(f"sequence candidate positive mismatch for index={row_id}")
+        candidates = [record["positive_skill_id"], *record["negative_skill_ids"]]
+        if len(candidates) != expected_negatives + 1:
+            raise ValueError(f"sequence candidate count mismatch for index={row_id}")
+        for candidate_index, sid in enumerate(candidates):
+            values = [int(value) for value in semantic_ids[sid]]
+            if len(values) != sid_length:
+                raise ValueError(
+                    f"semantic id length={len(values)} does not match expected={sid_length}: {sid}"
+                )
+            paths[row_index, candidate_index] = torch.tensor(
+                values, dtype=torch.long, device=device
+            )
+    return {
+        "sequence_candidate_paths": paths,
+        "sequence_candidate_valid": valid,
+        "sequence_candidate_positive": positive,
+    }
 
 
 def ripor_prefix_alphas(depth: int, beta: float = DEFAULT_RIPOR_ALPHA_BETA) -> list[float]:
@@ -4536,6 +4732,149 @@ def make_structured_t5_sid_model(
                 decoder_prefix_attention_mask=decoder_prefix_attention_mask,
             )
 
+        def sequence_candidate_logprob_scores(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_paths,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            """Score complete SID+STOP paths with the normal CE decoder.
+
+            This is the same autoregressive factorization used by constrained
+            decoding: full-vocabulary log-softmax at every SID decision followed
+            by the terminal STOP decision.
+            """
+            batch_size, candidate_count, path_length = candidate_paths.shape
+            expected_path_length = structured_sid_length(self.depth, self.semantic_id_mode)
+            if path_length != expected_path_length:
+                raise ValueError(
+                    "sequence candidate path length does not match the model schema: "
+                    f"expected={expected_path_length}, got={path_length}"
+                )
+            code_values = candidate_paths[:, :, : self.depth]
+            if bool(((code_values < 0) | (code_values >= self.codebook_size)).any()):
+                raise ValueError("sequence candidate code is outside the codebook")
+            if self.semantic_id_mode == SEMANTIC_ID_MODE_DEDUP:
+                dedup_values = candidate_paths[:, :, self.depth]
+                if bool(((dedup_values < 0) | (dedup_values >= self.dedup_size)).any()):
+                    raise ValueError("sequence candidate dedup value is outside the dedup vocabulary")
+            bos_id = structured_sid_bos_id(
+                self.codebook_size,
+                self.depth,
+                self.dedup_size,
+                self.semantic_id_mode,
+            )
+            decision_count = path_length + 1
+            decoder_input_ids = candidate_paths.new_full(
+                (batch_size, candidate_count, decision_count), bos_id
+            )
+            for level in range(self.depth):
+                decoder_input_ids[:, :, level + 1] = (
+                    level * self.codebook_size + candidate_paths[:, :, level]
+                )
+            if self.semantic_id_mode == SEMANTIC_ID_MODE_DEDUP:
+                decoder_input_ids[:, :, self.depth + 1] = (
+                    self.depth * self.codebook_size + candidate_paths[:, :, self.depth]
+                )
+            flat_decoder_ids = decoder_input_ids.reshape(
+                batch_size * candidate_count, decision_count
+            )
+            flat_decoder_mask = torch.ones_like(flat_decoder_ids)
+            flat_encoder = encoder_hidden_states.repeat_interleave(candidate_count, dim=0)
+            flat_encoder_mask = encoder_attention_mask.repeat_interleave(candidate_count, dim=0)
+            flat_prefix_ids = None
+            flat_prefix_mask = None
+            if decoder_prefix_input_ids is not None:
+                flat_prefix_ids = decoder_prefix_input_ids.repeat_interleave(candidate_count, dim=0)
+                if decoder_prefix_attention_mask is not None:
+                    flat_prefix_mask = decoder_prefix_attention_mask.repeat_interleave(
+                        candidate_count, dim=0
+                    )
+            hidden = self._decoder_hidden_from_encoder(
+                flat_encoder,
+                flat_encoder_mask,
+                flat_decoder_ids,
+                flat_decoder_mask,
+                decoder_prefix_input_ids=flat_prefix_ids,
+                decoder_prefix_attention_mask=flat_prefix_mask,
+            )
+            flat_paths = candidate_paths.reshape(batch_size * candidate_count, path_length)
+            scores = hidden.new_zeros(batch_size * candidate_count, dtype=torch.float32)
+            for level, head in enumerate(self.code_heads):
+                log_probs = F.log_softmax(head(hidden[:, level, :]).float(), dim=-1)
+                scores = scores + log_probs.gather(
+                    1, flat_paths[:, level : level + 1]
+                ).squeeze(1)
+            if self.dedup_head is not None:
+                log_probs = F.log_softmax(
+                    self.dedup_head(hidden[:, self.depth, :]).float(), dim=-1
+                )
+                scores = scores + log_probs.gather(
+                    1, flat_paths[:, self.depth : self.depth + 1]
+                ).squeeze(1)
+            stop_position = path_length
+            stop_log_probs = F.log_softmax(
+                self.control_head(hidden[:, stop_position, :]).float(), dim=-1
+            )
+            scores = scores + stop_log_probs[:, 1]
+            return scores.reshape(batch_size, candidate_count)
+
+        def sequence_listwise_rank_loss(
+            self,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_paths,
+            candidate_valid,
+            candidate_positive,
+            *,
+            temperature: float,
+            row_weights=None,
+            decoder_prefix_input_ids=None,
+            decoder_prefix_attention_mask=None,
+        ):
+            if temperature <= 0.0:
+                raise ValueError(
+                    f"sequence contrastive temperature must be positive, got {temperature}"
+                )
+            if candidate_valid.shape != candidate_positive.shape:
+                raise ValueError("sequence candidate validity and positive masks must match")
+            if candidate_paths.shape[:2] != candidate_valid.shape:
+                raise ValueError("sequence candidate paths and masks must share batch/candidate axes")
+            scores = self.sequence_candidate_logprob_scores(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                candidate_paths,
+                decoder_prefix_input_ids=decoder_prefix_input_ids,
+                decoder_prefix_attention_mask=decoder_prefix_attention_mask,
+            )
+            scaled_scores = scores / float(temperature)
+            loss_sum = scores.new_tensor(0.0)
+            row_count = scores.new_tensor(0.0)
+            for row_index in range(scores.shape[0]):
+                valid = candidate_valid[row_index]
+                positive = valid & candidate_positive[row_index]
+                if int(positive.sum().item()) != 1:
+                    raise ValueError(
+                        "sequence contrastive training requires exactly one positive path per row"
+                    )
+                if int(valid.sum().item()) <= 1:
+                    raise ValueError(
+                        "sequence contrastive training requires at least one negative path per row"
+                    )
+                row_loss = torch.logsumexp(scaled_scores[row_index, valid], dim=0) - torch.logsumexp(
+                    scaled_scores[row_index, positive], dim=0
+                )
+                row_weight = (
+                    row_weights[row_index].to(device=scores.device, dtype=scores.dtype)
+                    if row_weights is not None
+                    else scores.new_tensor(1.0)
+                )
+                loss_sum = loss_sum + row_loss * row_weight
+                row_count = row_count + row_weight
+            return loss_sum, row_count, scores
+
         def ripor_prefix_rank_loss(
             self,
             encoder_hidden_states,
@@ -4642,6 +4981,9 @@ def make_structured_t5_sid_model(
             ripor_candidate_positive=None,
             ripor_candidate_teacher_scores=None,
             ripor_candidate_teacher_observed=None,
+            sequence_candidate_paths=None,
+            sequence_candidate_valid=None,
+            sequence_candidate_positive=None,
             training_sample_weights=None,
             ce_excluded_labels=None,
             ripor_loss_weight: float = 0.0,
@@ -4649,6 +4991,8 @@ def make_structured_t5_sid_model(
             ripor_temperature: float = 1.0,
             ripor_alpha_beta: float = DEFAULT_RIPOR_ALPHA_BETA,
             ripor_prefix_max_length: int | None = None,
+            sequence_contrastive_loss_weight: float = 0.0,
+            sequence_contrastive_temperature: float = 1.0,
             pag_query_prefix: bool = False,
             pag_query_prefix_max_length: int = DEFAULT_PAG_QUERY_PREFIX_MAX_LENGTH,
             sequential_ce_weight: float = 1.0,
@@ -4776,6 +5120,35 @@ def make_structured_t5_sid_model(
                     for parameter in head.parameters():
                         if parameter.requires_grad:
                             loss = loss + parameter.reshape(-1)[0] * 0.0
+            sequence_loss_sum = hidden.new_tensor(0.0)
+            sequence_row_count = hidden.new_tensor(0.0)
+            sequence_contrastive_loss = hidden.new_tensor(0.0)
+            if float(sequence_contrastive_loss_weight) != 0.0:
+                if (
+                    sequence_candidate_paths is None
+                    or sequence_candidate_valid is None
+                    or sequence_candidate_positive is None
+                ):
+                    raise ValueError(
+                        "sequence contrastive loss requires candidate paths, validity, and positive masks"
+                    )
+                sequence_loss_sum, sequence_row_count, _ = self.sequence_listwise_rank_loss(
+                    encoder_hidden_states,
+                    attention_mask,
+                    sequence_candidate_paths,
+                    sequence_candidate_valid,
+                    sequence_candidate_positive,
+                    temperature=sequence_contrastive_temperature,
+                    row_weights=training_sample_weights,
+                    decoder_prefix_input_ids=pag_prefix_ids,
+                    decoder_prefix_attention_mask=pag_prefix_mask,
+                )
+                sequence_contrastive_loss = self._normalize_loss(
+                    sequence_loss_sum,
+                    sequence_row_count,
+                    global_loss_normalization,
+                )
+                loss = loss + float(sequence_contrastive_loss_weight) * sequence_contrastive_loss
             pag_set_loss_sum = hidden.new_tensor(0.0)
             pag_set_count = hidden.new_tensor(0.0)
             pag_set_loss = hidden.new_tensor(0.0)
@@ -4869,6 +5242,9 @@ def make_structured_t5_sid_model(
                     "local_ce_token_count": token_count,
                     "local_ripor_loss_sum": ripor_loss_sum,
                     "local_ripor_pair_count": ripor_pair_count,
+                    "sequence_contrastive_loss": sequence_contrastive_loss,
+                    "local_sequence_contrastive_loss_sum": sequence_loss_sum,
+                    "local_sequence_contrastive_row_count": sequence_row_count,
                     "pag_set_loss": pag_set_loss,
                     "local_pag_set_loss_sum": pag_set_loss_sum,
                     "local_pag_set_count": pag_set_count,
@@ -5105,11 +5481,18 @@ def _structured_global_train_metrics(components: dict[str, Any], context: Distri
     pag_sum, pag_count = reduce_sum_count(
         components["local_pag_set_loss_sum"], components["local_pag_set_count"], context
     )
+    sequence_sum, sequence_count = reduce_sum_count(
+        components["local_sequence_contrastive_loss_sum"],
+        components["local_sequence_contrastive_row_count"],
+        context,
+    )
     return {
         "ce_loss": ce_sum / max(1, ce_count),
         "ripor_loss": ripor_sum / max(1, ripor_count),
         "ripor_pairs": float(ripor_count),
         "pag_set_loss": pag_sum / max(1, pag_count),
+        "sequence_contrastive_loss": sequence_sum / max(1, sequence_count),
+        "sequence_contrastive_rows": float(sequence_count),
     }
 
 
@@ -5207,6 +5590,8 @@ def _run_distributed_structured_training(
     ripor_enabled: bool,
     ripor_hard_negative_map: dict[str, list[str]],
     ripor_teacher_score_map: dict[str, dict[str, float]],
+    sequence_contrastive_enabled: bool = False,
+    sequence_contrastive_candidate_map: dict[str, dict[str, Any]] | None = None,
     pag_set_token_ids: dict[str, list[int]] | None = None,
     pag_set_vocab_size: int = 0,
     pag_set_skills: list[dict[str, Any]] | None = None,
@@ -5400,6 +5785,14 @@ def _run_distributed_structured_training(
                 extra,
                 optimizer=optimizer,
                 semantic_id_mode=semantic_id_mode,
+                include_optimizer_state=bool(
+                    extra.get("training_state")
+                    or directory.name == "last"
+                    or (
+                        directory.name == "final"
+                        and not bool(getattr(args, "lightweight_checkpoints", False))
+                    )
+                ),
             )
         barrier(context)
 
@@ -5421,6 +5814,7 @@ def _run_distributed_structured_training(
                 "last_train_loss": None,
                 "last_ce_loss": None,
                 "last_ripor_loss": None,
+                "last_sequence_contrastive_loss": None,
                 "best_dev_loss": initial_best_loss,
                 "best_checkpoint": str(args.init_model_dir) if initial_best_loss is not None and args.init_model_dir else None,
                 "epoch_metrics": [],
@@ -5579,6 +5973,27 @@ def _run_distributed_structured_training(
                             ),
                         }
                     )
+                use_sequence_contrastive = sequence_contrastive_enabled and stage_name == "query"
+                if use_sequence_contrastive:
+                    if sequence_contrastive_candidate_map is None:
+                        raise ValueError("sequence contrastive training requires a candidate map")
+                    batch.update(
+                        build_sequence_contrastive_candidate_batch(
+                            batch_rows,
+                            semantic_ids,
+                            candidate_map=sequence_contrastive_candidate_map,
+                            expected_negatives=args.sequence_contrastive_max_negatives,
+                            semantic_id_mode=semantic_id_mode,
+                            depth=depth,
+                            device=device,
+                        )
+                    )
+                    batch["sequence_contrastive_loss_weight"] = (
+                        args.sequence_contrastive_loss_weight
+                    )
+                    batch["sequence_contrastive_temperature"] = (
+                        args.sequence_contrastive_temperature
+                    )
                 if pag_set_token_ids and stage_name != "catalog":
                     batch["pag_set_loss_weight"] = args.pag_set_loss_weight
                     batch["pag_set_sparsity_weight"] = args.pag_set_sparsity_weight
@@ -5624,9 +6039,16 @@ def _run_distributed_structured_training(
                     last_metrics = _structured_global_train_metrics(components, context)
                     pag_set_weight = float(getattr(args, "pag_set_loss_weight", 0.0))
                     ripor_weight = float(getattr(args, "ripor_loss_weight", 0.0))
+                    sequence_weight = float(
+                        getattr(args, "sequence_contrastive_loss_weight", 0.0)
+                    )
                     ce_weight = stage_ce_weight
                     train_loss = ce_weight * last_metrics["ce_loss"] + (
                         ripor_weight * last_metrics["ripor_loss"] if use_ripor else 0.0
+                    ) + (
+                        sequence_weight * last_metrics["sequence_contrastive_loss"]
+                        if use_sequence_contrastive
+                        else 0.0
                     ) + pag_set_weight * last_metrics["pag_set_loss"]
                     if context.is_main:
                         print(f"{stage_name}_step={display_step} train_loss={train_loss:.6f}", flush=True)
@@ -5644,31 +6066,47 @@ def _run_distributed_structured_training(
                             "sequential_ce_weight": ce_weight,
                             "ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
                             "ripor_pairs": int(last_metrics["ripor_pairs"]) if use_ripor else 0,
+                            "sequence_contrastive_loss": (
+                                last_metrics["sequence_contrastive_loss"]
+                                if use_sequence_contrastive
+                                else None
+                            ),
+                            "sequence_contrastive_rows": (
+                                int(last_metrics["sequence_contrastive_rows"])
+                                if use_sequence_contrastive
+                                else 0
+                            ),
                             "pag_set_loss": last_metrics["pag_set_loss"] if pag_set_token_ids else None,
                             "lr": optimizer.param_groups[0]["lr"],
                         }
                         append_loss_history(loss_history_path, event)
                         log_training_event(wandb_run, event)
                 if args.save_steps > 0 and step % args.save_steps == 0 and step < total_steps:
-                    rng_states = capture_rng_states()
+                    lightweight_checkpoint = bool(
+                        getattr(args, "lightweight_checkpoints", False)
+                    )
+                    snapshot_extra = {
+                        **checkpoint_metadata,
+                        "snapshot_step": display_step,
+                        "resume_capable": not lightweight_checkpoint,
+                    }
+                    if not lightweight_checkpoint:
+                        snapshot_extra["training_state"] = {
+                            "format": "structured_ddp_resume_v1",
+                            "stage": stage_name,
+                            "completed_steps": step,
+                            "display_step": display_step,
+                            "total_steps": total_steps,
+                            "next_epoch": next_epoch,
+                            "next_batch_index": next_batch_index,
+                            "world_size": context.world_size,
+                            "per_device_batch_size": args.batch_size,
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "rng_states": capture_rng_states(),
+                        }
                     save_checkpoint(
                         args.output_dir / f"checkpoint-{display_step}",
-                        {
-                            **checkpoint_metadata,
-                            "training_state": {
-                                "format": "structured_ddp_resume_v1",
-                                "stage": stage_name,
-                                "completed_steps": step,
-                                "display_step": display_step,
-                                "total_steps": total_steps,
-                                "next_epoch": next_epoch,
-                                "next_batch_index": next_batch_index,
-                                "world_size": context.world_size,
-                                "per_device_batch_size": args.batch_size,
-                                "scheduler_state_dict": scheduler.state_dict(),
-                                "rng_states": rng_states,
-                            },
-                        },
+                        snapshot_extra,
                     )
                 if eval_rows and args.eval_steps > 0 and (step % args.eval_steps == 0 or step == total_steps):
                     dev_loss = _distributed_structured_eval_loss(
@@ -5755,9 +6193,19 @@ def _run_distributed_structured_training(
             "steps": step,
             "last_train_loss": stage_ce_weight * last_metrics["ce_loss"] + (
                 float(getattr(args, "ripor_loss_weight", 0.0)) * last_metrics["ripor_loss"] if use_ripor else 0.0
+            ) + (
+                float(getattr(args, "sequence_contrastive_loss_weight", 0.0))
+                * last_metrics["sequence_contrastive_loss"]
+                if sequence_contrastive_enabled and stage_name == "query"
+                else 0.0
             ) + float(getattr(args, "pag_set_loss_weight", 0.0)) * last_metrics["pag_set_loss"],
             "last_ce_loss": last_metrics["ce_loss"],
             "last_ripor_loss": last_metrics["ripor_loss"] if use_ripor else None,
+            "last_sequence_contrastive_loss": (
+                last_metrics["sequence_contrastive_loss"]
+                if sequence_contrastive_enabled and stage_name == "query"
+                else None
+            ),
             "best_dev_loss": best_loss,
             "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
             "epoch_metrics": epoch_metrics,
@@ -5778,6 +6226,7 @@ def _run_distributed_structured_training(
         "last_train_loss": None,
         "last_ce_loss": None,
         "last_ripor_loss": None,
+        "last_sequence_contrastive_loss": None,
         "best_dev_loss": None,
         "best_checkpoint": None,
         "epoch_metrics": [],
@@ -5799,6 +6248,9 @@ def _run_distributed_structured_training(
         "last_train_loss": query_result["last_train_loss"],
         "last_ce_loss": query_result["last_ce_loss"],
         "last_ripor_loss": query_result["last_ripor_loss"],
+        "last_sequence_contrastive_loss": query_result[
+            "last_sequence_contrastive_loss"
+        ],
     }
     active_stages = [
         ("catalog", catalog_total_steps, catalog_result, 0),
@@ -6300,12 +6752,25 @@ def _initialize_structured_training_model(
 
 
 def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
-    """Train the single-SID GR with the RIPOR prefix-ranking objective."""
+    """Train the single-SID GR with optional sequence-level ranking objectives."""
     import torch
     from transformers import AutoTokenizer
 
     context = initialize_distributed(cpu=args.cpu)
     method_setting = validate_method_setting_contract(args, pag_set_enabled=False)
+    sequence_contrastive_enabled = float(args.sequence_contrastive_loss_weight) > 0.0
+    if args.sequence_contrastive_loss_weight < 0.0:
+        raise ValueError("sequence contrastive loss weight must be non-negative")
+    if sequence_contrastive_enabled and args.sequence_contrastive_hard_negatives is None:
+        raise ValueError(
+            "sequence contrastive loss requires --sequence-contrastive-hard-negatives"
+        )
+    if args.sequence_contrastive_temperature <= 0.0:
+        raise ValueError("sequence contrastive temperature must be positive")
+    if args.sequence_contrastive_max_negatives <= 0:
+        raise ValueError("sequence contrastive max negatives must be positive")
+    if sequence_contrastive_enabled and args.ripor_loss_weight > 0.0:
+        raise ValueError("run sequence contrastive and RIPOR objectives in separate experiments")
     if args.ripor_loss_weight > 0 and args.ripor_hard_negatives is None and not args.ripor_allow_weak_teacher:
         raise ValueError(
             "RIPOR prefix ranking requires --ripor-hard-negatives with frozen teacher scores; "
@@ -6347,6 +6812,11 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     depth = sid_config["depth"]
     dedup_size = sid_config["dedup_size"]
     query_rows_source = load_jsonl(args.rows)
+    if sequence_contrastive_enabled:
+        query_rows_source = [
+            {**row, "_sequence_contrastive_row_index": row_index}
+            for row_index, row in enumerate(query_rows_source)
+        ]
     if args.dev_rows:
         query_train_rows = expand_single_sid_query_rows(query_rows_source, semantic_ids)
         query_dev_rows = expand_single_sid_query_rows(load_jsonl(args.dev_rows), semantic_ids)
@@ -6425,6 +6895,46 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),
         "initialized_from_rq_centroids": bool(init_info["ripor_codebook_initialization"]),
     }
+    sequence_contrastive_candidate_map = load_sequence_contrastive_candidates(
+        args.sequence_contrastive_hard_negatives if sequence_contrastive_enabled else None,
+        semantic_ids,
+        expected_negatives=args.sequence_contrastive_max_negatives,
+    )
+    sequence_contrastive_audit = (
+        sequence_contrastive_candidate_audit(
+            query_train_rows,
+            sequence_contrastive_candidate_map,
+            semantic_ids,
+            expected_negatives=args.sequence_contrastive_max_negatives,
+        )
+        if sequence_contrastive_enabled
+        else None
+    )
+    checkpoint_metadata["sequence_contrastive"] = {
+        "enabled": sequence_contrastive_enabled,
+        "loss_weight": float(args.sequence_contrastive_loss_weight),
+        "temperature": float(args.sequence_contrastive_temperature),
+        "max_negatives": int(args.sequence_contrastive_max_negatives),
+        "candidate_manifest": (
+            str(args.sequence_contrastive_hard_negatives)
+            if args.sequence_contrastive_hard_negatives
+            else None
+        ),
+        "candidate_manifest_sha256": (
+            file_sha256(args.sequence_contrastive_hard_negatives)
+            if sequence_contrastive_enabled
+            else None
+        ),
+        "candidate_audit": sequence_contrastive_audit,
+        "score": "sum_full_vocabulary_logprob_over_sid_and_stop",
+        "objective": "single_positive_listwise_cross_entropy",
+        "inference_dependency": "none",
+    }
+    checkpoint_metadata["checkpointing"] = {
+        "save_steps": int(args.save_steps),
+        "lightweight_periodic_and_final": bool(args.lightweight_checkpoints),
+        "resume_checkpoint": "last",
+    }
     if context.is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     barrier(context)
@@ -6453,6 +6963,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "semantic_ids_sha256": checkpoint_metadata["semantic_ids_sha256"],
             "allow_source_truncation": args.allow_source_truncation,
             "ripor": checkpoint_metadata["ripor"],
+            "sequence_contrastive": checkpoint_metadata["sequence_contrastive"],
             "query_train_length_audit": query_train_length_audit,
             "query_dev_length_audit": query_dev_length_audit,
             "catalog_length_audit": catalog_length_audit,
@@ -6494,12 +7005,16 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             if method_setting == METHOD_SETTING_RIPOR
             else "single_sid_catalog_indexing_with_official_ripor_prefix_margin_mse"
             if args.ripor_loss_weight > 0
+            else "single_sid_full_path_hard_negative_listwise_ce"
+            if sequence_contrastive_enabled
             else f"single_sid_catalog_indexing_then_{args.query_loss}"
         ),
         wandb_run=wandb_run,
         ripor_enabled=args.ripor_loss_weight > 0,
         ripor_hard_negative_map=ripor_hard_negative_map,
         ripor_teacher_score_map=ripor_teacher_score_map,
+        sequence_contrastive_enabled=sequence_contrastive_enabled,
+        sequence_contrastive_candidate_map=sequence_contrastive_candidate_map,
     )
     if context.is_main:
         write_json(
@@ -6542,6 +7057,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                 "query_dev_length_audit": query_dev_length_audit,
                 "catalog_length_audit": catalog_length_audit,
                 "ripor": checkpoint_metadata["ripor"],
+                "sequence_contrastive": checkpoint_metadata["sequence_contrastive"],
+                "checkpointing": checkpoint_metadata["checkpointing"],
                 "query_loss": args.query_loss,
                 "lr": args.lr,
                 "lr_scheduler": args.lr_scheduler,
@@ -8177,6 +8694,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-steps", type=int, default=200)
     p.add_argument("--save-steps", type=int, default=0)
     p.add_argument(
+        "--lightweight-checkpoints",
+        action="store_true",
+        help="omit optimizer/RNG state from periodic/final evaluation snapshots; last remains resume-capable",
+    )
+    p.add_argument(
         "--no-padding-distributed-sampler",
         action="store_true",
         default=False,
@@ -8261,6 +8783,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ripor-hard-negatives",
         type=Path,
         help="ranked GR/dense prediction JSONL used as a refreshable hard-negative pool",
+    )
+    p.add_argument(
+        "--sequence-contrastive-loss-weight",
+        type=float,
+        default=0.0,
+        help="listwise full-SID+STOP hard-negative loss weight; zero preserves the existing objective",
+    )
+    p.add_argument(
+        "--sequence-contrastive-temperature",
+        type=float,
+        default=1.0,
+        help="temperature applied to complete-path log-probability scores",
+    )
+    p.add_argument(
+        "--sequence-contrastive-max-negatives",
+        type=int,
+        default=10,
+        help="exact number of static hard negatives required for every single-label row",
+    )
+    p.add_argument(
+        "--sequence-contrastive-hard-negatives",
+        type=Path,
+        help="query-bound JSONL containing positive_skill_id and exact negative_skill_ids",
     )
     add_wandb_args(p)
     p.set_defaults(func=command_train_single_sid_decoder)
