@@ -16,7 +16,7 @@ Risk Tier: 2
 
 ## Commands
 
-Train: job=`tide-chenyufei03-10680-pglnl`, launch commit=`b8719de2f1baedc3a45d0fe5cc0d16e958367226`; `bash scripts/run_legacy_sequence_contrastive_hn10_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, queue=`rudder-exper`, node=`1×8 A800`.
+Train: active job=`tide-chenyufei03-10681-njpcv`, launch commit=`2a48268`; `bash scripts/run_legacy_sequence_contrastive_hn10_node_20260813.sh` inside image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, queue=`rudder-exper`, node=`1×8 A800`.
 
 Eval: the launcher first anchors `cum_002@28,400`, then evaluates periodic step=`{200,400,...,5,000}` and final step=`5,164` in parallel over all `8×A800`; each evaluation uses Official core75=`75`, beam=`50`, beam-order, CE log-prob.
 
@@ -42,3 +42,5 @@ Metrics: pending.
 Pending.
 
 首次 job=`tide-chenyufei03-10680-pglnl` 命中固定 runtime 和 GPU count=`8`，随后在输入检查阶段失败：该 pod 没有 `/dataset_rw` alias。失败发生在模型加载、锚点评测和 optimizer step=`0` 之前。v2 launcher 改用 `/mnt/cfs_algo_bj/workspace/chenyufei03/datasets` 物理 CFS 路径。
+
+v2 job=`tide-chenyufei03-10681-njpcv` 的固定 runtime 与节点测试=`6/6` 通过。训练前锚点评测精确恢复 `cum_002@28,400`：Overall R@1/R@10/R@50=`28.2571/70.0000/75.1111%`，Single R@1=`41.6667%`，Multi R@1=`21.9468%`（Official core75=`75` queries、beam=`50`、beam-order、CE log-prob）。随后启动 DDP world size=`8` 的正式训练。
