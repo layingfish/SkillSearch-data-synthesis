@@ -1994,6 +1994,78 @@ def ranked_candidates_for_row(row: dict[str, Any], candidate_map: dict[str, list
     return _unique_preserving_order(values)
 
 
+def teacher_scores_for_row(
+    row: dict[str, Any], teacher_score_map: dict[str, dict[str, float]] | None
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    if teacher_score_map:
+        for key in retrieval_row_keys(row):
+            scores.update(teacher_score_map.get(key, {}))
+    return {sid: float(score) for sid, score in scores.items() if math.isfinite(score)}
+
+
+def audit_ripor_teacher_candidates(
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    *,
+    max_negatives: int,
+    hard_negative_map: dict[str, list[str]],
+    teacher_score_map: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Audit strict frozen-teacher coverage after excluding every GT sibling."""
+    if max_negatives < 0:
+        raise ValueError(f"strict teacher candidate audit requires max_negatives >= 0, got {max_negatives}")
+    known_skill_set = set(semantic_ids)
+    count_histogram: Counter[int] = Counter()
+    missing_positive_rows = 0
+    zero_negative_rows = 0
+    for row in rows:
+        positives = ripor_positive_skill_ids(row, semantic_ids)
+        row_teacher_scores = teacher_scores_for_row(row, teacher_score_map)
+        if any(sid not in row_teacher_scores for sid in positives):
+            missing_positive_rows += 1
+        exclusion_set = ranking_excluded_skill_ids(row, known_skill_set)
+        candidates = _unique_preserving_order(
+            [
+                sid
+                for sid in ranked_candidates_for_row(row, hard_negative_map)
+                if sid in known_skill_set
+                and sid not in exclusion_set
+                and sid in row_teacher_scores
+            ]
+        )
+        sampled_count = min(len(candidates), max_negatives)
+        count_histogram[sampled_count] += 1
+        if sampled_count == 0:
+            zero_negative_rows += 1
+    audit = {
+        "rows": len(rows),
+        "requested_max_negatives": int(max_negatives),
+        "min_teacher_scored_negatives": min(count_histogram, default=0),
+        "max_teacher_scored_negatives": max(count_histogram, default=0),
+        "rows_below_requested_max": sum(
+            count for negatives, count in count_histogram.items() if negatives < max_negatives
+        ),
+        "negative_count_distribution": {
+            str(negatives): count for negatives, count in sorted(count_histogram.items())
+        },
+        "missing_positive_score_rows": missing_positive_rows,
+        "zero_negative_rows": zero_negative_rows,
+        "candidate_policy": "up_to_max_finite_frozen_teacher_scores_after_all_gt_exclusions",
+    }
+    if missing_positive_rows:
+        raise ValueError(
+            "strict prefix training is missing frozen teacher scores for positive skills; "
+            f"rows={missing_positive_rows}"
+        )
+    if max_negatives > 0 and zero_negative_rows:
+        raise ValueError(
+            "strict prefix training requires at least one frozen-teacher-scored negative; "
+            f"rows={zero_negative_rows}"
+        )
+    return audit
+
+
 def build_ripor_candidate_batch(
     rows: list[dict[str, Any]],
     semantic_ids: dict[str, list[int]],
@@ -2027,8 +2099,17 @@ def build_ripor_candidate_batch(
         [sid for positives in positives_by_row for sid in positives]
     )
     candidate_lists: list[list[str]] = []
+    teacher_scores_by_row: list[dict[str, float]] = []
     for row, positives in zip(rows, positives_by_row):
         exclusion_set = ranking_excluded_skill_ids(row, known_skill_set)
+        row_teacher_scores = teacher_scores_for_row(row, teacher_score_map)
+        if require_teacher_scores:
+            missing_positive_scores = [sid for sid in positives if sid not in row_teacher_scores]
+            if missing_positive_scores:
+                raise ValueError(
+                    "strict prefix training requires frozen teacher scores for every positive; "
+                    f"missing={missing_positive_scores}, row={row.get('index')}"
+                )
         stable_seed = int.from_bytes(
             hashlib.sha256(f"{seed}:{retrieval_row_keys(row)[0]}".encode("utf-8")).digest()[:8],
             byteorder="big",
@@ -2037,6 +2118,7 @@ def build_ripor_candidate_batch(
             sid
             for sid in ranked_candidates_for_row(row, hard_negative_map)
             if sid in semantic_ids and sid not in exclusion_set
+            and (not require_teacher_scores or sid in row_teacher_scores)
         ]
         candidate_pool = _unique_preserving_order(candidate_pool)
         if negative_sampling == "random":
@@ -2049,20 +2131,23 @@ def build_ripor_candidate_batch(
                     break
         if len(negatives) < max_negatives:
             if require_teacher_scores:
-                raise ValueError(
-                    "strict RIPOR sampling requires enough mined, teacher-scored negatives; "
-                    f"needed={max_negatives}, available={len(negatives)}, row={row.get('index')}"
-                )
-            rng = random.Random(stable_seed)
-            random_pool = [
-                sid
-                for sid in [*in_batch_positives, *known_skill_ids]
-                if sid not in exclusion_set and sid not in negatives
-            ]
-            random_pool = _unique_preserving_order(random_pool)
-            rng.shuffle(random_pool)
-            negatives.extend(random_pool[: max_negatives - len(negatives)])
+                if max_negatives > 0 and not negatives:
+                    raise ValueError(
+                        "strict prefix training requires at least one frozen-teacher-scored "
+                        f"negative; row={row.get('index')}"
+                    )
+            else:
+                rng = random.Random(stable_seed)
+                random_pool = [
+                    sid
+                    for sid in [*in_batch_positives, *known_skill_ids]
+                    if sid not in exclusion_set and sid not in negatives
+                ]
+                random_pool = _unique_preserving_order(random_pool)
+                rng.shuffle(random_pool)
+                negatives.extend(random_pool[: max_negatives - len(negatives)])
         candidate_lists.append([*positives, *negatives[:max_negatives]])
+        teacher_scores_by_row.append(row_teacher_scores)
 
     max_candidates = max(len(values) for values in candidate_lists)
     candidate_codes = torch.zeros((len(rows), max_candidates, depth), dtype=torch.long, device=device)
@@ -2072,10 +2157,7 @@ def build_ripor_candidate_batch(
     candidate_teacher_observed = torch.zeros((len(rows), max_candidates), dtype=torch.bool, device=device)
     for row_index, (positives, candidates) in enumerate(zip(positives_by_row, candidate_lists)):
         positive_set = set(positives)
-        row_teacher_scores: dict[str, float] = {}
-        if teacher_score_map:
-            for key in retrieval_row_keys(rows[row_index]):
-                row_teacher_scores.update(teacher_score_map.get(key, {}))
+        row_teacher_scores = teacher_scores_by_row[row_index]
         known_scores = [score for sid, score in row_teacher_scores.items() if sid in candidates and math.isfinite(score)]
         positive_fallback = max(known_scores, default=0.0) + 1.0
         negative_fallback = min(known_scores, default=0.0) - 1.0
@@ -7469,6 +7551,25 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         load_jsonl(args.skills_jsonl), semantic_ids, args.catalog_input_prefix
     )
     random.Random(args.seed).shuffle(catalog_rows)
+    prefix_training_enabled = bool(
+        args.ripor_loss_weight > 0 or prefix_distill_enabled or pro_geometry_enabled
+    )
+    ripor_hard_negative_map, ripor_teacher_score_map = load_ranked_skill_candidates_with_scores(
+        args.ripor_hard_negatives
+    )
+    ripor_candidate_audit = (
+        audit_ripor_teacher_candidates(
+            query_train_rows,
+            semantic_ids,
+            max_negatives=args.ripor_max_negatives,
+            hard_negative_map=ripor_hard_negative_map,
+            teacher_score_map=ripor_teacher_score_map,
+        )
+        if prefix_training_enabled and not args.ripor_allow_weak_teacher
+        else None
+    )
+    if context.is_main and ripor_candidate_audit is not None:
+        print(json.dumps({"ripor_teacher_candidate_audit": ripor_candidate_audit}, sort_keys=True))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     args.pag_set_vocab_size = 0
@@ -7531,6 +7632,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         "control_score": "excluded",
         "teacher_score_fallback": "explicit_weak_ablation_only",
         "strict_teacher_scores": not args.ripor_allow_weak_teacher,
+        "candidate_audit": ripor_candidate_audit,
         "relevance_m0_checkpoint": str(args.ripor_relevance_checkpoint) if args.ripor_relevance_checkpoint else None,
         "rq_codebook_embeddings": str(args.ripor_codebook_embeddings) if args.ripor_codebook_embeddings else None,
         "initialized_from_relevance_m0": bool(init_info["ripor_relevance_initialization"]),
@@ -7552,6 +7654,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             if prefix_distill_enabled and args.ripor_hard_negatives
             else None
         ),
+        "candidate_audit": ripor_candidate_audit,
     }
     checkpoint_metadata["pro_fusion"] = {
         "compatible": bool(
@@ -7665,9 +7768,6 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             **init_info,
         },
     ) if context.is_main else None
-    ripor_hard_negative_map, ripor_teacher_score_map = load_ranked_skill_candidates_with_scores(
-        args.ripor_hard_negatives
-    )
     result = _run_distributed_structured_training(
         args=args,
         model=model,
@@ -7697,9 +7797,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             else f"single_sid_catalog_indexing_then_{args.query_loss}"
         ),
         wandb_run=wandb_run,
-        ripor_enabled=(
-            args.ripor_loss_weight > 0 or prefix_distill_enabled or pro_geometry_enabled
-        ),
+        ripor_enabled=prefix_training_enabled,
         ripor_hard_negative_map=ripor_hard_negative_map,
         ripor_teacher_score_map=ripor_teacher_score_map,
         sequence_contrastive_enabled=sequence_contrastive_enabled,

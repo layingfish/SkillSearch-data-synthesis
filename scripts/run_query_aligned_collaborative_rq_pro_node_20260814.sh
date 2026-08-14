@@ -4,8 +4,8 @@ set -euo pipefail
 bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 STAGE="${1:-}"
-if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight ]]; then
-  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight}" >&2
+if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder ]]; then
+  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder}" >&2
   exit 2
 fi
 
@@ -31,6 +31,8 @@ elif [[ "${STAGE}" == resume-rq-preflight ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_recovery_preflight_v2
 elif [[ "${STAGE}" == resume-rq ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2
+elif [[ "${STAGE}" == resume-decoder ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3
 else
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1
 fi
@@ -164,6 +166,8 @@ PYTHONPATH="${CODE_ROOT}/tests:${CODE_ROOT}/scripts:${PYTHONPATH}" CUDA_VISIBLE_
   test_skill_gr_pipeline.SkillGRPipelineTest.test_frozen_pro_query_vector_reproduces_m0_decoder_start_pooling \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_fusion_zero_weight_preserves_beam_scores_and_order \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_prefix_distribution_distillation_aggregates_teacher_mass_by_parent \
+  test_skill_gr_pipeline.SkillGRPipelineTest.test_strict_ripor_candidate_batch_uses_all_available_scored_negatives_up_to_max \
+  test_skill_gr_pipeline.SkillGRPipelineTest.test_ripor_teacher_candidate_audit_records_variable_strict_coverage \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_sequence_contrastive_zero_weight_preserves_forward_exactly -v
 
 run_torch() {
@@ -234,7 +238,7 @@ elif [[ "${STAGE}" == resume-rq-preflight ]]; then
   DECODER_SAVE_STEPS=0
 fi
 
-if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight ]]; then
+if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder ]]; then
   M0_ROOT="${SKILLGR_QUERY_ALIGNED_M0_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/m0}"
   if [[ "${M0_ROOT}" != /models_rw/* ]]; then
     echo "resume M0 root must be under /models_rw: ${M0_ROOT}" >&2
@@ -273,33 +277,46 @@ for required in relevance_encoder.pt skill_embeddings.pt query_embeddings.pt; do
   fi
 done
 
-RQ_ROOT="${OUTPUT_ROOT}/rq"
-run_torch "${RQ_TRAINER}" \
-  --relevance-embeddings "${M0_ROOT}/skill_embeddings.pt" \
-  --semantic-embeddings "${SEMANTIC_EMBEDDINGS}" \
-  --cf-embeddings "${CF_EMBEDDINGS}" \
-  --cf-skill-ids "${CF_SKILL_IDS}" \
-  --query-embeddings "${M0_ROOT}/query_embeddings.pt" \
-  --rows "${ACTIVE_ROWS}" \
-  --hard-negatives "${TEACHER_PANEL}" \
-  --output-dir "${RQ_ROOT}" \
-  --depth 4 \
-  --codebook-size 256 \
-  --kmeans-iters "${RQ_KMEANS_ITERS}" \
-  --batch-size 512 \
-  --query-batch-size 8 \
-  --max-candidates "${RQ_MAX_CANDIDATES}" \
-  --epochs "${RQ_EPOCHS}" \
-  --max-steps "${RQ_STEPS}" \
-  --lr 1e-3 \
-  --weight-decay 1e-4 \
-  --semantic-weight 0.01 \
-  --cf-weight 0.01 \
-  --prefix-weight 0.1 \
-  --teacher-temperature 0.05 \
-  --student-temperature 1.0 \
-  --logging-steps 25 \
-  --seed 20260814
+if [[ "${STAGE}" == resume-decoder ]]; then
+  RQ_ROOT="${SKILLGR_QUERY_ALIGNED_RQ_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq}"
+  if [[ "${RQ_ROOT}" != /models_rw/* ]]; then
+    echo "resume RQ root must be under /models_rw: ${RQ_ROOT}" >&2
+    exit 1
+  fi
+  check_sha256 "${RQ_ROOT}/rqvae.pt" 14b23af2101a1c4aa38416d6d984a1f8f3ab683ffceb2cab3c9b4cdac3ad875c
+  check_sha256 "${RQ_ROOT}/codebook_embeddings.pt" d6eb64f9d888f40db2334f53906fd5b19dc035cc82b4af4d935fe2cd895fa0a3
+  check_sha256 "${RQ_ROOT}/semantic_ids.jsonl" 8c0e95b30940669b3e74271e6a6d667036568a0b998a5069be49cab4ee96a451
+  check_sha256 "${RQ_ROOT}/rqvae_manifest.json" eda8b99dbeeb9e35e94c4aa49d9bedef240c35579735ca81b3bf6ae54d0e0828
+  echo "reusing verified RQ root: ${RQ_ROOT}"
+else
+  RQ_ROOT="${OUTPUT_ROOT}/rq"
+  run_torch "${RQ_TRAINER}" \
+    --relevance-embeddings "${M0_ROOT}/skill_embeddings.pt" \
+    --semantic-embeddings "${SEMANTIC_EMBEDDINGS}" \
+    --cf-embeddings "${CF_EMBEDDINGS}" \
+    --cf-skill-ids "${CF_SKILL_IDS}" \
+    --query-embeddings "${M0_ROOT}/query_embeddings.pt" \
+    --rows "${ACTIVE_ROWS}" \
+    --hard-negatives "${TEACHER_PANEL}" \
+    --output-dir "${RQ_ROOT}" \
+    --depth 4 \
+    --codebook-size 256 \
+    --kmeans-iters "${RQ_KMEANS_ITERS}" \
+    --batch-size 512 \
+    --query-batch-size 8 \
+    --max-candidates "${RQ_MAX_CANDIDATES}" \
+    --epochs "${RQ_EPOCHS}" \
+    --max-steps "${RQ_STEPS}" \
+    --lr 1e-3 \
+    --weight-decay 1e-4 \
+    --semantic-weight 0.01 \
+    --cf-weight 0.01 \
+    --prefix-weight 0.1 \
+    --teacher-temperature 0.05 \
+    --student-temperature 1.0 \
+    --logging-steps 25 \
+    --seed 20260814
+fi
 
 for required in codebook_embeddings.pt semantic_ids.jsonl rqvae_manifest.json; do
   if [[ ! -f "${RQ_ROOT}/${required}" ]]; then

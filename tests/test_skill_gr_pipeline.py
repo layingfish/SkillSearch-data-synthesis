@@ -31,6 +31,7 @@ from skill_gr_pipeline import (  # noqa: E402
     SEMANTIC_ID_MODE_LEARNED,
     advance_structured_beam,
     append_loss_history,
+    audit_ripor_teacher_candidates,
     audit_source_token_lengths,
     allowed_next_tokens_for_skill_trie,
     build_decoder_target,
@@ -1356,6 +1357,93 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(batch["ripor_candidate_positive"].tolist()[0], [True, False])
         self.assertAlmostEqual(float(batch["ripor_candidate_teacher_scores"][0, 0]), 0.8, places=5)
         self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 2, 2))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_strict_ripor_candidate_batch_uses_all_available_scored_negatives_up_to_max(self) -> None:
+        import torch
+
+        semantic_ids = {
+            "skill/a": [1, 1],
+            "skill/b": [2, 2],
+            "skill/c": [3, 3],
+            "skill/d": [4, 4],
+        }
+        row = {"index": "query-1", "selected_skill_ids": ["skill/a"]}
+        candidates = {"index:query-1": ["skill/b", "skill/c", "skill/d"]}
+        scores = {
+            "index:query-1": {
+                "skill/a": 1.0,
+                "skill/b": 0.3,
+                "skill/c": 0.2,
+            }
+        }
+
+        batch = build_ripor_candidate_batch(
+            [row],
+            semantic_ids,
+            depth=2,
+            max_negatives=3,
+            hard_negative_map=candidates,
+            teacher_score_map=scores,
+            seed=7,
+            device=torch.device("cpu"),
+            require_teacher_scores=True,
+        )
+
+        self.assertEqual(tuple(batch["ripor_candidate_codes"].shape), (1, 3, 2))
+        self.assertEqual(batch["ripor_candidate_valid"].tolist(), [[True, True, True]])
+        self.assertEqual(batch["ripor_candidate_teacher_observed"].tolist(), [[True, True, True]])
+        sampled_codes = [tuple(values) for values in batch["ripor_candidate_codes"][0].tolist()]
+        self.assertEqual(sampled_codes, [(1, 1), (2, 2), (3, 3)])
+
+    def test_ripor_teacher_candidate_audit_records_variable_strict_coverage(self) -> None:
+        semantic_ids = {
+            "skill/a": [1, 1],
+            "skill/b": [2, 2],
+            "skill/c": [3, 3],
+            "skill/d": [4, 4],
+        }
+        rows = [
+            {
+                "index": "query-1",
+                "selected_skill_ids": ["skill/a"],
+                "source_selected_skill_ids": ["skill/a", "skill/b"],
+            },
+            {"index": "query-2", "selected_skill_ids": ["skill/a"]},
+        ]
+        candidates = {
+            "index:query-1": ["skill/b", "skill/c", "skill/d"],
+            "index:query-2": ["skill/b", "skill/c", "skill/d"],
+        }
+        scores = {
+            "index:query-1": {
+                "skill/a": 1.0,
+                "skill/b": 0.9,
+                "skill/c": 0.2,
+                "skill/d": 0.1,
+            },
+            "index:query-2": {
+                "skill/a": 1.0,
+                "skill/b": 0.3,
+                "skill/c": 0.2,
+                "skill/d": 0.1,
+            },
+        }
+
+        audit = audit_ripor_teacher_candidates(
+            rows,
+            semantic_ids,
+            max_negatives=3,
+            hard_negative_map=candidates,
+            teacher_score_map=scores,
+        )
+
+        self.assertEqual(audit["min_teacher_scored_negatives"], 2)
+        self.assertEqual(audit["max_teacher_scored_negatives"], 3)
+        self.assertEqual(audit["rows_below_requested_max"], 1)
+        self.assertEqual(audit["negative_count_distribution"], {"2": 1, "3": 1})
+        self.assertEqual(audit["missing_positive_score_rows"], 0)
+        self.assertEqual(audit["zero_negative_rows"], 0)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_ripor_random_negative_sampling_changes_across_presentations(self) -> None:
