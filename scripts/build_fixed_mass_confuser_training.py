@@ -43,6 +43,10 @@ except ModuleNotFoundError:  # pragma: no cover - package-style test import
 SCHEDULE_VERSION = "fixed_mass_two_cycle_confuser_v1_20260814"
 
 
+def scalar_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def query_digest(row: dict[str, Any]) -> str:
     query = str(row.get("query") or row.get("query_text") or "")
     if not query:
@@ -67,8 +71,8 @@ def bind_candidates_to_source_indices(
         if not 0 <= row_index < len(source_rows):
             raise ValueError(f"candidate row index is out of range: {row_index}")
         row = source_rows[row_index]
-        source_index = str(row.get("source_index") or row.get("index") or "")
-        payload_index = str(row.get("index") or "")
+        payload_index = scalar_text(row.get("index"))
+        source_index = scalar_text(row.get("source_index")) or payload_index
         positive = selected_single_skill(row)
         negatives = [str(value) for value in candidate.get("negative_skill_ids", []) or []]
         if str(candidate.get("positive_skill_id") or "") != positive:
@@ -284,7 +288,7 @@ def build_fixed_mass_training(
         positive = selected_single_skill(row)
         if positive not in catalog_set:
             raise ValueError(f"single row has unknown positive: index={row.get('index')} positive={positive}")
-        index = str(row.get("index") or "")
+        index = scalar_text(row.get("index"))
         owner = task5_source_skill(index)
         if owner is not None:
             if owner == positive:
@@ -300,7 +304,7 @@ def build_fixed_mass_training(
     contrastive_by_skill: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in new_rows:
         positive = selected_single_skill(row)
-        index = str(row.get("index") or "")
+        index = scalar_text(row.get("index"))
         if positive not in target_set or not index.startswith(CONTRASTIVE_PREFIX):
             raise ValueError(f"invalid new contrastive row: index={index} positive={positive}")
         pseudo = row.get("pseudo_query") or {}
@@ -350,7 +354,7 @@ def build_fixed_mass_training(
     target_new_exposures: Counter[str] = Counter()
 
     def append_bound_row(row: dict[str, Any], cycle: int, source_kind: str) -> None:
-        original_index = str(row.get("index") or "")
+        original_index = scalar_text(row.get("index"))
         positive = selected_single_skill(row)
         if positive is None:
             raise ValueError(f"fixed-mass row is not single-target: {original_index}")
@@ -412,7 +416,7 @@ def build_fixed_mass_training(
             append_bound_row(row, cycle, "original")
         for sid in catalog_ids:
             for row in skill_cycles[sid][cycle]:
-                index = str(row.get("index") or "")
+                index = scalar_text(row.get("index"))
                 source_kind = (
                     "contrastive"
                     if index.startswith(CONTRASTIVE_PREFIX)

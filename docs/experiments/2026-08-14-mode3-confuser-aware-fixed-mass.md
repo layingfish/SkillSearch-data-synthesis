@@ -20,7 +20,7 @@ Mine: job=`tide-chenyufei03-10706-ldvau`; `CONFUSER_MINING_LAUNCH_COMMIT=9395ec4
 
 Generate: GPT-4o through the Huayan profile, workers=`8`, temperature=`0.7`, top_p=`0.9`, max_tokens=`512`, target/confuser body limits=`2,200/1,200` characters, output query limit=`1,500` characters, maximum attempts=`3` per pair. Full output: `/dataset_rw/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/generation_gpt4o_top1_v1`.
 
-Train: `FIXED_MASS_MANIFEST_SHA256=<audited hash> CONFUSER_FIXED_MASS_LAUNCH_COMMIT=<commit> bash scripts/run_confuser_fixed_mass_training_node_20260814.sh`; submission waits for full generation and fixed-mass materialization.
+Train: `FIXED_MASS_MANIFEST_SHA256=52963a94b4d8d3b2805f9524b9dccdb4fa9d6b60e9a552f48d943e6a3a67d867 CONFUSER_FIXED_MASS_LAUNCH_COMMIT=<commit> bash scripts/run_confuser_fixed_mass_training_node_20260814.sh` on one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`.
 
 Eval: Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob; checkpoint selection uses this requested test protocol.
 
@@ -36,7 +36,7 @@ Metrics: pending.
 
 - [x] Minimal local check (`6/6` focused unit tests across generation, fixed-mass construction, and checkpoint selection; Python compile, Ruff, shell syntax)
 - [x] Every mining row is one of the expected `13,776 = 1,722 × 8` target pseudo rows
-- [ ] Every generated row has one known target and one distinct known confuser
+- [x] All `5,166` generated rows have one known target, one distinct known confuser, unique pair closure, and unique query text
 - [x] Official rows are absent from mining and synthesis inputs; target selection reads training co-occurrence only
 - [x] Fixed-mass builder test verifies exactly `5` pseudo rows per catalog skill in each of the two materialized exposure cycles
 - [x] Reviewer required? no; local semantic review verifies row/candidate SHA binding, exact per-cycle skill mass, optimizer-step closure, cum_082 initialization, and Official checkpoint selection
@@ -55,4 +55,10 @@ The initial launcher omitted `--with-dataset-rw`; the lightweight pair output th
 
 Fixed-mass pre-audit: all `14,551` canonical skills have exactly `5` canonical-owner task5 rows. The historical single-row file also contains `2,030` original single queries and `2,670` alias-derived task5 rows that would duplicate canonical supervision. The planned two-cycle materialization contains `149,570 = 2 × (2,030 + 14,551 × 5)` rows; each canonical skill contributes exactly `10` pseudo exposures over both cycles.
 
-Generation smoke completed for the first `6` pairs (the first `2` target skills × `3` confusers) with `6/6` complete responses and no retries under the generation settings above. Query lengths were `1,011–1,372` characters. Full `5,166`-pair generation is running with resumable JSONL checkpoints on CFS.
+Generation smoke completed for the first `6` pairs (the first `2` target skills × `3` confusers) with `6/6` complete responses and no retries under the generation settings above. Query lengths were `1,011–1,372` characters.
+
+Full generation completed with `5,166/5,166` selected rows and no unresolved failures. The first quality audit found `5` rows outside the required task layout; targeted retries regenerated only those work keys, with one key requiring a second retry. Final generation records=`5,172`, selected rows=`5,166`, unique pairs=`5,166`, unique query texts=`5,166`, layout failures=`0`, and query length=`431–1,499` characters (mean=`1,075.46`). Selected rows SHA-256=`9eec6f7374f98bb0b9b9f96ca184d4649aca0eac82bb431be0d1629a0236b3c0`; generation manifest SHA-256=`946be99e8a37b342722559ccdec48432c5170ece3dbc78233c176bf730e144ef`.
+
+The fixed-mass builder initially rejected historical row `index=0` because integer zero was normalized as an empty string. The index coercion was corrected and covered by the focused test. No partial output directory existed after the failed local audit.
+
+Fixed-mass materialization completed with exactly `149,570` training rows and `149,570` query-bound candidate rows. Each exposure cycle contains `74,785` rows; each catalog skill contributes exactly `5` pseudo views per cycle; each target receives exactly `3` contrastive views across both cycles. Training rows SHA-256=`a7c11865ca5c96c8892204d84d7dc39dea5c00a5a2e9fffc33ef062f6b04938f`; candidates SHA-256=`0d66a21587b2871b89775209c9090e423bfd7b8023df8bf6ce06f21c81e35ffb`; manifest SHA-256=`52963a94b4d8d3b2805f9524b9dccdb4fa9d6b60e9a552f48d943e6a3a67d867`.

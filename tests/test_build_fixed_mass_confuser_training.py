@@ -33,7 +33,7 @@ class FixedMassConfuserTrainingTest(unittest.TestCase):
             write_jsonl(root / "targets.jsonl", [{"skill_id": target}])
             single_rows: list[dict] = [
                 {
-                    "index": "original-a",
+                    "index": 0,
                     "query": "original target query",
                     "selected_skill_ids": [target],
                     "positive_skill_id": target,

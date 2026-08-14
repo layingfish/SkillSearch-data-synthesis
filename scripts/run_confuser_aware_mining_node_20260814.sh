@@ -34,7 +34,7 @@ PIPELINE_SHA256=5ee736cddebca4a7e7251d95e85bcdfbaeede3a6d60f78696481c64a81a66f59
 MINER="${CODE_ROOT}/scripts/prepare_gr_self_mined_hard_negatives.py"
 MINER_SHA256=05d1698619bea860fd344929a398cddd482e0e310332da32cdf71b742ce9a924
 BUILDER="${CODE_ROOT}/scripts/build_confuser_aware_queries.py"
-BUILDER_SHA256=6d0123af9935a877b3a6136258058bffc3e7271f9dc62135bdd37d51484195bd
+BUILDER_SHA256=bc229be235487d8e5641cb9efd044c38529a7c0f65a1d1130c21fa745f0f3c24
 
 DATA_ROOT=/mnt/cfs_algo_bj/workspace/chenyufei03/datasets/SkillSearch-data-synthesis
 MINING_ROWS="${DATA_ROOT}/processed/confuser_aware_mode4_20260814_v1/mining_input/mining_rows.jsonl"

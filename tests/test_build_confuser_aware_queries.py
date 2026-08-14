@@ -8,6 +8,7 @@ from pathlib import Path
 from scripts.build_confuser_aware_queries import (
     aggregate_confusers,
     build_contrastive_messages,
+    load_forced_retry_keys,
     materialize_generation,
     prepare_mining_rows,
 )
@@ -22,6 +23,26 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class ConfuserAwareQueriesTest(unittest.TestCase):
+    def test_forced_retry_keys_are_unique_and_inside_pair_closure(self) -> None:
+        pairs = [
+            {
+                "target_skill_id": "skill/target",
+                "confuser_skill_id": "skill/confuser",
+                "confuser_rank": 1,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            retry = root / "retry.txt"
+            retry.write_text("skill/target\tskill/confuser\n", encoding="utf-8")
+            self.assertEqual(
+                load_forced_retry_keys(retry, pairs),
+                {"skill/target\tskill/confuser"},
+            )
+            retry.write_text("skill/target\tskill/unknown\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outside the pair closure"):
+                load_forced_retry_keys(retry, pairs)
+
     def test_prepare_mining_keeps_canonical_five_and_three_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

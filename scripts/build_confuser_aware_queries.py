@@ -538,6 +538,19 @@ def latest_records(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return latest
 
 
+def load_forced_retry_keys(path: Path | None, pairs: list[dict[str, Any]]) -> set[str]:
+    if path is None:
+        return set()
+    keys = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"forced retry work keys are not unique: {path}")
+    known = {contrastive_work_key(pair) for pair in pairs}
+    unknown = sorted(set(keys) - known)
+    if unknown:
+        raise ValueError(f"forced retry work keys are outside the pair closure: {unknown[:5]}")
+    return set(keys)
+
+
 def materialize_generation(
     *,
     output_dir: Path,
@@ -725,15 +738,30 @@ def command_generate(args: argparse.Namespace) -> None:
     records = load_jsonl(records_path) if records_path.exists() else []
     latest = latest_records(records)
     attempts = Counter(str(record.get("work_key") or "") for record in records)
+    forced_retry_keys = load_forced_retry_keys(args.force_retry_work_keys, pairs)
+    exhausted_forced = sorted(key for key in forced_retry_keys if attempts[key] >= args.max_attempts)
+    if exhausted_forced:
+        raise SystemExit(
+            "forced retry keys have exhausted --max-attempts; increase the limit: "
+            f"{exhausted_forced[:5]}"
+        )
+    forced_retry_attempt_floor = {key: attempts[key] + 1 for key in forced_retry_keys}
+
+    def needs_generation(pair: dict[str, Any]) -> bool:
+        key = contrastive_work_key(pair)
+        status_incomplete = str((latest.get(key) or {}).get("status") or "") != "complete"
+        forced_attempt_pending = attempts[key] < forced_retry_attempt_floor.get(key, 0)
+        return (status_incomplete or forced_attempt_pending) and attempts[key] < args.max_attempts
+
     pending = [
         pair
         for pair in pairs
-        if str((latest.get(contrastive_work_key(pair)) or {}).get("status") or "") != "complete"
-        and attempts[contrastive_work_key(pair)] < args.max_attempts
+        if needs_generation(pair)
     ]
     print(
         f"confuser generation pairs={len(pairs)} pending={len(pending)} "
-        f"complete={len(pairs) - len(pending)} workers={args.workers}",
+        f"complete={len(pairs) - len(pending)} forced_retry={len(forced_retry_keys)} "
+        f"workers={args.workers}",
         flush=True,
     )
     write_lock = threading.Lock()
@@ -794,8 +822,7 @@ def command_generate(args: argparse.Namespace) -> None:
         pending = [
             pair
             for pair in pairs
-            if str((latest.get(contrastive_work_key(pair)) or {}).get("status") or "") != "complete"
-            and attempts[contrastive_work_key(pair)] < args.max_attempts
+            if needs_generation(pair)
         ]
         if pending:
             print(f"retry_round={attempt_round + 1} pending={len(pending)}", flush=True)
@@ -866,6 +893,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     generate.add_argument("--workers", type=int, default=8)
     generate.add_argument("--progress-every", type=int, default=25)
     generate.add_argument("--max-attempts", type=int, default=3)
+    generate.add_argument(
+        "--force-retry-work-keys",
+        type=Path,
+        help="newline-delimited target<TAB>confuser work keys to regenerate once in this invocation",
+    )
     generate.add_argument("--require-complete", action=argparse.BooleanOptionalAction, default=True)
     generate.set_defaults(func=command_generate)
     return parser
