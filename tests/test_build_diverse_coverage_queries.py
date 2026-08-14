@@ -11,6 +11,7 @@ from scripts.build_diverse_coverage_queries import (
     build_generation_record,
     collect_existing_views,
     materialize,
+    normalize_coverage_query_layout,
 )
 
 
@@ -101,6 +102,11 @@ class DiverseCoverageQueriesTest(unittest.TestCase):
         for mode in COVERAGE_MODES:
             self.assertIn(f"`{mode}`", prompt)
         self.assertIn("Existing view 8: existing query 7", prompt)
+
+    def test_layout_normalizer_inserts_marker_before_adjacent_numbered_list(self) -> None:
+        query = "A concrete input must be processed into a verified output.\n1. Inspect the input.\n2. Save the output."
+        normalized = normalize_coverage_query_layout(query, "artifact_pipeline")
+        self.assertIn("\n\nYou need to:\n1. Inspect the input.", normalized)
 
     def test_generation_record_and_materialization_have_exact_mode_closure(self) -> None:
         target = "skill/a"

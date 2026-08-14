@@ -56,7 +56,7 @@ MODE3_PREFIX = "pseudo:zero_multi_mode:"
 COVERAGE_PREFIX = "pseudo:diverse_coverage:"
 COVERAGE_SOURCE = "training_gr_diverse_coverage_pseudo_query"
 PROMPT_VERSION = "gr_diverse_coverage_v1_20260814"
-MATERIALIZATION_VERSION = "diverse_coverage_layout_v1_20260814"
+MATERIALIZATION_VERSION = "diverse_coverage_layout_v2_20260814"
 SELECTION_BASIS = "zero_multi_training_query_coverage"
 QUERY_INSTRUCTION = (
     "Instruct: Given a task description, retrieve the most relevant skill document "
@@ -297,6 +297,20 @@ def parse_mode_queries(text: str) -> list[dict[str, str]]:
     return parsed
 
 
+def normalize_coverage_query_layout(query: str, mode: str) -> str:
+    if mode == "terse_natural":
+        return query.strip()
+    normalized = normalize_task_spec_layout(query)
+    if "you need to:" not in normalized.lower():
+        first_item = re.search(r"(?m)^\s*1[.)]\s+", normalized)
+        if first_item is not None:
+            normalized = (
+                f"{normalized[: first_item.start()].rstrip()}\n\nYou need to:\n"
+                f"{normalized[first_item.start() :].lstrip()}"
+            )
+    return normalize_task_spec_layout(normalized)
+
+
 def build_generation_record(
     *,
     target: str,
@@ -323,9 +337,7 @@ def build_generation_record(
     seen_texts: set[str] = set()
     for item in parsed:
         mode = item["mode"]
-        query = item["query"]
-        if mode != "terse_natural":
-            query = normalize_task_spec_layout(query)
+        query = normalize_coverage_query_layout(item["query"], mode)
         sanitized, sanitizations = sanitize_skill_references(query, skill)
         query = canonicalize_query(sanitized, max_query_chars)
         item_reasons: list[str] = []
