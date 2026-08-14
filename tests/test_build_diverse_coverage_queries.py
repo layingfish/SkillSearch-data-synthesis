@@ -104,9 +104,10 @@ class DiverseCoverageQueriesTest(unittest.TestCase):
         self.assertIn("Existing view 8: existing query 7", prompt)
 
     def test_layout_normalizer_inserts_marker_before_adjacent_numbered_list(self) -> None:
-        query = "A concrete input must be processed into a verified output.\n1. Inspect the input.\n2. Save the output."
+        query = "A concrete input must be processed into a verified output. To complete it: 1. Inspect the input. 2. Save the output."
         normalized = normalize_coverage_query_layout(query, "artifact_pipeline")
         self.assertIn("\n\nYou need to:\n1. Inspect the input.", normalized)
+        self.assertIn("\n2. Save the output.", normalized)
 
     def test_generation_record_and_materialization_have_exact_mode_closure(self) -> None:
         target = "skill/a"

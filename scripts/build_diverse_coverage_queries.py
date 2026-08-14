@@ -302,7 +302,7 @@ def normalize_coverage_query_layout(query: str, mode: str) -> str:
         return query.strip()
     normalized = normalize_task_spec_layout(query)
     if "you need to:" not in normalized.lower():
-        first_item = re.search(r"(?m)^\s*1[.)]\s+", normalized)
+        first_item = re.search(r"(?<!\S)1[.)]\s+", normalized)
         if first_item is not None:
             normalized = (
                 f"{normalized[: first_item.start()].rstrip()}\n\nYou need to:\n"
