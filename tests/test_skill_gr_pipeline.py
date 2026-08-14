@@ -200,6 +200,42 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertTrue(torch.allclose(scores, expected))
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_pro_residual_geometry_normalizes_over_full_codebook_before_legal_selection(self) -> None:
+        import torch
+
+        codebooks = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]],
+                [[0.5, 0.0], [0.0, 0.5], [0.5, 0.5], [-0.5, 0.25]],
+            ]
+        )
+        query = torch.tensor([2.0, 1.0])
+
+        scores = pro_residual_geometry_scores(
+            query,
+            codebooks,
+            current_prefix=[0],
+            target_level=1,
+            allowed_values=[2, 0],
+            normalize_bias=True,
+        )
+
+        residual = query - codebooks[0, 0]
+        full_bias = 2.0 * (codebooks[1] @ residual) - codebooks[1].square().sum(dim=-1)
+        normalized = (full_bias - full_bias.mean()) / full_bias.std(unbiased=False).clamp_min(1e-6)
+        self.assertTrue(torch.allclose(scores, normalized[[2, 0]]))
+
+        constant_scores = pro_residual_geometry_scores(
+            torch.zeros(2),
+            torch.zeros(1, 4, 2),
+            current_prefix=[],
+            target_level=0,
+            allowed_values=[3, 1],
+            normalize_bias=True,
+        )
+        self.assertTrue(torch.equal(constant_scores, torch.zeros(2)))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_frozen_pro_query_vector_reproduces_m0_decoder_start_pooling(self) -> None:
         import torch
 

@@ -4,8 +4,8 @@ set -euo pipefail
 bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 STAGE="${1:-}"
-if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder && "${STAGE}" != resume-eval ]]; then
-  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder|resume-eval}" >&2
+if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder && "${STAGE}" != resume-eval && "${STAGE}" != resume-eval-normalized ]]; then
+  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder|resume-eval|resume-eval-normalized}" >&2
   exit 2
 fi
 
@@ -35,6 +35,8 @@ elif [[ "${STAGE}" == resume-decoder ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3
 elif [[ "${STAGE}" == resume-eval ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4
+elif [[ "${STAGE}" == resume-eval-normalized ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v5
 else
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1
 fi
@@ -165,6 +167,7 @@ PYTHONPATH="${CODE_ROOT}/tests:${CODE_ROOT}/scripts:${PYTHONPATH}" CUDA_VISIBLE_
   "${PYTHON_BIN}" -m unittest \
   test_query_aligned_rq \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_residual_geometry_matches_closed_form_and_legal_order \
+  test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_residual_geometry_normalizes_over_full_codebook_before_legal_selection \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_frozen_pro_query_vector_reproduces_m0_decoder_start_pooling \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_fusion_zero_weight_preserves_beam_scores_and_order \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_model_config_provenance_allows_only_local_load_path_difference \
@@ -242,7 +245,7 @@ elif [[ "${STAGE}" == resume-rq-preflight ]]; then
   DECODER_SAVE_STEPS=0
 fi
 
-if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval ]]; then
+if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
   M0_ROOT="${SKILLGR_QUERY_ALIGNED_M0_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/m0}"
   if [[ "${M0_ROOT}" != /models_rw/* ]]; then
     echo "resume M0 root must be under /models_rw: ${M0_ROOT}" >&2
@@ -281,7 +284,7 @@ for required in relevance_encoder.pt skill_embeddings.pt query_embeddings.pt; do
   fi
 done
 
-if [[ "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval ]]; then
+if [[ "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
   RQ_ROOT="${SKILLGR_QUERY_ALIGNED_RQ_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq}"
   if [[ "${RQ_ROOT}" != /models_rw/* ]]; then
     echo "resume RQ root must be under /models_rw: ${RQ_ROOT}" >&2
@@ -329,7 +332,7 @@ for required in codebook_embeddings.pt semantic_ids.jsonl rqvae_manifest.json; d
   fi
 done
 
-if [[ "${STAGE}" == resume-eval ]]; then
+if [[ "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
   DECODER_ROOT="${SKILLGR_QUERY_ALIGNED_DECODER_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder}"
   if [[ "${DECODER_ROOT}" != /models_rw/* ]]; then
     echo "resume decoder root must be under /models_rw: ${DECODER_ROOT}" >&2
@@ -397,6 +400,22 @@ if [[ ! -f "${DECODER_ROOT}/final/structured_decoder.pt" ]]; then
   exit 1
 fi
 
+BASELINE_SELECTION_PATH=""
+PRO_FUSION_ARGS=(--pro-fusion-normalize-bias)
+if [[ "${STAGE}" == resume-eval ]]; then
+  PRO_FUSION_ARGS=()
+fi
+if [[ "${STAGE}" == resume-eval-normalized ]]; then
+  RAW_EVAL_ROOT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4
+  BASELINE_SELECTION_PATH="${RAW_EVAL_ROOT}/selected/selection.json"
+  if [[ ! -f "${RAW_EVAL_ROOT}/COMPLETED" ]]; then
+    echo "raw fusion evaluation is not marked complete: ${RAW_EVAL_ROOT}" >&2
+    exit 1
+  fi
+  check_sha256 "${BASELINE_SELECTION_PATH}" 27c4f0e858fb6da421505a4a7d8a8df28937ff66415cba04c200b9017e13c2a2
+  echo "reusing verified omega=0 records: ${BASELINE_SELECTION_PATH}"
+fi
+
 if [[ "${STAGE}" == resume-rq-preflight ]]; then
   touch "${OUTPUT_ROOT}/PASSED"
   exit 0
@@ -413,7 +432,8 @@ if [[ "${STAGE}" == preflight ]]; then
     --k-values "${EVAL_K_VALUES}" \
     --decoder-head ce \
     --score-transform logprob \
-    --pro-fusion-weight 10
+    --pro-fusion-weight 10 \
+    "${PRO_FUSION_ARGS[@]}"
   touch "${OUTPUT_ROOT}/PASSED"
   exit 0
 fi
@@ -428,7 +448,11 @@ if [[ "${#CHECKPOINTS[@]}" -lt 2 ]]; then
   echo "checkpoint sweep requires periodic checkpoints plus final" >&2
   exit 1
 fi
-FUSION_WEIGHTS=(0 2 5 10 20)
+if [[ "${STAGE}" == resume-eval-normalized ]]; then
+  FUSION_WEIGHTS=(2 5 10 20)
+else
+  FUSION_WEIGHTS=(0 2 5 10 20)
+fi
 
 eval_worker() {
   local gpu="$1" task_index=0 checkpoint weight label eval_dir
@@ -452,6 +476,7 @@ eval_worker() {
         --decoder-head ce \
         --score-transform logprob \
         --pro-fusion-weight "${weight}" \
+        "${PRO_FUSION_ARGS[@]}" \
         --log-every 75
       "${PYTHON_BIN}" "${PIPELINE}" rescore-ranked \
         --predictions "${eval_dir}/predictions.jsonl" \
@@ -472,7 +497,7 @@ for pid in "${worker_pids[@]}"; do
   wait "${pid}"
 done
 
-"${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${DECODER_ROOT}" <<'PY'
+"${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${DECODER_ROOT}" "${BASELINE_SELECTION_PATH}" <<'PY'
 import hashlib
 import json
 import os
@@ -481,6 +506,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 decoder_root = Path(sys.argv[2])
+baseline_selection_path = Path(sys.argv[3]) if sys.argv[3] else None
 records = []
 for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json")):
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))["overall"]
@@ -492,11 +518,20 @@ for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json"))
             "label": eval_dir.name,
             "checkpoint": str(checkpoint),
             "fusion_weight": manifest["pro_fusion_weight"],
+            "fusion_normalize_bias": bool(manifest.get("pro_fusion_normalize_bias", False)),
             "r1": metrics["@1"]["recall"],
             "r10": metrics["@10"]["recall"],
             "r50": metrics["@50"]["recall"],
         }
     )
+if baseline_selection_path is not None:
+    baseline_selection = json.loads(baseline_selection_path.read_text(encoding="utf-8"))
+    baseline_records = [
+        {**record, "fusion_normalize_bias": False}
+        for record in baseline_selection["records"]
+        if float(record["fusion_weight"]) == 0.0
+    ]
+    records.extend(baseline_records)
 fusion_weights = [0, 2, 5, 10, 20]
 checkpoint_labels = [path.name for path in decoder_root.glob("checkpoint-*")] + ["final"]
 expected_labels = {
@@ -513,6 +548,26 @@ if len(records) != len(expected_labels) or observed_labels != expected_labels:
         f"expected={len(expected_labels)}, observed={len(records)}, "
         f"missing={missing[:5]}, extra={extra[:5]}"
     )
+positive_normalization_modes = {
+    bool(record.get("fusion_normalize_bias", False))
+    for record in records
+    if float(record["fusion_weight"]) != 0.0
+}
+if len(positive_normalization_modes) != 1:
+    raise SystemExit(
+        "positive fusion records must use one normalization mode: "
+        f"observed={sorted(positive_normalization_modes)}"
+    )
+normalized_mode = positive_normalization_modes.pop()
+for record in records:
+    checkpoint_label = record["label"].rsplit("_omega", 1)[0]
+    expected_checkpoint = (decoder_root / checkpoint_label).resolve(strict=True)
+    actual_checkpoint = Path(record["checkpoint"]).resolve(strict=True)
+    if actual_checkpoint != expected_checkpoint:
+        raise SystemExit(
+            f"evaluation checkpoint mismatch for {record['label']}: "
+            f"expected={expected_checkpoint}, actual={actual_checkpoint}"
+        )
 best = max(records, key=lambda row: (row["r1"], row["r10"], row["r50"], -float(row["fusion_weight"])))
 checkpoint_file = Path(best["checkpoint"]) / "structured_decoder.pt"
 hasher = hashlib.sha256()
@@ -528,6 +583,11 @@ selection = {
         "rank_aggregation": "beam_order",
         "decoder_head": "ce",
         "score_transform": "logprob",
+        "pro_fusion_bias_normalization": (
+            "full_current_level_codebook_zscore_for_positive_weights"
+            if normalized_mode
+            else "none"
+        ),
         "checkpoint_selection": "Official core75 single R@1, then R@10, then R@50",
         "fusion_weights": fusion_weights,
     },

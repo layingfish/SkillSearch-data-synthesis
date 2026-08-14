@@ -4691,6 +4691,9 @@ def pro_residual_geometry_scores(
     current_prefix: list[int] | tuple[int, ...],
     target_level: int,
     allowed_values,
+    *,
+    normalize_bias: bool = False,
+    eps: float = 1e-6,
 ):
     """Compute PRO's residual codebook score for legal next-code values."""
     import torch
@@ -4722,8 +4725,12 @@ def pro_residual_geometry_scores(
         prefix_values = torch.as_tensor(current_prefix, dtype=torch.long, device=codebooks.device)
         prefix_levels = torch.arange(target_level, dtype=torch.long, device=codebooks.device)
         residual = residual - codebooks[prefix_levels, prefix_values].float().sum(dim=0)
-    centers = codebooks[target_level].index_select(0, allowed).float()
-    return 2.0 * (centers @ residual) - centers.square().sum(dim=-1)
+    centers = codebooks[target_level].float()
+    bias = 2.0 * (centers @ residual) - centers.square().sum(dim=-1)
+    if normalize_bias:
+        bias = bias - bias.mean(dim=-1, keepdim=True)
+        bias = bias / bias.std(dim=-1, keepdim=True, unbiased=False).clamp_min(float(eps))
+    return bias.index_select(0, allowed)
 
 
 def cross_entropy_with_label_exclusions(logits, labels, exclusions=None):
@@ -8685,6 +8692,9 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     if score_transform not in {"raw", "logprob"}:
         raise ValueError(f"unknown decoder score transform: {score_transform}")
     pro_fusion_weight = float(getattr(args, "pro_fusion_weight", 0.0))
+    pro_fusion_normalize_bias = bool(
+        getattr(args, "pro_fusion_normalize_bias", False)
+    )
     if pro_fusion_weight < 0.0:
         raise ValueError("PRO fusion weight must be non-negative")
     checkpoint_pro_fusion = checkpoint.get("pro_fusion") or {}
@@ -9054,6 +9064,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                             beam["current_prefix"],
                             target_type,
                             allowed,
+                            normalize_bias=pro_fusion_normalize_bias,
                         ).detach().cpu().tolist()
                     else:
                         geometry_scores = [0.0] * len(allowed)
@@ -9231,6 +9242,12 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "decoder_head": decoder_head,
             "score_transform": score_transform,
             "pro_fusion_weight": pro_fusion_weight,
+            "pro_fusion_normalize_bias": pro_fusion_normalize_bias,
+            "pro_fusion_normalization_domain": (
+                "full_current_level_codebook_zscore"
+                if pro_fusion_normalize_bias
+                else "none"
+            ),
             "pro_fusion": checkpoint_pro_fusion if pro_fusion_weight != 0.0 else None,
             "docid_control_score": "excluded" if decoder_head == "ripor" else "included",
             "pag_set_ids": str(args.pag_set_ids) if args.pag_set_ids else None,
@@ -9858,6 +9875,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="PRO residual-geometry weight omega; requires an M0-space codebook checkpoint",
     )
+    p.add_argument(
+        "--pro-fusion-normalize-bias",
+        action="store_true",
+        help="z-score PRO geometry over the complete current-level codebook before legal-token selection",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)
     p.add_argument("--pag-set-weight", type=float, default=0.0)
@@ -9905,6 +9927,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="PRO residual-geometry weight omega; requires an M0-space codebook checkpoint",
+    )
+    p.add_argument(
+        "--pro-fusion-normalize-bias",
+        action="store_true",
+        help="z-score PRO geometry over the complete current-level codebook before legal-token selection",
     )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--pag-set-ids", type=Path)

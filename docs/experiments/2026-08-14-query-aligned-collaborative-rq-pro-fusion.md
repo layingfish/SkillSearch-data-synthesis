@@ -50,14 +50,14 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Structured local cross-review complete
 - [x] Reviewer required? yes; fulfilled by structured local review because no delegated reviewer was requested
 - [x] Full strict-teacher coverage audit over 129,341 expanded query rows
-- [x] Local pipeline suite after evaluation recovery: 90 tests passed; 27 torch-dependent tests skipped in the CPU-only local environment
+- [x] Local pipeline suite after normalized-fusion recovery: 91 tests passed; 28 torch-dependent tests skipped in the CPU-only local environment
 - [x] On-node variable-candidate tensor invariant: 13 focused tests passed before decoder recovery
 
 ## Result / Notes
 
 Local cross-review found two HIGH launch/semantic issues and fixed both before submission: a mistyped frozen-runtime SHA-256 and use of the trainable decoder copy for PRO query geometry. Fusion now loads the exact frozen M0 checkpoint, verifies its hash/config/state schema, uses its recorded query truncation and decoder-start pooling, and rejects mismatched codebook provenance. No unresolved CRITICAL/HIGH finding remains.
 
-Method reference: PRO arXiv v3 (`2606.09241`, 2026-08-05), Eq. 7 and Appendix C; official implementation `layingfish/MGR_PRO@a9c47fda9cebc7a93a13aa8d19c0415f6c690b0d`. The implemented bias is `2 * residual dot code - squared_code_norm`; the paper default is `omega=10 (beam=50)`, and this run evaluates the local sensitivity set above.
+Method reference: PRO arXiv v3 (`2606.09241`, 2026-08-05), Eq. 7 and Appendix C; official implementation `layingfish/MGR_PRO@a9c47fda9cebc7a93a13aa8d19c0415f6c690b0d`. The bias is `2 * residual dot code - squared_code_norm`. The official multimodal config uses `omega=10`, `beam=50`, and `score_fusion_normalize_bias=true`; normalization is a z-score over the complete current-level codebook before selecting legal trie children.
 
 The 8-GPU preflight completed in Tianzhi job `tide-chenyufei03-10691-tibwq`. It ran on one rudder-exper node with 8xA800, passed all 9 focused node tests, completed 2 M0 optimizer steps, 2 RQ optimizer steps, 2 decoder optimizer steps, and an 8-query constrained-decoding smoke evaluation. Preflight output: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_preflight_v6/`.
 
@@ -78,3 +78,7 @@ The same job completed all 1,365 catalog optimizer steps (`catalog_epochs=3`, gl
 Decoder recovery job `tide-chenyufei03-10697-soipk` passed 13 focused on-node tests and completed training on one rudder-exper node with 8xA800. It finished 1,365 catalog optimizer steps (`catalog_epochs=3`, global batch=32) and 20,210 query optimizer steps (`query_epochs=5`, global batch=32), writing 50 periodic checkpoints plus `final`. The query-stage epoch mean CE values were 3.017245, 2.472590, 1.939909, 1.540114, and 1.307009 under this fixed run configuration.
 
 The subsequent 51-checkpoint by 5-weight evaluation stopped during the first worker tasks. `omega=0` loaded successfully, while every positive weight triggered a false M0 configuration mismatch because the PRO evaluation loader hashed the decoder run's local `_name_or_path`. The training-side check had already established that this is the only differing field. Recovery verifies the M0 checkpoint's original full config against its recorded hash, compares all cross-directory model-behavior fields after removing only `_name_or_path`, and reruns only the 255 evaluation tasks in a fresh output root.
+
+Evaluation recovery job `tide-chenyufei03-10698-ahret` completed all 255 tasks on one rudder-exper node with 8xA800. Conditions: 51 periodic/final checkpoints, Official core75 single subset with 24 queries, beam=50, beam-order ranking, CE log-probability scoring, and raw geometric weights in `{0,2,5,10,20}`. The best result was checkpoint-17200 with `omega=0`: R@1=33.3333%, R@10=41.6667%, and R@50=45.8333%. Selection SHA-256 is `27c4f0e858fb6da421505a4a7d8a8df28937ff66415cba04c200b9017e13c2a2`; selected checkpoint SHA-256 is `2b10502d40fd51d7f1aea6395433800575c2a68a24fc0bc0cb9c9e3316e7767f`.
+
+Post-result source audit found that the raw-weight sweep omitted the official `score_fusion_normalize_bias=true` setting. This explains why every positive raw weight degraded: its scale is not comparable to the paper's omega. The next recovery keeps the verified 51 `omega=0` records, applies full-codebook z-score normalization exactly as the official implementation, and evaluates only the 204 positive-weight tasks for `omega in {2,5,10,20}`.
