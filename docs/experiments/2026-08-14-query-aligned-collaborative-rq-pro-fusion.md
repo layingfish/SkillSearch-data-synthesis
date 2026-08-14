@@ -23,7 +23,7 @@ Local plan review: the main semantic risk is mixing codebook and query vectors f
 
 ## Commands
 
-Train: initial run used `... full`; RQ recovery used `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh resume-rq`; decoder recovery used the same launcher with `resume-decoder`. Evaluation recovery will use `resume-eval`. Every recovery stage reuses artifacts only after exact SHA-256 and structure checks.
+Train: initial run used `... full`; RQ recovery used `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh resume-rq`; decoder recovery used the same launcher with `resume-decoder`. Evaluation recoveries use `resume-eval`, `resume-eval-normalized`, and `resume-eval-fractional`. Every recovery stage reuses artifacts only after exact SHA-256 and structure checks.
 
 Eval: included in the full launcher; every periodic/final checkpoint is evaluated with `omega in {0,2,5,10,20}` under the metric protocol below.
 
@@ -52,6 +52,7 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Full strict-teacher coverage audit over 129,341 expanded query rows
 - [x] Local pipeline suite after normalized-fusion recovery: 91 tests passed; 28 torch-dependent tests skipped in the CPU-only local environment
 - [x] On-node variable-candidate tensor invariant: 13 focused tests passed before decoder recovery
+- [x] On-node official PRO normalization invariant: 16 focused tests passed before normalized evaluation
 
 ## Result / Notes
 
@@ -82,3 +83,7 @@ The subsequent 51-checkpoint by 5-weight evaluation stopped during the first wor
 Evaluation recovery job `tide-chenyufei03-10698-ahret` completed all 255 tasks on one rudder-exper node with 8xA800. Conditions: 51 periodic/final checkpoints, Official core75 single subset with 24 queries, beam=50, beam-order ranking, CE log-probability scoring, and raw geometric weights in `{0,2,5,10,20}`. The best result was checkpoint-17200 with `omega=0`: R@1=33.3333%, R@10=41.6667%, and R@50=45.8333%. Selection SHA-256 is `27c4f0e858fb6da421505a4a7d8a8df28937ff66415cba04c200b9017e13c2a2`; selected checkpoint SHA-256 is `2b10502d40fd51d7f1aea6395433800575c2a68a24fc0bc0cb9c9e3316e7767f`.
 
 Post-result source audit found that the raw-weight sweep omitted the official `score_fusion_normalize_bias=true` setting. This explains why every positive raw weight degraded: its scale is not comparable to the paper's omega. The next recovery keeps the verified 51 `omega=0` records, applies full-codebook z-score normalization exactly as the official implementation, and evaluates only the 204 positive-weight tasks for `omega in {2,5,10,20}`.
+
+Official-normalization job `tide-chenyufei03-10699-tjmkd` passed 16 focused on-node tests and completed all 204 new tasks on one rudder-exper node with 8xA800. Conditions: 51 periodic/final checkpoints, Official core75 single subset with 24 queries, beam=50, CE log-probability scoring, full-current-level-codebook z-score, and positive weights in `{2,5,10,20}`; the 51 verified `omega=0` records were reused. The best positive result was checkpoint-14000 with `omega=2`: R@1=29.1667%, R@10=33.3333%, and R@50=37.5000%. The overall winner remained checkpoint-17200 with `omega=0`: R@1=33.3333%, R@10=41.6667%, and R@50=45.8333%. Selection SHA-256 is `39222ecd560f96d531d4683fe7b1b2143eac196b56976d84f7076fac5d848d02`.
+
+The monotonic degradation from `omega=2` toward larger normalized weights shows that the official multimodal scale remains too strong for this T5 M0/RQ geometry. The final fusion search reuses all 255 verified normalized-matrix records and evaluates 255 new tasks for `omega in {0.1,0.25,0.5,1.0,1.5}` across the same 51 checkpoints.

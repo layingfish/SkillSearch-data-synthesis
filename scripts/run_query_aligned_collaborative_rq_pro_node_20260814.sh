@@ -4,8 +4,8 @@ set -euo pipefail
 bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 STAGE="${1:-}"
-if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder && "${STAGE}" != resume-eval && "${STAGE}" != resume-eval-normalized ]]; then
-  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder|resume-eval|resume-eval-normalized}" >&2
+if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder && "${STAGE}" != resume-eval && "${STAGE}" != resume-eval-normalized && "${STAGE}" != resume-eval-fractional ]]; then
+  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder|resume-eval|resume-eval-normalized|resume-eval-fractional}" >&2
   exit 2
 fi
 
@@ -37,6 +37,8 @@ elif [[ "${STAGE}" == resume-eval ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4
 elif [[ "${STAGE}" == resume-eval-normalized ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v5
+elif [[ "${STAGE}" == resume-eval-fractional ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v6
 else
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1
 fi
@@ -245,7 +247,7 @@ elif [[ "${STAGE}" == resume-rq-preflight ]]; then
   DECODER_SAVE_STEPS=0
 fi
 
-if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
+if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized || "${STAGE}" == resume-eval-fractional ]]; then
   M0_ROOT="${SKILLGR_QUERY_ALIGNED_M0_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/m0}"
   if [[ "${M0_ROOT}" != /models_rw/* ]]; then
     echo "resume M0 root must be under /models_rw: ${M0_ROOT}" >&2
@@ -284,7 +286,7 @@ for required in relevance_encoder.pt skill_embeddings.pt query_embeddings.pt; do
   fi
 done
 
-if [[ "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
+if [[ "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized || "${STAGE}" == resume-eval-fractional ]]; then
   RQ_ROOT="${SKILLGR_QUERY_ALIGNED_RQ_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq}"
   if [[ "${RQ_ROOT}" != /models_rw/* ]]; then
     echo "resume RQ root must be under /models_rw: ${RQ_ROOT}" >&2
@@ -332,7 +334,7 @@ for required in codebook_embeddings.pt semantic_ids.jsonl rqvae_manifest.json; d
   fi
 done
 
-if [[ "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized ]]; then
+if [[ "${STAGE}" == resume-eval || "${STAGE}" == resume-eval-normalized || "${STAGE}" == resume-eval-fractional ]]; then
   DECODER_ROOT="${SKILLGR_QUERY_ALIGNED_DECODER_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder}"
   if [[ "${DECODER_ROOT}" != /models_rw/* ]]; then
     echo "resume decoder root must be under /models_rw: ${DECODER_ROOT}" >&2
@@ -401,6 +403,8 @@ if [[ ! -f "${DECODER_ROOT}/final/structured_decoder.pt" ]]; then
 fi
 
 BASELINE_SELECTION_PATH=""
+BASELINE_SELECTION_MODE=none
+SELECTION_FUSION_WEIGHTS_JSON='[0,2,5,10,20]'
 PRO_FUSION_ARGS=(--pro-fusion-normalize-bias)
 if [[ "${STAGE}" == resume-eval ]]; then
   PRO_FUSION_ARGS=()
@@ -413,7 +417,19 @@ if [[ "${STAGE}" == resume-eval-normalized ]]; then
     exit 1
   fi
   check_sha256 "${BASELINE_SELECTION_PATH}" 27c4f0e858fb6da421505a4a7d8a8df28937ff66415cba04c200b9017e13c2a2
+  BASELINE_SELECTION_MODE=omega0
   echo "reusing verified omega=0 records: ${BASELINE_SELECTION_PATH}"
+elif [[ "${STAGE}" == resume-eval-fractional ]]; then
+  SOURCE_EVAL_ROOT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v5
+  BASELINE_SELECTION_PATH="${SOURCE_EVAL_ROOT}/selected/selection.json"
+  if [[ ! -f "${SOURCE_EVAL_ROOT}/COMPLETED" ]]; then
+    echo "normalized fusion evaluation is not marked complete: ${SOURCE_EVAL_ROOT}" >&2
+    exit 1
+  fi
+  check_sha256 "${BASELINE_SELECTION_PATH}" 39222ecd560f96d531d4683fe7b1b2143eac196b56976d84f7076fac5d848d02
+  BASELINE_SELECTION_MODE=all
+  SELECTION_FUSION_WEIGHTS_JSON='[0,0.1,0.25,0.5,1.0,1.5,2,5,10,20]'
+  echo "reusing verified normalized matrix: ${BASELINE_SELECTION_PATH}"
 fi
 
 if [[ "${STAGE}" == resume-rq-preflight ]]; then
@@ -450,6 +466,8 @@ if [[ "${#CHECKPOINTS[@]}" -lt 2 ]]; then
 fi
 if [[ "${STAGE}" == resume-eval-normalized ]]; then
   FUSION_WEIGHTS=(2 5 10 20)
+elif [[ "${STAGE}" == resume-eval-fractional ]]; then
+  FUSION_WEIGHTS=(0.1 0.25 0.5 1.0 1.5)
 else
   FUSION_WEIGHTS=(0 2 5 10 20)
 fi
@@ -497,7 +515,8 @@ for pid in "${worker_pids[@]}"; do
   wait "${pid}"
 done
 
-"${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${DECODER_ROOT}" "${BASELINE_SELECTION_PATH}" <<'PY'
+"${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${DECODER_ROOT}" "${BASELINE_SELECTION_PATH}" \
+  "${BASELINE_SELECTION_MODE}" "${SELECTION_FUSION_WEIGHTS_JSON}" <<'PY'
 import hashlib
 import json
 import os
@@ -507,6 +526,14 @@ from pathlib import Path
 root = Path(sys.argv[1])
 decoder_root = Path(sys.argv[2])
 baseline_selection_path = Path(sys.argv[3]) if sys.argv[3] else None
+baseline_selection_mode = sys.argv[4]
+fusion_weights = json.loads(sys.argv[5])
+if baseline_selection_mode not in {"none", "omega0", "all"}:
+    raise SystemExit(f"unknown baseline selection mode: {baseline_selection_mode}")
+if (baseline_selection_path is None) != (baseline_selection_mode == "none"):
+    raise SystemExit("baseline selection path/mode mismatch")
+if not isinstance(fusion_weights, list) or not fusion_weights or len(set(fusion_weights)) != len(fusion_weights):
+    raise SystemExit(f"invalid fusion weight matrix: {fusion_weights}")
 records = []
 for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json")):
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))["overall"]
@@ -526,13 +553,15 @@ for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json"))
     )
 if baseline_selection_path is not None:
     baseline_selection = json.loads(baseline_selection_path.read_text(encoding="utf-8"))
-    baseline_records = [
-        {**record, "fusion_normalize_bias": False}
-        for record in baseline_selection["records"]
-        if float(record["fusion_weight"]) == 0.0
-    ]
+    if baseline_selection_mode == "omega0":
+        baseline_records = [
+            {**record, "fusion_normalize_bias": False}
+            for record in baseline_selection["records"]
+            if float(record["fusion_weight"]) == 0.0
+        ]
+    else:
+        baseline_records = [dict(record) for record in baseline_selection["records"]]
     records.extend(baseline_records)
-fusion_weights = [0, 2, 5, 10, 20]
 checkpoint_labels = [path.name for path in decoder_root.glob("checkpoint-*")] + ["final"]
 expected_labels = {
     f"{checkpoint_label}_omega{weight}"
