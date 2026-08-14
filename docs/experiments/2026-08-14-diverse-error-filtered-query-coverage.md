@@ -1,6 +1,6 @@
 # Experiment: Diverse training-side query coverage with GR error filtering
 
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -10,7 +10,7 @@ Risk Tier: 2
 - Hypothesis: query-scenario coverage is the active bottleneck. Generate exactly `6` new views for each of the `1,722` zero-multi target skills, using six fixed diversity modes and the existing `8` views as exclusions.
 - Generation budget: `10,332 = 1,722 × 6` selected rows from `1,722` API requests. Modes are `implicit_outcome`, `artifact_pipeline`, `workflow_stage`, `failure_recovery`, `verification_first`, and `terse_natural`.
 - Filtering: decode all generated rows with cum_082 on one node=`8×A800`, beam=`50`; retain only rows whose gold is not top-1. Candidate negatives remain bound to the exact generated query.
-- Training mass: pending mining statistics. The builder will preserve a fixed number of pseudo exposures per catalog skill and will not append the new rows on top of the catalog-balanced schedule.
+- Training mass: preserve exactly `10` pseudo exposures/catalog skill over two cycles. Include every retained error query once, then fill each target's remaining slots with mode3/task5 views; do not append rows to the catalog-balanced schedule.
 
 ## Commands
 
@@ -20,17 +20,17 @@ Prepare mining: `uv run python scripts/build_diverse_coverage_queries.py prepare
 
 Mine: `scripts/run_diverse_coverage_mining_node_20260814.sh`; job=`tide-chenyufei03-10713-kbwck`, one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`, cum_082 checkpoint SHA-256=`b55092f2be32ff063bff3f4387f154343dcd5f652573e4d044274df33d39cf1d`, beam=`50`, negatives/query=`10`.
 
-Train: `scripts/run_diverse_error_fixed_mass_training_node_20260814.sh`; one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`. Initialization and optimizer settings match the prior fixed-mass run: cum_082 initialization, AdamW lr=`1e-5`, weight decay=`0`, constant schedule, BF16, batch=`2/GPU`, global batch=`16`, listwise loss weight=`1.0`, temperature=`0.5`, negatives/query=`10`, optimizer steps=`9,349`, and checkpoint interval=`200` steps.
+Train: `scripts/run_diverse_error_fixed_mass_training_node_20260814.sh`; job=`tide-chenyufei03-10714-ccslv`, one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`. Initialization and optimizer settings match the prior fixed-mass run: cum_082 initialization, AdamW lr=`1e-5`, weight decay=`0`, constant schedule, BF16, batch=`2/GPU`, global batch=`16`, listwise loss weight=`1.0`, temperature=`0.5`, negatives/query=`10`, optimizer steps=`9,349`, and checkpoint interval=`200` steps.
 
 Eval: Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob; checkpoint selection uses this requested test protocol.
 
 ## Outputs
 
-Checkpoint: pending.
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_diverse_error_fixed_mass_top1_20260814_v1/selected/single_top1_best` (`step=5,200` under Official core75=`75`, single/multi=`24/51`, beam=`50`), SHA-256=`d7fef8eed222ad387d7be0ca6958c44b31fa7e544303adc0a92a67711c2de83d`.
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_diverse_coverage_mining_20260814_v1/logs/node.log` after submission.
+Log: mining=`/models_rw/SkillSearch-data-synthesis/experiments/a800_diverse_coverage_mining_20260814_v1/logs/node.log`; training/eval=`/models_rw/SkillSearch-data-synthesis/experiments/a800_diverse_error_fixed_mass_top1_20260814_v1/logs/node.log`.
 
-Metrics: cum_082 reaches generated-query R@1/R@10/R@50=`53.6489/74.6612/80.3039%` before filtering under `10,332` training-side rows, beam=`50`, beam-order, and CE log-prob.
+Metrics: selected step=`5,200` reaches Overall R@1/R@10/R@50=`30.2571/71.5873/74.0000%`, Single=`45.8333/54.1667/54.1667%`, and Multi=`22.9272/79.7852/83.3333%` under Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob, and macro recall.
 
 ## Verification
 
@@ -39,8 +39,9 @@ Metrics: cum_082 reaches generated-query R@1/R@10/R@50=`53.6489/74.6612/80.3039%
 - [x] Query text is distinct from all `8` existing views for the same target
 - [x] Generated rows and mined candidates have exact row/hash closure
 - [x] Fixed per-skill training mass and candidate/query-hash closure
-- [ ] Optimizer-step closure after training
-- [ ] Reviewer required? no; perform focused local semantic review before GPU training
+- [x] Optimizer-step closure (`9,349/9,349` steps, `46` periodic checkpoints plus final)
+- [x] All `49` requested evaluations completed under the same Official protocol
+- [x] Reviewer required? no; focused local semantic review and full training-loader audit completed
 
 ## Result / Notes
 
@@ -61,3 +62,11 @@ For the `13` cum_082 Single misses under Official core75=`24` single queries and
 Fixed-mass materialization completed with `149,570 = 2 × (2,030 + 14,551 × 5)` rows and the same number of candidate records. Each catalog skill contributes exactly `5` pseudo views/cycle and `10` over two cycles. Every retained error query appears exactly once; the remaining target slots use `12,431` cum_082-bound task5/mode3 views, while original and non-target rows use `132,350` step2400-bound candidate records. Training rows SHA-256=`dacdf84aa57fc24e10b9c61590cd1e1c450e3f7797c173e90dd1177f0863e249`; candidates SHA-256=`1bf33c59cfbf7cdbe6a0f51d5b1efe0828b5deef2a7bd0c7a52e100f61828f84`; manifest SHA-256=`2c4f7b9dcae23fba97dbc0b1ee562e1ca7a3d8327f48589b52582e1cc15921e6`.
 
 The training loader independently validated all `149,570` row/candidate joins under learned SID codes: exactly `10` unique non-gold negatives/row, SHA-256 query binding for every row, and exclusion of all source-selected skills from the negative set.
+
+Training job=`tide-chenyufei03-10714-ccslv` completed with pod restart=`0` in about `48` minutes, including training and Official evaluation. Training completed exactly `9,349/9,349` optimizer steps under DDP world size=`8`, batch=`2/GPU`, global batch=`16`; epoch=`1` mean CE loss was `0.552045`. All `46` periodic checkpoints plus final were created, and all `49 = 46 + final + cum_002 + cum_082` evaluation entries completed.
+
+The selected step=`5,200` checkpoint does not improve Single over cum_082: both reach Single R@1/R@10/R@50=`45.8333/54.1667/54.1667%` under `24` Official single queries and beam=`50`. Relative to cum_082 under the full Official core75=`75`, step=`5,200` changes Overall R@1/R@10/R@50 by `+0.6667/+0.6667/+0.2222` points and Multi R@1/R@10/R@50 by `+0.9804/+0.9804/+0.3268` points.
+
+Across all `47` trained checkpoints under the same `24`-query, beam=`50` Single protocol, no cum_082 miss ever becomes top-1. The selected checkpoint has exactly the same `11/24` correct query indices as cum_082. Of the `13` misses, `11/13` gold skills remain outside beam=`50` at every trained checkpoint; `gt/timeseries-detrending` remains rank=`2`; `gt/hierarchical-taxonomy-clustering` moves from rank=`3` to rank=`2` at its best checkpoint but never reaches top-1.
+
+This rejects the working hypothesis that broader document-conditioned synthetic scenarios plus GR error filtering are sufficient for Single top-1. The added supervision is valid and strong enough to improve Multi, yet it does not transfer to the Official Single OOD queries. Further query synthesis of the same form has low expected value; the next method must alter query-to-SID semantic alignment or the GR training objective while keeping inference generative.
