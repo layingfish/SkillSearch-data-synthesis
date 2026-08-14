@@ -150,6 +150,15 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def query_digest(row: dict[str, Any]) -> str:
+    query = str(row.get("query") or row.get("query_text") or "")
+    if not query:
+        raise ValueError(
+            f"row has no query text: index={row.get('index')} source_index={row.get('source_index')}"
+        )
+    return hashlib.sha256(query.encode("utf-8")).hexdigest()
+
+
 def selected_single_skill(row: dict[str, Any]) -> str | None:
     selected = [str(value) for value in row.get("selected_skill_ids", []) or []]
     if len(selected) != 1:
@@ -167,6 +176,66 @@ def target_ids_from_rows(rows: list[dict[str, Any]]) -> list[str]:
     if len(targets) != len(set(targets)):
         raise ValueError("target skill ids must be unique")
     return targets
+
+
+def coverage_row_identity(row: dict[str, Any]) -> tuple[str, str, str]:
+    source_index = str(row.get("source_index") or row.get("index") or "")
+    if not source_index.startswith(COVERAGE_PREFIX):
+        raise ValueError(f"invalid diverse-coverage source index: {source_index!r}")
+    target_from_index, separator, mode_from_index = source_index[len(COVERAGE_PREFIX) :].rpartition(":")
+    if not separator or not target_from_index or mode_from_index not in COVERAGE_MODES:
+        raise ValueError(f"invalid diverse-coverage source index: {source_index!r}")
+    positive = selected_single_skill(row)
+    if positive != target_from_index:
+        raise ValueError(
+            f"coverage source/positive mismatch: source={source_index} positive={positive}"
+        )
+    mode = str((row.get("pseudo_query") or {}).get("mode") or "")
+    if mode != mode_from_index:
+        raise ValueError(
+            f"coverage source/mode mismatch: source={source_index} metadata_mode={mode!r}"
+        )
+    return source_index, positive, mode
+
+
+def validate_coverage_closure(
+    rows: list[dict[str, Any]],
+    *,
+    expected_targets: int,
+    views_per_target: int,
+) -> dict[str, list[str]]:
+    if views_per_target != len(COVERAGE_MODES):
+        raise ValueError(
+            f"views_per_target must equal the prescribed mode count: "
+            f"{views_per_target} != {len(COVERAGE_MODES)}"
+        )
+    by_target: dict[str, list[str]] = defaultdict(list)
+    source_indices: set[str] = set()
+    for row in rows:
+        source_index, target, mode = coverage_row_identity(row)
+        if source_index in source_indices:
+            raise ValueError(f"duplicate diverse-coverage source index: {source_index}")
+        source_indices.add(source_index)
+        query_digest(row)
+        by_target[target].append(mode)
+    if len(by_target) != expected_targets:
+        raise ValueError(
+            f"coverage target count mismatch: observed={len(by_target)} expected={expected_targets}"
+        )
+    expected_modes = set(COVERAGE_MODES)
+    bad_modes = {
+        target: modes
+        for target, modes in by_target.items()
+        if len(modes) != views_per_target or set(modes) != expected_modes
+    }
+    if bad_modes:
+        raise ValueError(f"coverage mode closure failed: {list(bad_modes.items())[:10]}")
+    expected_rows = expected_targets * views_per_target
+    if len(rows) != expected_rows:
+        raise ValueError(
+            f"coverage row count mismatch: observed={len(rows)} expected={expected_rows}"
+        )
+    return dict(by_target)
 
 
 def task5_owner(row_index: str) -> str | None:
@@ -681,6 +750,374 @@ def command_generate(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
 
+def prepare_mining_rows(
+    *,
+    selected_rows_path: Path,
+    generation_manifest_path: Path,
+    output_dir: Path,
+    expected_targets: int,
+    views_per_target: int,
+) -> dict[str, Any]:
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to overwrite mining input directory: {output_dir}")
+    generation_manifest = json.loads(generation_manifest_path.read_text(encoding="utf-8"))
+    selected_sha256 = file_sha256(selected_rows_path)
+    required_manifest = {
+        "complete": True,
+        "target_skill_count": expected_targets,
+        "selected_rows": expected_targets * views_per_target,
+        "modes": list(COVERAGE_MODES),
+        "selected_rows_sha256": selected_sha256,
+    }
+    drift = {
+        key: (expected, generation_manifest.get(key))
+        for key, expected in required_manifest.items()
+        if generation_manifest.get(key) != expected
+    }
+    if drift:
+        raise ValueError(f"generation manifest drifted: {drift}")
+
+    rows = load_jsonl(selected_rows_path)
+    validate_coverage_closure(
+        rows,
+        expected_targets=expected_targets,
+        views_per_target=views_per_target,
+    )
+    mining_rows: list[dict[str, Any]] = []
+    for ordinal, row in enumerate(rows):
+        source_index, _, mode = coverage_row_identity(row)
+        mining_rows.append(
+            {
+                **row,
+                "index": ordinal,
+                "source_index": source_index,
+                "coverage_mining": {
+                    "source_kind": "diverse_coverage",
+                    "selection_basis": SELECTION_BASIS,
+                    "mode": mode,
+                },
+            }
+        )
+    output_path = output_dir / "mining_rows.jsonl"
+    write_jsonl(output_path, mining_rows)
+    manifest = {
+        "format": "diverse_coverage_mining_rows_v1",
+        "selection_basis": SELECTION_BASIS,
+        "selected_rows": str(selected_rows_path),
+        "selected_rows_sha256": selected_sha256,
+        "generation_manifest": str(generation_manifest_path),
+        "generation_manifest_sha256": file_sha256(generation_manifest_path),
+        "target_skill_count": expected_targets,
+        "views_per_target": views_per_target,
+        "modes": list(COVERAGE_MODES),
+        "row_count": len(mining_rows),
+        "index_contract": "zero_based_contiguous_row_ordinal",
+        "source_index_contract": "original_diverse_coverage_index",
+        "output": str(output_path),
+        "output_sha256": file_sha256(output_path),
+    }
+    write_json(output_dir / "manifest.json", manifest)
+    return manifest
+
+
+def filter_mined_errors(
+    *,
+    mining_rows_path: Path,
+    candidates_path: Path,
+    candidate_manifest_path: Path,
+    prediction_paths: list[Path],
+    output_dir: Path,
+    expected_rows: int,
+    expected_targets: int,
+    views_per_target: int,
+    expected_negatives: int,
+    expected_beams: int,
+    expected_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to overwrite error-filtered directory: {output_dir}")
+    rows = load_jsonl(mining_rows_path)
+    if len(rows) != expected_rows:
+        raise ValueError(f"mining row count mismatch: observed={len(rows)} expected={expected_rows}")
+    validate_coverage_closure(
+        rows,
+        expected_targets=expected_targets,
+        views_per_target=views_per_target,
+    )
+    mining_by_index: dict[int, dict[str, Any]] = {}
+    for expected_index, row in enumerate(rows):
+        row_index = int(row.get("index"))
+        if row_index != expected_index:
+            raise ValueError(
+                f"mining row indices must be contiguous: ordinal={expected_index} index={row_index}"
+            )
+        mining_by_index[row_index] = row
+
+    candidate_manifest = json.loads(candidate_manifest_path.read_text(encoding="utf-8"))
+    mining_rows_sha256 = file_sha256(mining_rows_path)
+    candidates_sha256 = file_sha256(candidates_path)
+    required_candidate_manifest = {
+        "rows_sha256": mining_rows_sha256,
+        "output_sha256": candidates_sha256,
+        "mining_checkpoint_sha256": expected_checkpoint_sha256,
+    }
+    candidate_drift = {
+        key: (expected, candidate_manifest.get(key))
+        for key, expected in required_candidate_manifest.items()
+        if candidate_manifest.get(key) != expected
+    }
+    mining_protocol = candidate_manifest.get("mining_protocol") or {}
+    if mining_protocol.get("num_beams") != expected_beams:
+        candidate_drift["mining_protocol.num_beams"] = (
+            expected_beams,
+            mining_protocol.get("num_beams"),
+        )
+    audit = candidate_manifest.get("audit") or {}
+    required_audit = {
+        "rows": expected_rows,
+        "training_rows": expected_rows,
+        "negatives_per_row": expected_negatives,
+        "known_unique_non_gold_negatives": True,
+    }
+    for key, expected in required_audit.items():
+        if audit.get(key) != expected:
+            candidate_drift[f"audit.{key}"] = (expected, audit.get(key))
+    if candidate_drift:
+        raise ValueError(f"candidate manifest drifted: {candidate_drift}")
+
+    expected_prediction_hashes = sorted(
+        str(item.get("predictions_sha256") or "")
+        for item in candidate_manifest.get("prediction_shards", [])
+    )
+    observed_prediction_hashes = sorted(file_sha256(path) for path in prediction_paths)
+    if observed_prediction_hashes != expected_prediction_hashes:
+        raise ValueError("prediction files do not match the compacted candidate manifest")
+
+    candidates_by_index: dict[int, dict[str, Any]] = {}
+    for candidate in load_jsonl(candidates_path):
+        row_index = int(candidate.get("row_index"))
+        if row_index in candidates_by_index or row_index not in mining_by_index:
+            raise ValueError(f"duplicate or unknown candidate row_index={row_index}")
+        row = mining_by_index[row_index]
+        source_index, positive, _ = coverage_row_identity(row)
+        negatives = [str(value) for value in candidate.get("negative_skill_ids", []) or []]
+        if str(candidate.get("source_index") or "") != source_index:
+            raise ValueError(f"candidate source mismatch at row_index={row_index}")
+        if str(candidate.get("positive_skill_id") or "") != positive:
+            raise ValueError(f"candidate positive mismatch at row_index={row_index}")
+        if str(candidate.get("query_sha256") or "") != query_digest(row):
+            raise ValueError(f"candidate query mismatch at row_index={row_index}")
+        if len(negatives) != expected_negatives or len(negatives) != len(set(negatives)):
+            raise ValueError(f"candidate negative count/uniqueness failed at row_index={row_index}")
+        if positive in negatives:
+            raise ValueError(f"candidate negatives contain gold at row_index={row_index}")
+        candidates_by_index[row_index] = candidate
+    if set(candidates_by_index) != set(mining_by_index):
+        raise ValueError("candidate/mining row closure failed")
+
+    predictions_by_index: dict[int, dict[str, Any]] = {}
+    for prediction_path in prediction_paths:
+        for prediction in load_jsonl(prediction_path):
+            row_index = int(prediction.get("index"))
+            if row_index in predictions_by_index or row_index not in mining_by_index:
+                raise ValueError(f"duplicate or unknown prediction row_index={row_index}")
+            row = mining_by_index[row_index]
+            _, positive, _ = coverage_row_identity(row)
+            gold = [str(value) for value in prediction.get("gold_skill_ids", []) or []]
+            ranked = [str(value) for value in prediction.get("ranked_skill_ids", []) or []]
+            if gold != [positive] or not ranked:
+                raise ValueError(f"prediction gold/ranked closure failed at row_index={row_index}")
+            if bool(prediction.get("invalid")):
+                raise ValueError(f"invalid decoded prediction at row_index={row_index}")
+            if query_digest(prediction) != query_digest(row):
+                raise ValueError(f"prediction query mismatch at row_index={row_index}")
+            candidate = candidates_by_index[row_index]
+            expected_candidate_order = [sid for sid in ranked if sid != positive][:expected_negatives]
+            if expected_candidate_order != candidate["negative_skill_ids"]:
+                raise ValueError(f"prediction/candidate order mismatch at row_index={row_index}")
+            predictions_by_index[row_index] = prediction
+    if set(predictions_by_index) != set(mining_by_index):
+        raise ValueError("prediction/mining row closure failed")
+
+    outcomes: list[dict[str, Any]] = []
+    error_rows: list[dict[str, Any]] = []
+    error_candidates: list[dict[str, Any]] = []
+    per_mode_total: Counter[str] = Counter()
+    per_mode_errors: Counter[str] = Counter()
+    per_target_total: Counter[str] = Counter()
+    per_target_errors: Counter[str] = Counter()
+    per_target_modes: dict[str, list[str]] = defaultdict(list)
+    per_target_confusers: dict[str, Counter[str]] = defaultdict(Counter)
+    gold_in_beam = 0
+    for row_index in sorted(mining_by_index):
+        row = mining_by_index[row_index]
+        source_index, positive, mode = coverage_row_identity(row)
+        prediction = predictions_by_index[row_index]
+        ranked = [str(value) for value in prediction["ranked_skill_ids"]]
+        gold_rank = ranked.index(positive) + 1 if positive in ranked else None
+        if gold_rank is not None:
+            gold_in_beam += 1
+        gold_top1 = ranked[0] == positive
+        top1_confuser = None if gold_top1 else ranked[0]
+        per_mode_total[mode] += 1
+        per_target_total[positive] += 1
+        if not gold_top1:
+            per_mode_errors[mode] += 1
+            per_target_errors[positive] += 1
+            per_target_modes[positive].append(mode)
+            per_target_confusers[positive][str(top1_confuser)] += 1
+        outcomes.append(
+            {
+                "row_index": row_index,
+                "source_index": source_index,
+                "target_skill_id": positive,
+                "mode": mode,
+                "gold_top1": gold_top1,
+                "gold_rank": gold_rank,
+                "top1_skill_id": ranked[0],
+            }
+        )
+        if gold_top1:
+            continue
+        filtered_index = len(error_rows)
+        error_rows.append(
+            {
+                **row,
+                "index": source_index,
+                "source_index": source_index,
+                "error_filtered_mining": {
+                    "source_row_index": row_index,
+                    "mining_checkpoint_sha256": expected_checkpoint_sha256,
+                    "num_beams": expected_beams,
+                    "gold_rank": gold_rank,
+                    "top1_confuser_skill_id": top1_confuser,
+                },
+            }
+        )
+        source_candidate = candidates_by_index[row_index]
+        error_candidates.append(
+            {
+                "row_index": filtered_index,
+                "source_index": source_index,
+                "query_sha256": query_digest(row),
+                "positive_skill_id": positive,
+                "negative_skill_ids": source_candidate["negative_skill_ids"],
+                "source_mining_row_index": row_index,
+                "top1_confuser_skill_id": top1_confuser,
+            }
+        )
+    if not error_rows:
+        raise ValueError("error filtering retained zero rows")
+
+    target_summaries = []
+    for target in sorted(per_target_total):
+        confusers = per_target_confusers[target]
+        target_summaries.append(
+            {
+                "target_skill_id": target,
+                "total_queries": per_target_total[target],
+                "gold_top1_queries": per_target_total[target] - per_target_errors[target],
+                "error_queries": per_target_errors[target],
+                "error_modes": sorted(per_target_modes[target]),
+                "top1_confusers": [
+                    {"skill_id": skill, "count": count}
+                    for skill, count in sorted(confusers.items(), key=lambda item: (-item[1], item[0]))
+                ],
+            }
+        )
+    error_histogram = Counter(per_target_errors[target] for target in per_target_total)
+    by_mode = {
+        mode: {
+            "total": per_mode_total[mode],
+            "errors": per_mode_errors[mode],
+            "gold_top1": per_mode_total[mode] - per_mode_errors[mode],
+            "error_rate": per_mode_errors[mode] / per_mode_total[mode],
+        }
+        for mode in COVERAGE_MODES
+    }
+
+    output_dir.mkdir(parents=True)
+    error_rows_path = output_dir / "error_rows.jsonl"
+    error_candidates_path = output_dir / "error_candidates.jsonl"
+    outcomes_path = output_dir / "all_query_outcomes.jsonl"
+    target_summary_path = output_dir / "target_error_summary.jsonl"
+    write_jsonl(error_rows_path, error_rows)
+    write_jsonl(error_candidates_path, error_candidates)
+    write_jsonl(outcomes_path, outcomes)
+    write_jsonl(target_summary_path, target_summaries)
+    manifest = {
+        "format": "diverse_coverage_error_filtered_v1",
+        "selection_basis": SELECTION_BASIS,
+        "mining_rows": str(mining_rows_path),
+        "mining_rows_sha256": mining_rows_sha256,
+        "candidates": str(candidates_path),
+        "candidates_sha256": candidates_sha256,
+        "candidate_manifest": str(candidate_manifest_path),
+        "candidate_manifest_sha256": file_sha256(candidate_manifest_path),
+        "prediction_shards": [
+            {"path": str(path), "sha256": file_sha256(path)} for path in prediction_paths
+        ],
+        "mining_checkpoint_sha256": expected_checkpoint_sha256,
+        "mining_protocol": {"num_beams": expected_beams},
+        "input_rows": len(rows),
+        "target_skill_count": len(per_target_total),
+        "views_per_target": views_per_target,
+        "gold_top1_rows": len(rows) - len(error_rows),
+        "gold_in_beam_rows": gold_in_beam,
+        "gold_missing_from_beam_rows": len(rows) - gold_in_beam,
+        "error_rows": len(error_rows),
+        "targets_with_errors": sum(count > 0 for count in per_target_errors.values()),
+        "unique_top1_error_pairs": sum(len(values) for values in per_target_confusers.values()),
+        "by_mode": by_mode,
+        "error_count_per_target_histogram": {
+            str(count): targets for count, targets in sorted(error_histogram.items())
+        },
+        "outputs": {
+            "error_rows": str(error_rows_path),
+            "error_rows_sha256": file_sha256(error_rows_path),
+            "error_candidates": str(error_candidates_path),
+            "error_candidates_sha256": file_sha256(error_candidates_path),
+            "all_query_outcomes": str(outcomes_path),
+            "all_query_outcomes_sha256": file_sha256(outcomes_path),
+            "target_error_summary": str(target_summary_path),
+            "target_error_summary_sha256": file_sha256(target_summary_path),
+        },
+        "candidate_join_contract": "zero_based_error_row_ordinal",
+        "query_binding": "sha256",
+        "negatives_per_error_row": expected_negatives,
+    }
+    write_json(output_dir / "manifest.json", manifest)
+    return manifest
+
+
+def command_prepare_mining(args: argparse.Namespace) -> None:
+    manifest = prepare_mining_rows(
+        selected_rows_path=args.selected_rows,
+        generation_manifest_path=args.generation_manifest,
+        output_dir=args.output_dir,
+        expected_targets=args.expected_targets,
+        views_per_target=args.views_per_target,
+    )
+    print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+
+def command_filter_errors(args: argparse.Namespace) -> None:
+    manifest = filter_mined_errors(
+        mining_rows_path=args.mining_rows,
+        candidates_path=args.candidates,
+        candidate_manifest_path=args.candidate_manifest,
+        prediction_paths=args.predictions,
+        output_dir=args.output_dir,
+        expected_rows=args.expected_rows,
+        expected_targets=args.expected_targets,
+        views_per_target=args.views_per_target,
+        expected_negatives=args.expected_negatives,
+        expected_beams=args.expected_beams,
+        expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+    )
+    print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+
 def add_shared_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-skills", type=Path, required=True)
     parser.add_argument("--skills-jsonl", type=Path, required=True)
@@ -717,6 +1154,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-attempts", type=int, default=3)
     generate.add_argument("--require-complete", action=argparse.BooleanOptionalAction, default=True)
     generate.set_defaults(func=command_generate)
+
+    prepare = subparsers.add_parser("prepare-mining")
+    prepare.add_argument("--selected-rows", type=Path, required=True)
+    prepare.add_argument("--generation-manifest", type=Path, required=True)
+    prepare.add_argument("--output-dir", type=Path, required=True)
+    prepare.add_argument("--expected-targets", type=int, default=1722)
+    prepare.add_argument("--views-per-target", type=int, default=len(COVERAGE_MODES))
+    prepare.set_defaults(func=command_prepare_mining)
+
+    filter_errors = subparsers.add_parser("filter-errors")
+    filter_errors.add_argument("--mining-rows", type=Path, required=True)
+    filter_errors.add_argument("--candidates", type=Path, required=True)
+    filter_errors.add_argument("--candidate-manifest", type=Path, required=True)
+    filter_errors.add_argument("--predictions", type=Path, action="append", required=True)
+    filter_errors.add_argument("--output-dir", type=Path, required=True)
+    filter_errors.add_argument("--expected-rows", type=int, default=1722 * len(COVERAGE_MODES))
+    filter_errors.add_argument("--expected-targets", type=int, default=1722)
+    filter_errors.add_argument("--views-per-target", type=int, default=len(COVERAGE_MODES))
+    filter_errors.add_argument("--expected-negatives", type=int, default=10)
+    filter_errors.add_argument("--expected-beams", type=int, default=50)
+    filter_errors.add_argument("--expected-checkpoint-sha256", required=True)
+    filter_errors.set_defaults(func=command_filter_errors)
     return parser
 
 

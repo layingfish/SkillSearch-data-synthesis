@@ -10,8 +10,12 @@ from scripts.build_diverse_coverage_queries import (
     build_coverage_messages,
     build_generation_record,
     collect_existing_views,
+    file_sha256,
+    filter_mined_errors,
     materialize,
     normalize_coverage_query_layout,
+    prepare_mining_rows,
+    query_digest,
 )
 
 
@@ -196,6 +200,140 @@ class DiverseCoverageQueriesTest(unittest.TestCase):
         self.assertEqual(record["status"], "complete", record["reject_reasons"])
         self.assertFalse(record["queries"][0]["has_task_marker"])
         self.assertFalse(record["queries"][0]["has_numbered_steps"])
+
+    def test_prepare_and_filter_mining_preserve_exact_query_binding(self) -> None:
+        targets = ["skill/a", "skill/b"]
+        selected = []
+        for target in targets:
+            for rank, mode in enumerate(COVERAGE_MODES):
+                query = f"query for {target} in {mode} with unique ordinal {rank}"
+                selected.append(
+                    {
+                        "index": f"pseudo:diverse_coverage:{target}:{mode}",
+                        "source": "training_gr_diverse_coverage_pseudo_query",
+                        "query": query,
+                        "query_text": f"instruction\nQuery:{query}",
+                        "selected_skill_ids": [target],
+                        "positive_skill_id": target,
+                        "pseudo_query": {"mode": mode},
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selected_path = root / "selected.jsonl"
+            selected_path.write_text(
+                "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in selected),
+                encoding="utf-8",
+            )
+            generation_manifest_path = root / "generation_manifest.json"
+            generation_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "complete": True,
+                        "target_skill_count": 2,
+                        "selected_rows": 12,
+                        "modes": list(COVERAGE_MODES),
+                        "selected_rows_sha256": file_sha256(selected_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mining_dir = root / "mining_input"
+            mining_manifest = prepare_mining_rows(
+                selected_rows_path=selected_path,
+                generation_manifest_path=generation_manifest_path,
+                output_dir=mining_dir,
+                expected_targets=2,
+                views_per_target=6,
+            )
+            mining_rows_path = Path(mining_manifest["output"])
+            mining_rows = [json.loads(line) for line in mining_rows_path.read_text().splitlines()]
+            self.assertEqual([row["index"] for row in mining_rows], list(range(12)))
+            self.assertEqual(mining_rows[0]["source_index"], selected[0]["index"])
+
+            candidates = []
+            predictions = []
+            for row in mining_rows:
+                row_index = row["index"]
+                positive = row["positive_skill_id"]
+                negatives = [f"negative/{row_index}/{rank}" for rank in range(10)]
+                ranked = [positive, *negatives] if row_index % 2 == 0 else [negatives[0], positive, *negatives[1:]]
+                candidates.append(
+                    {
+                        "row_index": row_index,
+                        "source_index": row["source_index"],
+                        "query_sha256": query_digest(row),
+                        "positive_skill_id": positive,
+                        "negative_skill_ids": negatives,
+                    }
+                )
+                predictions.append(
+                    {
+                        "index": row_index,
+                        "query": row["query"],
+                        "gold_skill_ids": [positive],
+                        "ranked_skill_ids": ranked,
+                        "invalid": False,
+                    }
+                )
+            candidates_path = root / "candidates.jsonl"
+            candidates_path.write_text(
+                "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in candidates),
+                encoding="utf-8",
+            )
+            predictions_path = root / "predictions.jsonl"
+            predictions_path.write_text(
+                "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in predictions),
+                encoding="utf-8",
+            )
+            checkpoint_sha = "a" * 64
+            candidate_manifest_path = root / "candidate_manifest.json"
+            candidate_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "rows_sha256": file_sha256(mining_rows_path),
+                        "output_sha256": file_sha256(candidates_path),
+                        "mining_checkpoint_sha256": checkpoint_sha,
+                        "mining_protocol": {"num_beams": 50},
+                        "prediction_shards": [
+                            {"predictions_sha256": file_sha256(predictions_path)}
+                        ],
+                        "audit": {
+                            "rows": 12,
+                            "training_rows": 12,
+                            "negatives_per_row": 10,
+                            "known_unique_non_gold_negatives": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            filtered_manifest = filter_mined_errors(
+                mining_rows_path=mining_rows_path,
+                candidates_path=candidates_path,
+                candidate_manifest_path=candidate_manifest_path,
+                prediction_paths=[predictions_path],
+                output_dir=root / "filtered",
+                expected_rows=12,
+                expected_targets=2,
+                views_per_target=6,
+                expected_negatives=10,
+                expected_beams=50,
+                expected_checkpoint_sha256=checkpoint_sha,
+            )
+            self.assertEqual(filtered_manifest["error_rows"], 6)
+            self.assertEqual(filtered_manifest["targets_with_errors"], 2)
+            error_candidates = [
+                json.loads(line)
+                for line in Path(filtered_manifest["outputs"]["error_candidates"])
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual([row["row_index"] for row in error_candidates], list(range(6)))
+            self.assertTrue(
+                all(row["top1_confuser_skill_id"] == row["negative_skill_ids"][0] for row in error_candidates)
+            )
 
 
 if __name__ == "__main__":
