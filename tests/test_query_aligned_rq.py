@@ -108,10 +108,10 @@ class QueryAlignedRQTest(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(codebooks.grad.abs().sum()), 0.0)
 
-    def test_minimum_cost_last_code_resolution_is_collision_free(self) -> None:
+    def test_hierarchical_capacity_resolution_is_collision_free(self) -> None:
         import torch
 
-        from train_query_aligned_rq import minimum_cost_unique_last_codes
+        from train_query_aligned_rq import hierarchical_capacity_unique_codes
 
         codebooks = torch.tensor(
             [
@@ -119,16 +119,75 @@ class QueryAlignedRQTest(unittest.TestCase):
                 [[0.0, 0.0], [1.0, 0.0]],
             ]
         )
-        embeddings = torch.tensor([[0.0, 0.0], [0.9, 0.0]])
+        embeddings = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
         collided = torch.tensor([[0, 0], [0, 0]])
 
-        resolved, audit = minimum_cost_unique_last_codes(
+        resolved, audit = hierarchical_capacity_unique_codes(
             collided, embeddings, codebooks
         )
 
         self.assertEqual(len({tuple(row) for row in resolved.tolist()}), 2)
         self.assertEqual(audit["post_collision_groups"], 0)
-        self.assertEqual(audit["repaired_items"], 2)
+        self.assertTrue(any(row["repaired_items"] == 2 for row in audit["level_audit"]))
+
+    def test_hierarchical_capacity_resolution_falls_back_before_last_level(self) -> None:
+        import torch
+
+        from train_query_aligned_rq import hierarchical_capacity_unique_codes
+
+        codebooks = torch.tensor(
+            [
+                [[0.0], [10.0]],
+                [[0.0], [1.0]],
+                [[0.0], [0.1]],
+            ]
+        )
+        embeddings = torch.tensor([[0.00], [0.02], [0.04], [0.06], [0.08]])
+        collided = torch.zeros((5, 3), dtype=torch.long)
+
+        resolved, audit = hierarchical_capacity_unique_codes(
+            collided, embeddings, codebooks
+        )
+
+        self.assertEqual(len({tuple(row) for row in resolved.tolist()}), 5)
+        self.assertGreater(audit["level_audit"][0]["capacity_reassignments"], 0)
+        self.assertTrue(
+            all(row["overloaded_prefix_groups"] == 0 for row in audit["post_capacity_audit"])
+        )
+
+    def test_fixed_skill_codes_control_reconstruction(self) -> None:
+        import torch
+
+        from train_query_aligned_rq import QueryAlignedResidualCodebook
+
+        initial = torch.tensor(
+            [
+                [[0.0], [10.0]],
+                [[0.0], [10.0]],
+            ]
+        )
+        model = QueryAlignedResidualCodebook(initial)
+        embedding = torch.tensor([[0.0]])
+        components = model(
+            embedding,
+            embedding,
+            embedding,
+            [],
+            [],
+            [],
+            [{(): (0, 1)}, {(0,): (0, 1), (1,): (0, 1)}],
+            skill_codes=torch.tensor([[1, 1]]),
+            semantic_weight=0.0,
+            cf_weight=0.0,
+            prefix_weight=0.0,
+            teacher_temperature=1.0,
+            student_temperature=1.0,
+        )
+
+        self.assertAlmostEqual(float(components["reconstruction_loss"]), 400.0)
+        components["loss"].backward()
+        self.assertEqual(float(model.codebooks.grad[:, 0].abs().sum()), 0.0)
+        self.assertGreater(float(model.codebooks.grad[:, 1].abs().sum()), 0.0)
 
 
 if __name__ == "__main__":

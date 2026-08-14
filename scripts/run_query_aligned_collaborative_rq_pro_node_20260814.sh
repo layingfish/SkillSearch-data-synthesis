@@ -4,8 +4,8 @@ set -euo pipefail
 bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 STAGE="${1:-}"
-if [[ "${STAGE}" != preflight && "${STAGE}" != full ]]; then
-  echo "usage: $0 {preflight|full}" >&2
+if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight ]]; then
+  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight}" >&2
   exit 2
 fi
 
@@ -27,6 +27,10 @@ fi
 
 if [[ "${STAGE}" == preflight ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_preflight_v1
+elif [[ "${STAGE}" == resume-rq-preflight ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_recovery_preflight_v1
+elif [[ "${STAGE}" == resume-rq ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2
 else
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1
 fi
@@ -219,27 +223,48 @@ PY
   DECODER_SAVE_STEPS=0
   EVAL_BEAMS=10
   EVAL_K_VALUES=1,10
+elif [[ "${STAGE}" == resume-rq-preflight ]]; then
+  RQ_STEPS=2
+  RQ_EPOCHS=1
+  DECODER_CATALOG_EPOCHS=0
+  DECODER_EPOCHS=1
+  DECODER_STEPS=2
+  DECODER_BATCH=1
+  DECODER_MAX_NEGATIVES=5
+  DECODER_SAVE_STEPS=0
 fi
 
-M0_ROOT="${OUTPUT_ROOT}/m0"
-run_torch "${PIPELINE}" train-ripor-relevance-encoder \
-  --rows "${ACTIVE_ROWS}" \
-  --skills-jsonl "${SKILLS}" \
-  --hard-negatives "${TEACHER_PANEL}" \
-  --output-dir "${M0_ROOT}" \
-  --model "${MODEL_SAFE}" \
-  --max-query-length 512 \
-  --max-skill-length 512 \
-  --decoder-length 1 \
-  --batch-size "${M0_BATCH}" \
-  --epochs "${M0_EPOCHS}" \
-  --max-steps "${M0_STEPS}" \
-  --lr 3e-5 \
-  --weight-decay 0.01 \
-  --max-negatives 1 \
-  --logging-steps 25 \
-  --seed 20260814 \
-  --bf16
+if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight ]]; then
+  M0_ROOT="${SKILLGR_QUERY_ALIGNED_M0_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/m0}"
+  if [[ "${M0_ROOT}" != /models_rw/* ]]; then
+    echo "resume M0 root must be under /models_rw: ${M0_ROOT}" >&2
+    exit 1
+  fi
+  check_sha256 "${M0_ROOT}/relevance_encoder.pt" c08d6ce0d3f7ca26b20938e37ff72aac828f2541ecfc50a047b709696ca0d519
+  check_sha256 "${M0_ROOT}/skill_embeddings.pt" 283641ad3069333997c33e5407daf535d246b800152d3d30b49afa50f495b39a
+  check_sha256 "${M0_ROOT}/query_embeddings.pt" cf0c84d18c524ff6782d6e28dece32088ef7b824317cb64815b1297334225fad
+  echo "reusing verified M0 root: ${M0_ROOT}"
+else
+  M0_ROOT="${OUTPUT_ROOT}/m0"
+  run_torch "${PIPELINE}" train-ripor-relevance-encoder \
+    --rows "${ACTIVE_ROWS}" \
+    --skills-jsonl "${SKILLS}" \
+    --hard-negatives "${TEACHER_PANEL}" \
+    --output-dir "${M0_ROOT}" \
+    --model "${MODEL_SAFE}" \
+    --max-query-length 512 \
+    --max-skill-length 512 \
+    --decoder-length 1 \
+    --batch-size "${M0_BATCH}" \
+    --epochs "${M0_EPOCHS}" \
+    --max-steps "${M0_STEPS}" \
+    --lr 3e-5 \
+    --weight-decay 0.01 \
+    --max-negatives 1 \
+    --logging-steps 25 \
+    --seed 20260814 \
+    --bf16
+fi
 
 for required in relevance_encoder.pt skill_embeddings.pt query_embeddings.pt; do
   if [[ ! -f "${M0_ROOT}/${required}" ]]; then
@@ -325,6 +350,11 @@ run_torch "${PIPELINE}" train-single-sid-decoder \
 if [[ ! -f "${DECODER_ROOT}/final/structured_decoder.pt" ]]; then
   echo "decoder final checkpoint is missing" >&2
   exit 1
+fi
+
+if [[ "${STAGE}" == resume-rq-preflight ]]; then
+  touch "${OUTPUT_ROOT}/PASSED"
+  exit 0
 fi
 
 if [[ "${STAGE}" == preflight ]]; then

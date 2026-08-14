@@ -41,7 +41,7 @@ from skill_gr_pipeline import (  # noqa: E402
 )
 
 
-ARTIFACT_FORMAT = "query_aligned_collaborative_rq_codebook_v1"
+ARTIFACT_FORMAT = "query_aligned_collaborative_rq_codebook_v2"
 
 
 def squared_euclidean_distance(x: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
@@ -68,6 +68,20 @@ def residual_encode(
         selected.append(level_centers)
         residual = residual - level_centers
     return torch.stack(codes, dim=-1), torch.stack(selected, dim=0).sum(dim=0)
+
+
+def reconstruction_from_codes(codes: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
+    """Reconstruct vectors from an explicit, fixed residual-code assignment."""
+    if codes.ndim != 2 or codes.shape[1] != codebooks.shape[0]:
+        raise ValueError(
+            "codes must have shape [items, depth] matching the codebooks, got "
+            f"codes={tuple(codes.shape)}, codebooks={tuple(codebooks.shape)}"
+        )
+    selected = [
+        codebooks[level].index_select(0, codes[:, level].long())
+        for level in range(codebooks.shape[0])
+    ]
+    return torch.stack(selected, dim=0).sum(dim=0)
 
 
 def pairwise_affinity_loss(reconstruction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -211,13 +225,17 @@ class QueryAlignedResidualCodebook(nn.Module):
         query_teacher_scores: list[torch.Tensor],
         legal_children: list[dict[tuple[int, ...], tuple[int, ...]]],
         *,
+        skill_codes: torch.Tensor | None = None,
         semantic_weight: float,
         cf_weight: float,
         prefix_weight: float,
         teacher_temperature: float,
         student_temperature: float,
     ) -> dict[str, torch.Tensor]:
-        _, reconstruction = residual_encode(skill_embeddings, self.codebooks)
+        if skill_codes is None:
+            _, reconstruction = residual_encode(skill_embeddings, self.codebooks)
+        else:
+            reconstruction = reconstruction_from_codes(skill_codes, self.codebooks)
         reconstruction_loss = F.mse_loss(reconstruction, skill_embeddings.float())
         semantic_loss = pairwise_affinity_loss(reconstruction, semantic_embeddings)
         cf_loss = pairwise_affinity_loss(reconstruction, cf_embeddings)
@@ -255,59 +273,162 @@ class QueryAlignedResidualCodebook(nn.Module):
         }
 
 
-def minimum_cost_unique_last_codes(
+def prefix_capacity_audit(codes: torch.Tensor, codebook_size: int) -> list[dict[str, int]]:
+    """Report whether every prefix fits in the code space below it."""
+    codes_cpu = codes.detach().cpu().long()
+    if codes_cpu.ndim != 2 or codes_cpu.shape[1] <= 0:
+        raise ValueError(f"codes must have shape [items, depth], got {tuple(codes_cpu.shape)}")
+    depth = int(codes_cpu.shape[1])
+    audit: list[dict[str, int]] = []
+    for prefix_length in range(1, depth + 1):
+        counts = Counter(
+            tuple(int(value) for value in row[:prefix_length])
+            for row in codes_cpu.tolist()
+        )
+        suffix_capacity = int(codebook_size ** (depth - prefix_length))
+        audit.append(
+            {
+                "prefix_length": prefix_length,
+                "suffix_capacity": suffix_capacity,
+                "prefix_groups": len(counts),
+                "max_prefix_load": max(counts.values(), default=0),
+                "overloaded_prefix_groups": sum(
+                    count > suffix_capacity for count in counts.values()
+                ),
+            }
+        )
+    return audit
+
+
+def _confidence_ordered_capacity_assignment(
+    costs: Any,
+    *,
+    child_capacity: int,
+) -> tuple[Any, int]:
+    """Assign rows to children under a hard capacity using deterministic confidence order."""
+    import numpy as np
+
+    values = np.asarray(costs, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] <= 0:
+        raise ValueError(f"cost matrix must be two-dimensional, got {values.shape}")
+    if child_capacity <= 0 or values.shape[0] > values.shape[1] * child_capacity:
+        raise ValueError(
+            "child capacity cannot hold all rows: "
+            f"rows={values.shape[0]}, children={values.shape[1]}, capacity={child_capacity}"
+        )
+    preferences = np.argsort(values, axis=1, kind="stable")
+    unconstrained = preferences[:, 0]
+    counts = np.bincount(unconstrained, minlength=values.shape[1])
+    if int(counts.max(initial=0)) <= child_capacity:
+        return unconstrained.astype(np.int64, copy=False), 0
+
+    rows = np.arange(values.shape[0], dtype=np.int64)
+    if values.shape[1] == 1:
+        margins = np.full(values.shape[0], np.inf, dtype=np.float64)
+    else:
+        margins = values[rows, preferences[:, 1]] - values[rows, preferences[:, 0]]
+    order = np.lexsort((rows, -margins))
+    remaining = np.full(values.shape[1], child_capacity, dtype=np.int64)
+    assigned = np.full(values.shape[0], -1, dtype=np.int64)
+    for row in order.tolist():
+        for child in preferences[row].tolist():
+            if remaining[child] > 0:
+                assigned[row] = child
+                remaining[child] -= 1
+                break
+    if bool((assigned < 0).any()):
+        raise RuntimeError("capacity assignment left at least one row unassigned")
+    return assigned, int(np.count_nonzero(assigned != unconstrained))
+
+
+def hierarchical_capacity_unique_codes(
     codes: torch.Tensor,
     embeddings: torch.Tensor,
     codebooks: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Resolve full-code collisions within each parent by final-level distortion."""
+    """Resolve collisions with a suffix-capacity constraint at every prefix level."""
     import numpy as np
-    from scipy.optimize import linear_sum_assignment
 
-    resolved = codes.detach().cpu().long().clone()
-    codebooks = codebooks.detach().cpu().float()
-    embeddings = embeddings.detach().cpu().float()
-    residual = embeddings.clone()
-    for level in range(codebooks.shape[0] - 1):
-        residual = residual - codebooks[level].index_select(0, resolved[:, level])
-    final_costs = squared_euclidean_distance(residual, codebooks[-1]).double().numpy()
-    prefix_groups: dict[tuple[int, ...], list[int]] = {}
-    for item_index, values in enumerate(resolved[:, :-1].tolist()):
-        prefix_groups.setdefault(tuple(int(value) for value in values), []).append(item_index)
+    if codes.ndim != 2 or codebooks.ndim != 3:
+        raise ValueError("codes and codebooks must have shapes [items, depth] and [depth, size, dim]")
+    if codes.shape[1] != codebooks.shape[0] or embeddings.shape[0] != codes.shape[0]:
+        raise ValueError("codes, embeddings, and codebooks do not share item/depth dimensions")
+    depth = int(codebooks.shape[0])
+    codebook_size = int(codebooks.shape[1])
+    if codes.shape[0] > codebook_size**depth:
+        raise ValueError(
+            f"{codes.shape[0]} items exceed the {codebook_size**depth} available full codes"
+        )
 
-    repaired_prefixes = repaired_items = changed_items = 0
-    assignment_cost = 0.0
-    max_repaired_prefix_size = 0
-    for prefix in sorted(prefix_groups):
-        item_indices = prefix_groups[prefix]
-        existing = Counter(int(resolved[item, -1]) for item in item_indices)
-        if max(existing.values()) <= 1:
-            continue
-        if len(item_indices) > codebooks.shape[1]:
-            raise ValueError(
-                f"prefix {prefix} contains {len(item_indices)} skills but only {codebooks.shape[1]} final codes"
+    device = embeddings.device
+    resolved = torch.zeros_like(codes, dtype=torch.long, device=device)
+    residual = embeddings.detach().to(device=device, dtype=torch.float32).clone()
+    codebooks_device = codebooks.detach().to(device=device, dtype=torch.float32)
+    parent_groups: dict[tuple[int, ...], list[int]] = {(): list(range(codes.shape[0]))}
+    level_audit: list[dict[str, Any]] = []
+    total_assignment_cost = 0.0
+    for level in range(depth):
+        all_costs = (
+            squared_euclidean_distance(residual, codebooks_device[level])
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        child_capacity = int(codebook_size ** (depth - level - 1))
+        repaired_parent_groups = repaired_items = capacity_reassignments = 0
+        next_parent_groups: dict[tuple[int, ...], list[int]] = {}
+        for parent in sorted(parent_groups):
+            item_indices = parent_groups[parent]
+            local_costs = np.asarray(all_costs[item_indices], dtype=np.float64)
+            unconstrained = local_costs.argmin(axis=1)
+            unconstrained_counts = np.bincount(unconstrained, minlength=codebook_size)
+            assigned, changed = _confidence_ordered_capacity_assignment(
+                local_costs,
+                child_capacity=child_capacity,
             )
-        repaired_prefixes += 1
-        repaired_items += len(item_indices)
-        max_repaired_prefix_size = max(max_repaired_prefix_size, len(item_indices))
-        local_rows, assigned = linear_sum_assignment(np.asarray(final_costs[item_indices]))
-        for local_row, code in zip(local_rows.tolist(), assigned.tolist()):
-            item_index = item_indices[local_row]
-            changed_items += int(int(resolved[item_index, -1]) != int(code))
-            resolved[item_index, -1] = int(code)
-            assignment_cost += float(final_costs[item_index, code])
+            if int(unconstrained_counts.max(initial=0)) > child_capacity:
+                repaired_parent_groups += 1
+                repaired_items += len(item_indices)
+            capacity_reassignments += changed
+            total_assignment_cost += float(local_costs[np.arange(len(item_indices)), assigned].sum())
+            item_tensor = torch.tensor(item_indices, dtype=torch.long, device=device)
+            assigned_tensor = torch.from_numpy(assigned).to(device=device, dtype=torch.long)
+            resolved[item_tensor, level] = assigned_tensor
+            for item_index, child in zip(item_indices, assigned.tolist()):
+                next_parent_groups.setdefault((*parent, int(child)), []).append(item_index)
 
-    counts = Counter(tuple(int(value) for value in row) for row in resolved.tolist())
+        selected = codebooks_device[level].index_select(0, resolved[:, level])
+        residual = residual - selected
+        max_prefix_load = max((len(items) for items in next_parent_groups.values()), default=0)
+        if max_prefix_load > child_capacity:
+            raise RuntimeError(
+                f"level {level} capacity invariant failed: load={max_prefix_load}, capacity={child_capacity}"
+            )
+        level_audit.append(
+            {
+                "level": level,
+                "child_capacity": child_capacity,
+                "parent_groups": len(parent_groups),
+                "repaired_parent_groups": repaired_parent_groups,
+                "repaired_items": repaired_items,
+                "capacity_reassignments": capacity_reassignments,
+                "output_prefix_groups": len(next_parent_groups),
+                "max_output_prefix_load": max_prefix_load,
+            }
+        )
+        parent_groups = next_parent_groups
+
+    resolved_cpu = resolved.detach().cpu().long()
+    counts = Counter(tuple(int(value) for value in row) for row in resolved_cpu.tolist())
     collision_groups = sum(count > 1 for count in counts.values())
     if collision_groups:
-        raise RuntimeError(f"minimum-cost final-code assignment left {collision_groups} collisions")
-    return resolved, {
-        "method": "minimum_cost_unique_last_code",
-        "repaired_prefixes": repaired_prefixes,
-        "repaired_items": repaired_items,
-        "changed_items": changed_items,
-        "max_repaired_prefix_size": max_repaired_prefix_size,
-        "assignment_cost": assignment_cost,
+        raise RuntimeError(f"hierarchical capacity assignment left {collision_groups} collisions")
+    return resolved_cpu, {
+        "method": "hierarchical_confidence_ordered_capacity_assignment",
+        "assignment_cost": total_assignment_cost,
+        "level_audit": level_audit,
+        "pre_capacity_audit": prefix_capacity_audit(codes, codebook_size),
+        "post_capacity_audit": prefix_capacity_audit(resolved_cpu, codebook_size),
         "post_collision_groups": collision_groups,
     }
 
@@ -473,6 +594,32 @@ def main() -> None:
         import torch.distributed as dist
 
         dist.broadcast(initial, src=0)
+
+    # The prefix objective must not be allowed to shrink its own label domain by
+    # moving every skill into the same branch.  Derive one capacity-safe RQ
+    # assignment from the M0 KMeans initialization and keep those discrete
+    # labels fixed while optimizing the continuous codebook geometry.
+    with torch.no_grad():
+        initial_nearest_codes, _ = residual_encode(relevance_device, initial)
+    if context.is_main:
+        anchored_codes_cpu, collision_audit = hierarchical_capacity_unique_codes(
+            initial_nearest_codes,
+            relevance_device,
+            initial,
+        )
+        anchored_codes = anchored_codes_cpu.to(device)
+    else:
+        anchored_codes = torch.zeros(
+            relevance.shape[0],
+            args.depth,
+            dtype=torch.long,
+            device=device,
+        )
+        collision_audit = None
+    if context.enabled:
+        dist.broadcast(anchored_codes, src=0)
+    legal_children = build_legal_children(anchored_codes)
+
     core_model = QueryAlignedResidualCodebook(initial).to(device)
     model = wrap_ddp(core_model, context)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -490,9 +637,6 @@ def main() -> None:
     skill_generator = torch.Generator(device="cpu").manual_seed(args.seed + 10_000 + context.rank)
     query_generator = torch.Generator(device="cpu").manual_seed(args.seed + 20_000 + context.rank)
     step = 0
-    snapshot_epoch = -1
-    all_codes = None
-    legal_children = None
     history_path = args.output_dir / "training_history.jsonl"
     if context.is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -500,14 +644,6 @@ def main() -> None:
             history_path.unlink()
     barrier(context)
     while step < total_steps:
-        epoch = step // steps_per_epoch
-        if epoch != snapshot_epoch:
-            with torch.no_grad():
-                all_codes = unwrap_model(model).encode(relevance_device).detach()
-            legal_children = build_legal_children(all_codes)
-            snapshot_epoch = epoch
-        assert all_codes is not None and legal_children is not None
-
         skill_indices = torch.randint(
             0,
             relevance.shape[0],
@@ -523,7 +659,7 @@ def main() -> None:
         sampled_queries = [query_examples[int(offset)] for offset in query_offsets]
         query_vectors = [query_device[item["row_index"]] for item in sampled_queries]
         query_candidate_codes = [
-            all_codes.index_select(
+            anchored_codes.index_select(
                 0,
                 torch.tensor(item["candidate_indices"], dtype=torch.long, device=device),
             )
@@ -542,6 +678,7 @@ def main() -> None:
             query_candidate_codes,
             query_teacher_scores,
             legal_children,
+            skill_codes=anchored_codes.index_select(0, skill_indices),
             semantic_weight=args.semantic_weight,
             cf_weight=args.cf_weight,
             prefix_weight=args.prefix_weight,
@@ -583,13 +720,12 @@ def main() -> None:
 
     barrier(context)
     if context.is_main:
-        trained_codebooks = unwrap_model(model).codebooks.detach().cpu().float()
-        raw_codes, _ = residual_encode(relevance, trained_codebooks)
-        resolved_codes, collision_audit = minimum_cost_unique_last_codes(
-            raw_codes,
-            relevance,
-            trained_codebooks,
-        )
+        trained_codebooks_device = unwrap_model(model).codebooks.detach()
+        trained_codebooks = trained_codebooks_device.cpu().float()
+        final_nearest_codes, _ = residual_encode(relevance_device, trained_codebooks_device)
+        resolved_codes = anchored_codes.detach().cpu().long()
+        if collision_audit is None:
+            raise RuntimeError("rank 0 is missing the anchored collision audit")
         semantic_id_map = {
             sid: [int(value) for value in resolved_codes[index].tolist()]
             for index, sid in enumerate(relevance_ids)
@@ -626,7 +762,9 @@ def main() -> None:
             "depth": int(args.depth),
             "embedding_dim": int(trained_codebooks.shape[-1]),
             "identity_latent": True,
-            "objective": "M0 reconstruction + Qwen/LightGCN affinity + query-prefix distribution",
+            "anchored_assignments": True,
+            "assignment_policy": "capacity-safe initial M0 residual KMeans assignments fixed during geometry optimization",
+            "objective": "anchored M0 reconstruction + Qwen/LightGCN affinity + query-prefix distribution",
             "source_embeddings": str(args.relevance_embeddings),
             "semantic_embeddings": str(args.semantic_embeddings),
             "cf_embeddings": str(args.cf_embeddings),
@@ -651,7 +789,14 @@ def main() -> None:
             args.output_dir / "rqvae.pt",
         )
         write_jsonl(args.output_dir / "semantic_ids.jsonl", output_rows)
-        raw_counter = Counter(tuple(int(value) for value in row) for row in raw_codes.tolist())
+        initial_raw_counter = Counter(
+            tuple(int(value) for value in row)
+            for row in initial_nearest_codes.detach().cpu().tolist()
+        )
+        final_nearest_counter = Counter(
+            tuple(int(value) for value in row)
+            for row in final_nearest_codes.detach().cpu().tolist()
+        )
         level_usage = [
             len(set(int(value) for value in resolved_codes[:, level].tolist()))
             for level in range(args.depth)
@@ -686,8 +831,21 @@ def main() -> None:
                 "weight_decay": args.weight_decay,
                 "kmeans_iters": args.kmeans_iters,
                 "seed": args.seed,
-                "pre_resolution_collision_groups": sum(count > 1 for count in raw_counter.values()),
+                "anchored_assignments": True,
+                "assignment_policy": "capacity-safe initial M0 residual KMeans assignments fixed during geometry optimization",
+                "pre_resolution_collision_groups": sum(
+                    count > 1 for count in initial_raw_counter.values()
+                ),
                 "collision_resolution": collision_audit,
+                "final_nearest_assignment_audit": {
+                    "collision_groups": sum(
+                        count > 1 for count in final_nearest_counter.values()
+                    ),
+                    "capacity_audit": prefix_capacity_audit(
+                        final_nearest_codes,
+                        args.codebook_size,
+                    ),
+                },
                 "level_usage": level_usage,
                 "codebook_embeddings": str(args.output_dir / "codebook_embeddings.pt"),
                 "semantic_ids": str(args.output_dir / "semantic_ids.jsonl"),

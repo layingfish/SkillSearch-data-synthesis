@@ -4508,6 +4508,7 @@ def _load_ripor_codebook_embeddings(
         supported_formats = {
             "ripor_m0_rq_codebook_v1",
             "query_aligned_collaborative_rq_codebook_v1",
+            "query_aligned_collaborative_rq_codebook_v2",
         }
         if payload.get("artifact_format") not in supported_formats:
             raise ValueError(

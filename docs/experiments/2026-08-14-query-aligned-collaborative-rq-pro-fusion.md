@@ -23,15 +23,15 @@ Local plan review: the main semantic risk is mixing codebook and query vectors f
 
 ## Commands
 
-Train: `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh full`
+Train: initial run used `... full`; recovery uses `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh resume-rq` and reuses the verified M0 artifact from the failed run.
 
 Eval: included in the full launcher; every periodic/final checkpoint is evaluated with `omega in {0,2,5,10,20}` under the metric protocol below.
 
 ## Outputs
 
-Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`
+Checkpoint: failed M0 source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`; recovery output `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/`.
 
-Log: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/logs/`
+Log: recovery log `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/logs/`.
 
 Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=beam_order, K={1,10,50}; checkpoint selection uses the same test-set protocol as the A800 baseline.
 
@@ -45,6 +45,8 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Unit/invariant test: gate=0 student output is allclose to base-model output
 - [x] Unit/invariant test: collision-free four-code SIDs
 - [x] 8-GPU two-step preflight
+- [ ] Unit/invariant test: overloaded prefix falls back before the final code
+- [ ] 8-GPU recovery preflight on all 14,551 M0 skill vectors
 - [x] Structured local cross-review complete
 - [x] Reviewer required? yes; fulfilled by structured local review because no delegated reviewer was requested
 
@@ -57,3 +59,7 @@ Method reference: PRO arXiv v3 (`2606.09241`, 2026-08-05), Eq. 7 and Appendix C;
 The 8-GPU preflight completed in Tianzhi job `tide-chenyufei03-10691-tibwq`. It ran on one rudder-exper node with 8xA800, passed all 9 focused node tests, completed 2 M0 optimizer steps, 2 RQ optimizer steps, 2 decoder optimizer steps, and an 8-query constrained-decoding smoke evaluation. Preflight output: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_preflight_v6/`.
 
 The full run is Tianzhi job `tide-chenyufei03-10692-iblld`, launched from commit `f0d14d46af644794853d46526b9a1f09e44d291f` on one rudder-exper node with 8xA800. It writes to the checkpoint and log paths recorded above.
+
+The first full run failed after completing all 4,692 RQ optimizer steps. The learned nearest-code assignment placed 10,223 skills under prefix `(43, 184, 90)`, which exceeds the 256 available final codes. The original postprocessor only reassigned the final code and therefore raised before writing the RQ artifact. M0 completed successfully and remains reusable: 129,341 MarginMSE pairs, 14,551 skill vectors, 100,078 query vectors, embedding width 768, and relevance checkpoint SHA-256 `c08d6ce0d3f7ca26b20938e37ff72aac828f2541ecfc50a047b709696ca0d519`.
+
+Remediation: derive collision-free hierarchical assignments from the initial M0 residual KMeans solution with an explicit capacity of `codebook_size ** remaining_depth` at every prefix, then keep those discrete assignments fixed while optimizing codebook geometry. This removes the degenerate route where prefix cross-entropy can reduce its own branching domain by collapsing assignments. The final resolver must fall back to earlier levels when a parent exceeds the next level's suffix capacity; tests cover an overloaded prefix that cannot be repaired at the final level alone. The recovery run starts from the preserved M0 artifacts and reruns RQ, decoder training, and the full checkpoint-by-fusion-weight evaluation.
