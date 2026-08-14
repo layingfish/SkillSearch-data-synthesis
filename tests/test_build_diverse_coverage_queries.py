@@ -173,6 +173,30 @@ class DiverseCoverageQueriesTest(unittest.TestCase):
         self.assertEqual(record["status"], "invalid_generation")
         self.assertTrue(any("existing_jaccard" in reason for reason in record["reject_reasons"]))
 
+    def test_natural_non_terse_query_is_valid_without_numbered_layout(self) -> None:
+        target = "skill/a"
+        skill = {"skill_id": target, "name": "Private capability", "body": "Process an input into an output."}
+        items = generated_items()
+        items[0]["query"] = (
+            "A review team has a supplied input artifact and needs a reliable processed result for a scheduled handoff. "
+            "Inspect the available content, carry out the supported transformation, preserve every user-provided value, and save "
+            "the result at the requested destination. Confirm that the output contains the expected information and remains "
+            "internally consistent before reporting completion to the reviewer."
+        )
+        response = {"choices": [{"message": {"content": json.dumps(items)}}]}
+        record = build_generation_record(
+            target=target,
+            skill=skill,
+            existing_queries=["an unrelated training query"],
+            response=response,
+            max_query_chars=1500,
+            existing_jaccard_threshold=1.0,
+            pairwise_jaccard_threshold=1.0,
+        )
+        self.assertEqual(record["status"], "complete", record["reject_reasons"])
+        self.assertFalse(record["queries"][0]["has_task_marker"])
+        self.assertFalse(record["queries"][0]["has_numbered_steps"])
+
 
 if __name__ == "__main__":
     unittest.main()

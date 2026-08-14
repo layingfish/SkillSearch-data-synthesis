@@ -56,7 +56,7 @@ MODE3_PREFIX = "pseudo:zero_multi_mode:"
 COVERAGE_PREFIX = "pseudo:diverse_coverage:"
 COVERAGE_SOURCE = "training_gr_diverse_coverage_pseudo_query"
 PROMPT_VERSION = "gr_diverse_coverage_v1_20260814"
-MATERIALIZATION_VERSION = "diverse_coverage_layout_v2_20260814"
+MATERIALIZATION_VERSION = "diverse_coverage_layout_v3_20260814"
 SELECTION_BASIS = "zero_multi_training_query_coverage"
 QUERY_INSTRUCTION = (
     "Instruct: Given a task description, retrieve the most relevant skill document "
@@ -341,18 +341,15 @@ def build_generation_record(
         sanitized, sanitizations = sanitize_skill_references(query, skill)
         query = canonicalize_query(sanitized, max_query_chars)
         item_reasons: list[str] = []
-        minimum_chars = 120 if mode == "terse_natural" else 400
+        minimum_chars = 120 if mode == "terse_natural" else 300
         maximum_chars = 500 if mode == "terse_natural" else max_query_chars
         if len(query) < minimum_chars:
             item_reasons.append(f"short:{len(query)}<{minimum_chars}")
         if len(query) > maximum_chars:
             item_reasons.append(f"long:{len(query)}>{maximum_chars}")
-        if mode != "terse_natural":
-            if "you need to:" not in query.lower():
-                item_reasons.append("missing_task_marker")
-            if not re.search(r"(^|\n)\s*1[.)]\s", query):
-                item_reasons.append("missing_numbered_steps")
-        elif re.search(r"(^|\n)\s*\d+[.)]\s", query):
+        has_task_marker = "you need to:" in query.lower()
+        has_numbered_steps = bool(re.search(r"(^|\n)\s*1[.)]\s", query))
+        if mode == "terse_natural" and re.search(r"(^|\n)\s*\d+[.)]\s", query):
             item_reasons.append("terse_has_numbered_steps")
         item_reasons.extend(f"leak:{reason}" for reason in exact_leak_reasons(query, skill, []))
         normalized_key = re.sub(r"\s+", " ", query).strip().lower()
@@ -376,6 +373,8 @@ def build_generation_record(
                 "query": query,
                 "max_existing_jaccard": max_existing,
                 "max_pairwise_jaccard": max_pairwise,
+                "has_task_marker": has_task_marker,
+                "has_numbered_steps": has_numbered_steps,
                 "sanitized_reference_types": sorted(set(sanitizations)),
                 "reject_reasons": item_reasons,
             }
@@ -472,6 +471,15 @@ def materialize(
                         "existing_view_indices": existing_indices[target],
                         "max_existing_jaccard": query_record["max_existing_jaccard"],
                         "max_pairwise_jaccard": query_record["max_pairwise_jaccard"],
+                        "has_task_marker": bool(
+                            query_record.get("has_task_marker", "you need to:" in query.lower())
+                        ),
+                        "has_numbered_steps": bool(
+                            query_record.get(
+                                "has_numbered_steps",
+                                re.search(r"(^|\n)\s*1[.)]\s", query),
+                            )
+                        ),
                         "reference_sanitized": bool(query_record.get("sanitized_reference_types")),
                         "sanitized_reference_types": query_record.get("sanitized_reference_types") or [],
                     },
