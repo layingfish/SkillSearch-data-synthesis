@@ -140,6 +140,38 @@ def semantic_model_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def validate_model_config_provenance(
+    recorded_config: Any,
+    recorded_config_sha256: Any,
+    actual_config: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Verify the original config artifact, then compare path-independent behavior."""
+    if not recorded_config_sha256:
+        raise ValueError(f"{label} checkpoint is missing model_config_sha256 provenance")
+    if not isinstance(recorded_config, dict):
+        raise ValueError(f"{label} checkpoint is missing its complete model_config")
+    if stable_payload_sha256(recorded_config) != str(recorded_config_sha256):
+        raise ValueError(f"{label} checkpoint model_config does not match its recorded hash")
+
+    recorded_semantic = semantic_model_config_payload(recorded_config)
+    actual_semantic = semantic_model_config_payload(actual_config)
+    recorded_semantic_hash = stable_payload_sha256(recorded_semantic)
+    actual_semantic_hash = stable_payload_sha256(actual_semantic)
+    if recorded_semantic_hash != actual_semantic_hash:
+        differing_keys = sorted(
+            key
+            for key in set(recorded_config) | set(actual_config)
+            if key != "_name_or_path" and recorded_config.get(key) != actual_config.get(key)
+        )
+        raise ValueError(
+            f"{label} configuration mismatch: "
+            f"recorded={recorded_semantic_hash}, actual={actual_semantic_hash}, "
+            f"differing_keys={differing_keys[:10]}"
+        )
+
+
 def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     """Return a streaming SHA-256 for a checkpoint/artifact file."""
     digest = hashlib.sha256()
@@ -7085,31 +7117,14 @@ def _initialize_structured_training_model(
                 "from train-ripor-relevance-encoder"
             )
         m0_config_hash = relevance_checkpoint.get("model_config_sha256")
-        if not m0_config_hash:
-            raise ValueError("M0 relevance checkpoint is missing model_config_sha256 provenance")
         m0_config = relevance_checkpoint.get("model_config")
-        if not isinstance(m0_config, dict):
-            raise ValueError("M0 relevance checkpoint is missing its complete model_config")
-        if stable_payload_sha256(m0_config) != str(m0_config_hash):
-            raise ValueError("M0 relevance checkpoint model_config does not match its recorded hash")
         actual_config = core_model.backbone.config.to_dict()
-        m0_semantic_config_hash = stable_payload_sha256(
-            semantic_model_config_payload(m0_config)
+        validate_model_config_provenance(
+            m0_config,
+            m0_config_hash,
+            actual_config,
+            label="M0/GR model",
         )
-        actual_semantic_config_hash = stable_payload_sha256(
-            semantic_model_config_payload(actual_config)
-        )
-        if m0_semantic_config_hash != actual_semantic_config_hash:
-            differing_keys = sorted(
-                key
-                for key in set(m0_config) | set(actual_config)
-                if key != "_name_or_path" and m0_config.get(key) != actual_config.get(key)
-            )
-            raise ValueError(
-                "M0/GR model configuration mismatch: "
-                f"m0={m0_semantic_config_hash}, gr={actual_semantic_config_hash}, "
-                f"differing_keys={differing_keys[:10]}"
-            )
         expected_state_keys = relevance_checkpoint.get("state_keys")
         if not isinstance(expected_state_keys, list) or not expected_state_keys:
             raise ValueError("M0 relevance checkpoint is missing its complete state_keys schema")
@@ -8575,12 +8590,12 @@ def load_frozen_pro_relevance_encoder(
 
     model = T5Model.from_pretrained(architecture_model)
     expected_config_hash = checkpoint.get("model_config_sha256")
-    actual_config_hash = stable_payload_sha256(model.config.to_dict())
-    if not expected_config_hash or str(expected_config_hash) != actual_config_hash:
-        raise ValueError(
-            "PRO M0/model configuration mismatch: "
-            f"m0={expected_config_hash}, model={actual_config_hash}"
-        )
+    validate_model_config_provenance(
+        checkpoint.get("model_config"),
+        expected_config_hash,
+        model.config.to_dict(),
+        label="PRO M0/model",
+    )
     normalized_state = {
         (key[len("backbone.") :] if key.startswith("backbone.") else key): value
         for key, value in state.items()

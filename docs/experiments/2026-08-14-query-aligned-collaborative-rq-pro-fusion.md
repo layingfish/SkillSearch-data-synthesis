@@ -23,13 +23,13 @@ Local plan review: the main semantic risk is mixing codebook and query vectors f
 
 ## Commands
 
-Train: initial run used `... full`; RQ recovery used `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh resume-rq`; decoder recovery uses the same launcher with `resume-decoder`. The recovery stages reuse artifacts only after exact SHA-256 checks.
+Train: initial run used `... full`; RQ recovery used `SKILLGR_LAUNCH_COMMIT=<commit> bash scripts/run_query_aligned_collaborative_rq_pro_node_20260814.sh resume-rq`; decoder recovery used the same launcher with `resume-decoder`. Evaluation recovery will use `resume-eval`. Every recovery stage reuses artifacts only after exact SHA-256 and structure checks.
 
 Eval: included in the full launcher; every periodic/final checkpoint is evaluated with `omega in {0,2,5,10,20}` under the metric protocol below.
 
 ## Outputs
 
-Checkpoint: M0 source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`; completed RQ source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq/`; decoder recovery output `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/`.
+Checkpoint: M0 source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`; completed RQ source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq/`; completed decoder source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder/`; evaluation recovery output `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4/`.
 
 Log: RQ recovery log `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/logs/`; decoder recovery log `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/logs/`.
 
@@ -50,8 +50,8 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Structured local cross-review complete
 - [x] Reviewer required? yes; fulfilled by structured local review because no delegated reviewer was requested
 - [x] Full strict-teacher coverage audit over 129,341 expanded query rows
-- [x] Local pipeline suite: 88 tests passed; 27 torch-dependent tests skipped in the CPU-only local environment
-- [ ] On-node variable-candidate tensor invariant
+- [x] Local pipeline suite after evaluation recovery: 90 tests passed; 27 torch-dependent tests skipped in the CPU-only local environment
+- [x] On-node variable-candidate tensor invariant: 13 focused tests passed before decoder recovery
 
 ## Result / Notes
 
@@ -74,3 +74,7 @@ Recovery preflight job `tide-chenyufei03-10694-trbne` passed from commit `46c974
 Formal RQ recovery job `tide-chenyufei03-10695-olgan` completed all 4,692 optimizer steps on one rudder-exper node with 8xA800. The capacity-safe assignment produced 14,551 unique four-code SIDs and zero overloaded prefix groups at every depth. Artifact hashes: `rqvae.pt=14b23af2101a1c4aa38416d6d984a1f8f3ab683ffceb2cab3c9b4cdac3ad875c`, `codebook_embeddings.pt=d6eb64f9d888f40db2334f53906fd5b19dc035cc82b4af4d935fe2cd895fa0a3`, `semantic_ids.jsonl=8c0e95b30940669b3e74271e6a6d667036568a0b998a5069be49cab4ee96a451`, and `rqvae_manifest.json=eda8b99dbeeb9e35e94c4aa49d9bedef240c35579735ca81b3bf6ae54d0e0828`.
 
 The same job completed all 1,365 catalog optimizer steps (`catalog_epochs=3`, global batch=32) and then failed at the first query batch. The frozen teacher panel has fewer than 49 valid negatives after excluding every GT sibling for some multi-GT queries. Full expanded-row audit (`query_train_rows=129,341`, requested maximum=49) found 46 negatives for 8 rows, 47 for 633 rows, 48 for 7,505 rows, and 49 for 121,195 rows. Recovery keeps `max_negatives=49`, samples only candidates with finite frozen teacher scores, accepts the audited per-row range 46--49, and records the distribution in checkpoint provenance. No weak or fabricated teacher score is introduced.
+
+Decoder recovery job `tide-chenyufei03-10697-soipk` passed 13 focused on-node tests and completed training on one rudder-exper node with 8xA800. It finished 1,365 catalog optimizer steps (`catalog_epochs=3`, global batch=32) and 20,210 query optimizer steps (`query_epochs=5`, global batch=32), writing 50 periodic checkpoints plus `final`. The query-stage epoch mean CE values were 3.017245, 2.472590, 1.939909, 1.540114, and 1.307009 under this fixed run configuration.
+
+The subsequent 51-checkpoint by 5-weight evaluation stopped during the first worker tasks. `omega=0` loaded successfully, while every positive weight triggered a false M0 configuration mismatch because the PRO evaluation loader hashed the decoder run's local `_name_or_path`. The training-side check had already established that this is the only differing field. Recovery verifies the M0 checkpoint's original full config against its recorded hash, compares all cross-directory model-behavior fields after removing only `_name_or_path`, and reruns only the 255 evaluation tasks in a fresh output root.

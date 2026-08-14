@@ -4,8 +4,8 @@ set -euo pipefail
 bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 STAGE="${1:-}"
-if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder ]]; then
-  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder}" >&2
+if [[ "${STAGE}" != preflight && "${STAGE}" != full && "${STAGE}" != resume-rq && "${STAGE}" != resume-rq-preflight && "${STAGE}" != resume-decoder && "${STAGE}" != resume-eval ]]; then
+  echo "usage: $0 {preflight|full|resume-rq|resume-rq-preflight|resume-decoder|resume-eval}" >&2
   exit 2
 fi
 
@@ -33,6 +33,8 @@ elif [[ "${STAGE}" == resume-rq ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2
 elif [[ "${STAGE}" == resume-decoder ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3
+elif [[ "${STAGE}" == resume-eval ]]; then
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4
 else
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1
 fi
@@ -165,6 +167,8 @@ PYTHONPATH="${CODE_ROOT}/tests:${CODE_ROOT}/scripts:${PYTHONPATH}" CUDA_VISIBLE_
   test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_residual_geometry_matches_closed_form_and_legal_order \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_frozen_pro_query_vector_reproduces_m0_decoder_start_pooling \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_pro_fusion_zero_weight_preserves_beam_scores_and_order \
+  test_skill_gr_pipeline.SkillGRPipelineTest.test_model_config_provenance_allows_only_local_load_path_difference \
+  test_skill_gr_pipeline.SkillGRPipelineTest.test_model_config_provenance_verifies_recorded_full_hash \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_prefix_distribution_distillation_aggregates_teacher_mass_by_parent \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_strict_ripor_candidate_batch_uses_all_available_scored_negatives_up_to_max \
   test_skill_gr_pipeline.SkillGRPipelineTest.test_ripor_teacher_candidate_audit_records_variable_strict_coverage \
@@ -238,7 +242,7 @@ elif [[ "${STAGE}" == resume-rq-preflight ]]; then
   DECODER_SAVE_STEPS=0
 fi
 
-if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder ]]; then
+if [[ "${STAGE}" == resume-rq || "${STAGE}" == resume-rq-preflight || "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval ]]; then
   M0_ROOT="${SKILLGR_QUERY_ALIGNED_M0_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/m0}"
   if [[ "${M0_ROOT}" != /models_rw/* ]]; then
     echo "resume M0 root must be under /models_rw: ${M0_ROOT}" >&2
@@ -277,7 +281,7 @@ for required in relevance_encoder.pt skill_embeddings.pt query_embeddings.pt; do
   fi
 done
 
-if [[ "${STAGE}" == resume-decoder ]]; then
+if [[ "${STAGE}" == resume-decoder || "${STAGE}" == resume-eval ]]; then
   RQ_ROOT="${SKILLGR_QUERY_ALIGNED_RQ_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq}"
   if [[ "${RQ_ROOT}" != /models_rw/* ]]; then
     echo "resume RQ root must be under /models_rw: ${RQ_ROOT}" >&2
@@ -325,44 +329,68 @@ for required in codebook_embeddings.pt semantic_ids.jsonl rqvae_manifest.json; d
   fi
 done
 
-DECODER_ROOT="${OUTPUT_ROOT}/decoder"
-run_torch "${PIPELINE}" train-single-sid-decoder \
-  --rows "${ACTIVE_ROWS}" \
-  --dev-rows "${ACTIVE_DEV_ROWS}" \
-  --semantic-ids "${RQ_ROOT}/semantic_ids.jsonl" \
-  --skills-jsonl "${SKILLS}" \
-  --output-dir "${DECODER_ROOT}" \
-  --model "${MODEL_SAFE}" \
-  --query-loss expanded_ce \
-  --catalog-epochs "${DECODER_CATALOG_EPOCHS}" \
-  --catalog-max-steps -1 \
-  --max-source-length 2048 \
-  --batch-size "${DECODER_BATCH}" \
-  --eval-batch-size "${DECODER_BATCH}" \
-  --epochs "${DECODER_EPOCHS}" \
-  --max-steps "${DECODER_STEPS}" \
-  --lr 3e-4 \
-  --warmup-ratio 0 \
-  --lr-scheduler linear \
-  --weight-decay 0 \
-  --logging-steps 25 \
-  --eval-steps 0 \
-  --save-steps "${DECODER_SAVE_STEPS}" \
-  --lightweight-checkpoints \
-  --no-padding-distributed-sampler \
-  --seed 20260814 \
-  --ripor-relevance-checkpoint "${M0_ROOT}/relevance_encoder.pt" \
-  --ripor-codebook-embeddings "${RQ_ROOT}/codebook_embeddings.pt" \
-  --ripor-loss-weight 0 \
-  --sequential-ce-weight 1 \
-  --ripor-max-negatives "${DECODER_MAX_NEGATIVES}" \
-  --ripor-negative-sampling top \
-  --ripor-hard-negatives "${TEACHER_PANEL}" \
-  --prefix-distill-loss-weight 1 \
-  --prefix-distill-teacher-temperature 0.05 \
-  --prefix-distill-student-temperature 1 \
-  --no-load-best-model-at-end \
-  --bf16
+if [[ "${STAGE}" == resume-eval ]]; then
+  DECODER_ROOT="${SKILLGR_QUERY_ALIGNED_DECODER_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder}"
+  if [[ "${DECODER_ROOT}" != /models_rw/* ]]; then
+    echo "resume decoder root must be under /models_rw: ${DECODER_ROOT}" >&2
+    exit 1
+  fi
+  check_sha256 "${DECODER_ROOT}/single_sid_decoder_train_manifest.json" a50b0c609dce1e199aece92e23003929720f2ed83538ea3e83c6094518728917
+  check_sha256 "${DECODER_ROOT}/final/structured_decoder.pt" 3fb015dcdb46f02bdf100f9ecb0b3e834bbb5c79b9e71205b314ec032066fb67
+  for step in $(seq 400 400 20000); do
+    if [[ ! -s "${DECODER_ROOT}/checkpoint-${step}/structured_decoder.pt" ]]; then
+      echo "decoder checkpoint is missing or empty: checkpoint-${step}" >&2
+      exit 1
+    fi
+  done
+  mapfile -t PERIODIC_CHECKPOINTS < <(
+    find "${DECODER_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'checkpoint-*' -print
+  )
+  if [[ "${#PERIODIC_CHECKPOINTS[@]}" -ne 50 ]]; then
+    echo "expected exactly 50 periodic decoder checkpoints, found ${#PERIODIC_CHECKPOINTS[@]}" >&2
+    exit 1
+  fi
+  echo "reusing verified decoder root: ${DECODER_ROOT}"
+else
+  DECODER_ROOT="${OUTPUT_ROOT}/decoder"
+  run_torch "${PIPELINE}" train-single-sid-decoder \
+    --rows "${ACTIVE_ROWS}" \
+    --dev-rows "${ACTIVE_DEV_ROWS}" \
+    --semantic-ids "${RQ_ROOT}/semantic_ids.jsonl" \
+    --skills-jsonl "${SKILLS}" \
+    --output-dir "${DECODER_ROOT}" \
+    --model "${MODEL_SAFE}" \
+    --query-loss expanded_ce \
+    --catalog-epochs "${DECODER_CATALOG_EPOCHS}" \
+    --catalog-max-steps -1 \
+    --max-source-length 2048 \
+    --batch-size "${DECODER_BATCH}" \
+    --eval-batch-size "${DECODER_BATCH}" \
+    --epochs "${DECODER_EPOCHS}" \
+    --max-steps "${DECODER_STEPS}" \
+    --lr 3e-4 \
+    --warmup-ratio 0 \
+    --lr-scheduler linear \
+    --weight-decay 0 \
+    --logging-steps 25 \
+    --eval-steps 0 \
+    --save-steps "${DECODER_SAVE_STEPS}" \
+    --lightweight-checkpoints \
+    --no-padding-distributed-sampler \
+    --seed 20260814 \
+    --ripor-relevance-checkpoint "${M0_ROOT}/relevance_encoder.pt" \
+    --ripor-codebook-embeddings "${RQ_ROOT}/codebook_embeddings.pt" \
+    --ripor-loss-weight 0 \
+    --sequential-ce-weight 1 \
+    --ripor-max-negatives "${DECODER_MAX_NEGATIVES}" \
+    --ripor-negative-sampling top \
+    --ripor-hard-negatives "${TEACHER_PANEL}" \
+    --prefix-distill-loss-weight 1 \
+    --prefix-distill-teacher-temperature 0.05 \
+    --prefix-distill-student-temperature 1 \
+    --no-load-best-model-at-end \
+    --bf16
+fi
 
 if [[ ! -f "${DECODER_ROOT}/final/structured_decoder.pt" ]]; then
   echo "decoder final checkpoint is missing" >&2
@@ -444,7 +472,7 @@ for pid in "${worker_pids[@]}"; do
   wait "${pid}"
 done
 
-"${PYTHON_BIN}" - "${OUTPUT_ROOT}" <<'PY'
+"${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${DECODER_ROOT}" <<'PY'
 import hashlib
 import json
 import os
@@ -452,6 +480,7 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+decoder_root = Path(sys.argv[2])
 records = []
 for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json")):
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))["overall"]
@@ -468,10 +497,22 @@ for metrics_path in sorted((root / "eval").glob("*/ranked_metrics_single.json"))
             "r50": metrics["@50"]["recall"],
         }
     )
-expected = len(list((root / "decoder").glob("checkpoint-*"))) + 1
-expected *= 5
-if len(records) != expected:
-    raise SystemExit(f"evaluation matrix incomplete: expected={expected}, observed={len(records)}")
+fusion_weights = [0, 2, 5, 10, 20]
+checkpoint_labels = [path.name for path in decoder_root.glob("checkpoint-*")] + ["final"]
+expected_labels = {
+    f"{checkpoint_label}_omega{weight}"
+    for checkpoint_label in checkpoint_labels
+    for weight in fusion_weights
+}
+observed_labels = {record["label"] for record in records}
+if len(records) != len(expected_labels) or observed_labels != expected_labels:
+    missing = sorted(expected_labels - observed_labels)
+    extra = sorted(observed_labels - expected_labels)
+    raise SystemExit(
+        "evaluation matrix incomplete: "
+        f"expected={len(expected_labels)}, observed={len(records)}, "
+        f"missing={missing[:5]}, extra={extra[:5]}"
+    )
 best = max(records, key=lambda row: (row["r1"], row["r10"], row["r50"], -float(row["fusion_weight"])))
 checkpoint_file = Path(best["checkpoint"]) / "structured_decoder.pt"
 hasher = hashlib.sha256()
@@ -488,7 +529,7 @@ selection = {
         "decoder_head": "ce",
         "score_transform": "logprob",
         "checkpoint_selection": "Official core75 single R@1, then R@10, then R@50",
-        "fusion_weights": [0, 2, 5, 10, 20],
+        "fusion_weights": fusion_weights,
     },
     "best": {**best, "checkpoint_sha256": digest},
     "records": records,

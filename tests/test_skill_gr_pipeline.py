@@ -79,6 +79,7 @@ from skill_gr_pipeline import (  # noqa: E402
     save_structured_decoder_checkpoint,
     semantic_model_config_payload,
     semantic_ids_sha256,
+    stable_payload_sha256,
     setting_contract_provenance,
     sibling_negative_exclusion_values,
     sequence_contrastive_candidate_audit,
@@ -90,6 +91,7 @@ from skill_gr_pipeline import (  # noqa: E402
     validate_checkpoint_semantic_ids,
     validate_letter_tokenizer_manifest,
     validate_method_setting_contract,
+    validate_model_config_provenance,
     validate_rank_capacity,
     validate_structured_resume_plan,
 )
@@ -127,6 +129,45 @@ class SkillGRPipelineTest(unittest.TestCase):
             semantic_model_config_payload(left),
             semantic_model_config_payload(right),
         )
+
+    def test_model_config_provenance_allows_only_local_load_path_difference(self) -> None:
+        recorded = {
+            "_name_or_path": "/models/run-a/t5-base",
+            "d_model": 768,
+            "num_layers": 12,
+        }
+        recorded_hash = stable_payload_sha256(recorded)
+        actual = {**recorded, "_name_or_path": "/models/run-b/t5-base"}
+
+        validate_model_config_provenance(
+            recorded,
+            recorded_hash,
+            actual,
+            label="PRO M0/model",
+        )
+
+        with self.assertRaisesRegex(ValueError, "differing_keys=.*num_layers"):
+            validate_model_config_provenance(
+                recorded,
+                recorded_hash,
+                {**actual, "num_layers": 6},
+                label="PRO M0/model",
+            )
+
+    def test_model_config_provenance_verifies_recorded_full_hash(self) -> None:
+        recorded = {
+            "_name_or_path": "/models/run-a/t5-base",
+            "d_model": 768,
+        }
+        stale_hash = stable_payload_sha256({**recorded, "_name_or_path": "/models/other/t5-base"})
+
+        with self.assertRaisesRegex(ValueError, "does not match its recorded hash"):
+            validate_model_config_provenance(
+                recorded,
+                stale_hash,
+                {**recorded, "_name_or_path": "/models/run-b/t5-base"},
+                label="PRO M0/model",
+            )
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_pro_residual_geometry_matches_closed_form_and_legal_order(self) -> None:
