@@ -184,7 +184,7 @@ class QueryAlignedRQTest(unittest.TestCase):
             student_temperature=1.0,
         )
 
-        self.assertAlmostEqual(float(components["reconstruction_loss"]), 400.0)
+        self.assertAlmostEqual(float(components["reconstruction_loss"].detach()), 400.0)
         components["loss"].backward()
         self.assertEqual(float(model.codebooks.grad[:, 0].abs().sum()), 0.0)
         self.assertGreater(float(model.codebooks.grad[:, 1].abs().sum()), 0.0)

@@ -45,8 +45,8 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Unit/invariant test: gate=0 student output is allclose to base-model output
 - [x] Unit/invariant test: collision-free four-code SIDs
 - [x] 8-GPU two-step preflight
-- [ ] Unit/invariant test: overloaded prefix falls back before the final code
-- [ ] 8-GPU recovery preflight on all 14,551 M0 skill vectors
+- [x] Unit/invariant test: overloaded prefix falls back before the final code
+- [x] 8-GPU recovery preflight on all 14,551 M0 skill vectors
 - [x] Structured local cross-review complete
 - [x] Reviewer required? yes; fulfilled by structured local review because no delegated reviewer was requested
 
@@ -65,3 +65,5 @@ The first full run failed after completing all 4,692 RQ optimizer steps. The lea
 Remediation: derive collision-free hierarchical assignments from the initial M0 residual KMeans solution with an explicit capacity of `codebook_size ** remaining_depth` at every prefix, then keep those discrete assignments fixed while optimizing codebook geometry. This removes the degenerate route where prefix cross-entropy can reduce its own branching domain by collapsing assignments. The final resolver must fall back to earlier levels when a parent exceeds the next level's suffix capacity; tests cover an overloaded prefix that cannot be repaired at the final level alone. The recovery run starts from the preserved M0 artifacts and reruns RQ, decoder training, and the full checkpoint-by-fusion-weight evaluation.
 
 Recovery preflight job `tide-chenyufei03-10693-mblii` validated the v2 RQ artifact on all 14,551 skills: the initial assignment had 410 colliding full-code groups; hierarchical assignment made 520 final-level reassignments across 403 parent prefixes, produced 14,551 unique four-code SIDs, and left zero overloaded prefixes at every depth. Decoder initialization then rejected a configuration hash mismatch. The only differing field was `_name_or_path`: the preserved M0 recorded the v1 control-directory path while the recovery decoder loaded the byte-identical model through its v2 control-directory path. The check now verifies the original full config against its stored hash, then compares all model-behavior fields while excluding only `_name_or_path`.
+
+Recovery preflight job `tide-chenyufei03-10694-trbne` passed from commit `46c9740ba6b7abe46c994448cfd8967c43977706`. Conditions: one rudder-exper node with 8xA800; all 14,551 M0 skill vectors; 4 levels with 256 codes per level; 25 KMeans iterations; 2 RQ optimizer steps; full 129,341-row query-source length audit; 2 decoder optimizer steps; reused M0 checkpoint SHA-256 `c08d6ce0d3f7ca26b20938e37ff72aac828f2541ecfc50a047b709696ca0d519`. Output: `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_recovery_preflight_v2/`.
