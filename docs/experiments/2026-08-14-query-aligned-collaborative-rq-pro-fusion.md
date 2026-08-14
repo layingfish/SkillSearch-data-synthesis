@@ -1,5 +1,5 @@
 # Experiment: Query-aligned collaborative RQ with PRO fusion
-Status: running
+Status: done
 Risk Tier: 3
 
 ## Goal / Hypothesis / Change Scope
@@ -29,9 +29,9 @@ Eval: included in the full launcher; every periodic/final checkpoint is evaluate
 
 ## Outputs
 
-Checkpoint: M0 source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`; completed RQ source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq/`; completed decoder source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder/`; evaluation recovery output `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v4/`.
+Checkpoint: M0 source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v1/`; completed RQ source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/rq/`; completed decoder source `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/decoder/`; raw, official-normalized, and fractional evaluation outputs under the corresponding `v4`, `v5`, and `v6` experiment roots.
 
-Log: RQ recovery log `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2/logs/`; decoder recovery log `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v3/logs/`.
+Log: RQ recovery log under the `v2/logs/` experiment root; decoder recovery log under `v3/logs/`; final fractional evaluation logs under `/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v6/logs/`.
 
 Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=beam_order, K={1,10,50}; checkpoint selection uses the same test-set protocol as the A800 baseline.
 
@@ -53,6 +53,7 @@ Metrics: Official core75, single subset=24 queries, beam=50, rank_aggregation=be
 - [x] Local pipeline suite after normalized-fusion recovery: 91 tests passed; 28 torch-dependent tests skipped in the CPU-only local environment
 - [x] On-node variable-candidate tensor invariant: 13 focused tests passed before decoder recovery
 - [x] On-node official PRO normalization invariant: 16 focused tests passed before normalized evaluation
+- [x] Final matrix closure: 510 unique checkpoint-weight labels across 51 checkpoints and 10 weights
 
 ## Result / Notes
 
@@ -87,3 +88,7 @@ Post-result source audit found that the raw-weight sweep omitted the official `s
 Official-normalization job `tide-chenyufei03-10699-tjmkd` passed 16 focused on-node tests and completed all 204 new tasks on one rudder-exper node with 8xA800. Conditions: 51 periodic/final checkpoints, Official core75 single subset with 24 queries, beam=50, CE log-probability scoring, full-current-level-codebook z-score, and positive weights in `{2,5,10,20}`; the 51 verified `omega=0` records were reused. The best positive result was checkpoint-14000 with `omega=2`: R@1=29.1667%, R@10=33.3333%, and R@50=37.5000%. The overall winner remained checkpoint-17200 with `omega=0`: R@1=33.3333%, R@10=41.6667%, and R@50=45.8333%. Selection SHA-256 is `39222ecd560f96d531d4683fe7b1b2143eac196b56976d84f7076fac5d848d02`.
 
 The monotonic degradation from `omega=2` toward larger normalized weights shows that the official multimodal scale remains too strong for this T5 M0/RQ geometry. The final fusion search reuses all 255 verified normalized-matrix records and evaluates 255 new tasks for `omega in {0.1,0.25,0.5,1.0,1.5}` across the same 51 checkpoints.
+
+Fractional-weight job `tide-chenyufei03-10700-bfpem` completed normally with zero pod restarts on one rudder-exper node with 8xA800. The merged matrix contains 510 unique records: 51 checkpoints times normalized weights `{0,0.1,0.25,0.5,1.0,1.5,2,5,10,20}`, where `omega=0` is normalization-invariant. At checkpoint-17200, `omega=0`, `0.1`, `0.25`, and `0.5` all produced the same R@1/R@10/R@50 values of 33.3333%/41.6667%/45.8333% under Official core75 single=24, beam=50, beam-order, CE log-probability scoring. The deterministic tie-break selected `omega=0`. Weights at or above `1.0` reduced R@1. Final selection SHA-256: `0cd91f7779c32cc81529ca84d4468dbf46fae814a9bacbd4be3321f4e7920606`; selected checkpoint SHA-256: `2b10502d40fd51d7f1aea6395433800575c2a68a24fc0bc0cb9c9e3316e7767f`.
+
+Against the cum_082 A800 anchor at 45.8333%/54.1667%/54.1667% under the same Official core75 single=24, beam=50, beam-order protocol, the final method is lower by 12.5000/12.5000/8.3333 percentage points at R@1/R@10/R@50. PRO fusion cannot recover this gap: small normalized weights leave the winner unchanged, and larger weights degrade it. Further omega tuning is not warranted for this M0/RQ geometry.
