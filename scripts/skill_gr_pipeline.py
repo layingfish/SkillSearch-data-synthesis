@@ -133,6 +133,13 @@ def stable_payload_sha256(payload: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def semantic_model_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    """Remove the local load path while retaining every model-behavior field."""
+    result = dict(config)
+    result.pop("_name_or_path", None)
+    return result
+
+
 def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     """Return a streaming SHA-256 for a checkpoint/artifact file."""
     digest = hashlib.sha256()
@@ -6998,11 +7005,28 @@ def _initialize_structured_training_model(
         m0_config_hash = relevance_checkpoint.get("model_config_sha256")
         if not m0_config_hash:
             raise ValueError("M0 relevance checkpoint is missing model_config_sha256 provenance")
-        actual_config_hash = stable_payload_sha256(core_model.backbone.config.to_dict())
-        if str(m0_config_hash) != actual_config_hash:
+        m0_config = relevance_checkpoint.get("model_config")
+        if not isinstance(m0_config, dict):
+            raise ValueError("M0 relevance checkpoint is missing its complete model_config")
+        if stable_payload_sha256(m0_config) != str(m0_config_hash):
+            raise ValueError("M0 relevance checkpoint model_config does not match its recorded hash")
+        actual_config = core_model.backbone.config.to_dict()
+        m0_semantic_config_hash = stable_payload_sha256(
+            semantic_model_config_payload(m0_config)
+        )
+        actual_semantic_config_hash = stable_payload_sha256(
+            semantic_model_config_payload(actual_config)
+        )
+        if m0_semantic_config_hash != actual_semantic_config_hash:
+            differing_keys = sorted(
+                key
+                for key in set(m0_config) | set(actual_config)
+                if key != "_name_or_path" and m0_config.get(key) != actual_config.get(key)
+            )
             raise ValueError(
                 "M0/GR model configuration mismatch: "
-                f"m0={m0_config_hash}, gr={actual_config_hash}"
+                f"m0={m0_semantic_config_hash}, gr={actual_semantic_config_hash}, "
+                f"differing_keys={differing_keys[:10]}"
             )
         expected_state_keys = relevance_checkpoint.get("state_keys")
         if not isinstance(expected_state_keys, list) or not expected_state_keys:

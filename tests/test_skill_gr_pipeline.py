@@ -76,6 +76,7 @@ from skill_gr_pipeline import (  # noqa: E402
     remap_row_skill_aliases,
     resolve_eval_max_source_length,
     save_structured_decoder_checkpoint,
+    semantic_model_config_payload,
     semantic_ids_sha256,
     setting_contract_provenance,
     sibling_negative_exclusion_values,
@@ -104,6 +105,28 @@ from train_letter_rqvae_official import (  # noqa: E402
 
 
 class SkillGRPipelineTest(unittest.TestCase):
+    def test_semantic_model_config_ignores_only_local_load_path(self) -> None:
+        left = {
+            "_name_or_path": "/models/run-a/t5-base",
+            "d_model": 768,
+            "num_layers": 12,
+        }
+        right = {
+            "_name_or_path": "/models/run-b/t5-base",
+            "d_model": 768,
+            "num_layers": 12,
+        }
+
+        self.assertEqual(
+            semantic_model_config_payload(left),
+            semantic_model_config_payload(right),
+        )
+        right["num_layers"] = 6
+        self.assertNotEqual(
+            semantic_model_config_payload(left),
+            semantic_model_config_payload(right),
+        )
+
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
     def test_pro_residual_geometry_matches_closed_form_and_legal_order(self) -> None:
         import torch

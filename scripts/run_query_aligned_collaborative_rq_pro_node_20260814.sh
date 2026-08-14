@@ -28,7 +28,7 @@ fi
 if [[ "${STAGE}" == preflight ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_preflight_v1
 elif [[ "${STAGE}" == resume-rq-preflight ]]; then
-  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_recovery_preflight_v1
+  DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_recovery_preflight_v2
 elif [[ "${STAGE}" == resume-rq ]]; then
   DEFAULT_OUTPUT=/models_rw/SkillSearch-data-synthesis/experiments/query_aligned_collaborative_rq_pro_20260814_v2
 else
