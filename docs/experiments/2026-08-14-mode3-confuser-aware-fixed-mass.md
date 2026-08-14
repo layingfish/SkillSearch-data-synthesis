@@ -18,7 +18,9 @@ Risk Tier: 2
 
 Mine: job=`tide-chenyufei03-10706-ldvau`; `CONFUSER_MINING_LAUNCH_COMMIT=9395ec4 bash scripts/run_confuser_aware_mining_node_20260814.sh` on one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`.
 
-Train: pending.
+Generate: GPT-4o through the Huayan profile, workers=`8`, temperature=`0.7`, top_p=`0.9`, max_tokens=`512`, target/confuser body limits=`2,200/1,200` characters, output query limit=`1,500` characters, maximum attempts=`3` per pair. Full output: `/dataset_rw/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/generation_gpt4o_top1_v1`.
+
+Train: `FIXED_MASS_MANIFEST_SHA256=<audited hash> CONFUSER_FIXED_MASS_LAUNCH_COMMIT=<commit> bash scripts/run_confuser_fixed_mass_training_node_20260814.sh`; submission waits for full generation and fixed-mass materialization.
 
 Eval: Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob; checkpoint selection uses this requested test protocol.
 
@@ -32,12 +34,12 @@ Metrics: pending.
 
 ## Verification
 
-- [x] Minimal local check (`4/4` focused unit tests, Python compile, Ruff, shell syntax)
+- [x] Minimal local check (`6/6` focused unit tests across generation, fixed-mass construction, and checkpoint selection; Python compile, Ruff, shell syntax)
 - [x] Every mining row is one of the expected `13,776 = 1,722 × 8` target pseudo rows
 - [ ] Every generated row has one known target and one distinct known confuser
 - [x] Official rows are absent from mining and synthesis inputs; target selection reads training co-occurrence only
 - [x] Fixed-mass builder test verifies exactly `5` pseudo rows per catalog skill in each of the two materialized exposure cycles
-- [ ] Reviewer required? no; perform focused local semantic review before launch
+- [x] Reviewer required? no; local semantic review verifies row/candidate SHA binding, exact per-cycle skill mass, optimizer-step closure, cum_082 initialization, and Official checkpoint selection
 
 ## Result / Notes
 
@@ -52,3 +54,5 @@ Top-1-aware aggregation gives `5,166 = 1,722 × 3` pairs, SHA-256=`678c4b0b2805d
 The initial launcher omitted `--with-dataset-rw`; the lightweight pair output therefore landed in pod-local storage. GPU predictions and candidates were already durable under `/models_rw`, so the pair file was rebuilt locally without rerunning mining. The launcher now initializes `/dataset_rw` explicitly and uses a physical CFS output path.
 
 Fixed-mass pre-audit: all `14,551` canonical skills have exactly `5` canonical-owner task5 rows. The historical single-row file also contains `2,030` original single queries and `2,670` alias-derived task5 rows that would duplicate canonical supervision. The planned two-cycle materialization contains `149,570 = 2 × (2,030 + 14,551 × 5)` rows; each canonical skill contributes exactly `10` pseudo exposures over both cycles.
+
+Generation smoke completed for the first `6` pairs (the first `2` target skills × `3` confusers) with `6/6` complete responses and no retries under the generation settings above. Query lengths were `1,011–1,372` characters. Full `5,166`-pair generation is running with resumable JSONL checkpoints on CFS.
