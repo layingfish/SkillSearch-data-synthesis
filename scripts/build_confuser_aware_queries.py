@@ -251,6 +251,7 @@ def aggregate_confusers(
     output_dir: Path,
     confusers_per_skill: int,
     expected_views_per_skill: int,
+    prediction_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite confuser aggregation: {output_dir}")
@@ -278,6 +279,7 @@ def aggregate_confusers(
     reciprocal_scores: dict[str, Counter[str]] = defaultdict(Counter)
     occurrences: dict[str, Counter[str]] = defaultdict(Counter)
     best_ranks: dict[str, dict[str, int]] = defaultdict(dict)
+    candidates_by_source: dict[str, list[str]] = {}
     seen_sources: set[str] = set()
     for candidate in load_jsonl(candidates_path):
         source_index = str(candidate.get("source_index") or "")
@@ -296,6 +298,7 @@ def aggregate_confusers(
         unknown = [sid for sid in negatives if sid not in catalog_ids]
         if unknown:
             raise ValueError(f"unknown negative skills for source={source_index}: {unknown[:5]}")
+        candidates_by_source[source_index] = negatives
         for rank, negative in enumerate(negatives, start=1):
             reciprocal_scores[positive][negative] += 1.0 / rank
             occurrences[positive][negative] += 1
@@ -303,6 +306,56 @@ def aggregate_confusers(
     if seen_sources != set(by_source):
         missing = sorted(set(by_source) - seen_sources)
         raise ValueError(f"candidate closure is missing {len(missing)} mining rows: {missing[:5]}")
+
+    top1_error_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    gold_top1_views: Counter[str] = Counter()
+    prediction_records = 0
+    if prediction_paths:
+        reciprocal_scores = defaultdict(Counter)
+        occurrences = defaultdict(Counter)
+        best_ranks = defaultdict(dict)
+        mining_by_index = {int(row["index"]): row for row in mining_rows}
+        seen_prediction_indices: set[int] = set()
+        for prediction_path in prediction_paths:
+            for prediction in load_jsonl(prediction_path):
+                row_index = int(prediction["index"])
+                if row_index in seen_prediction_indices:
+                    raise ValueError(f"duplicate prediction row index: {row_index}")
+                source_row = mining_by_index.get(row_index)
+                if source_row is None:
+                    raise ValueError(f"prediction references unknown mining row index: {row_index}")
+                seen_prediction_indices.add(row_index)
+                prediction_records += 1
+                source_index = str(source_row["source_index"])
+                positive = selected_single_skill(source_row)
+                gold = [str(value) for value in prediction.get("gold_skill_ids", []) or []]
+                if gold != [positive]:
+                    raise ValueError(f"prediction gold mismatch at row index={row_index}: {gold} != {[positive]}")
+                ranked = [str(value) for value in prediction.get("ranked_skill_ids", []) or []]
+                negatives = candidates_by_source[source_index]
+                observed_negatives = [sid for sid in ranked if sid != positive][: len(negatives)]
+                if observed_negatives != negatives:
+                    raise ValueError(
+                        f"prediction/candidate ordering mismatch at row index={row_index}: "
+                        f"prediction={observed_negatives[:3]}, candidates={negatives[:3]}"
+                    )
+                if ranked and ranked[0] == positive:
+                    gold_top1_views[positive] += 1
+                elif ranked:
+                    top1_error_counts[positive][ranked[0]] += 1
+                absolute_ranks = {sid: rank for rank, sid in enumerate(ranked, start=1)}
+                for negative in negatives:
+                    rank = absolute_ranks[negative]
+                    reciprocal_scores[positive][negative] += 1.0 / rank
+                    occurrences[positive][negative] += 1
+                    best_ranks[positive][negative] = min(
+                        best_ranks[positive].get(negative, rank), rank
+                    )
+        if seen_prediction_indices != set(mining_by_index):
+            missing = sorted(set(mining_by_index) - seen_prediction_indices)
+            raise ValueError(
+                f"prediction closure is missing {len(missing)} mining rows: {missing[:5]}"
+            )
 
     candidate_manifest = json.loads(candidate_manifest_path.read_text(encoding="utf-8"))
     if Path(str(candidate_manifest.get("output") or "")).resolve() != candidates_path.resolve():
@@ -312,6 +365,8 @@ def aggregate_confusers(
         ranked = sorted(
             reciprocal_scores[target],
             key=lambda negative: (
+                -(top1_error_counts[target][negative] > 0),
+                -top1_error_counts[target][negative],
                 -reciprocal_scores[target][negative],
                 -occurrences[target][negative],
                 best_ranks[target][negative],
@@ -332,6 +387,8 @@ def aggregate_confusers(
                     "reciprocal_rank_sum": reciprocal_scores[target][confuser],
                     "supporting_view_count": occurrences[target][confuser],
                     "best_view_rank": best_ranks[target][confuser],
+                    "top1_error_view_count": top1_error_counts[target][confuser],
+                    "target_gold_top1_view_count": gold_top1_views[target],
                     "target_view_count": target_view_counts[target],
                     "selection_basis": SELECTION_BASIS,
                 }
@@ -358,6 +415,14 @@ def aggregate_confusers(
         "views_per_target": expected_views_per_skill,
         "confusers_per_target": confusers_per_skill,
         "pair_count": len(pairs),
+        "ranking": (
+            "top1_error_first_then_absolute_reciprocal_rank_v1"
+            if prediction_paths
+            else "nongold_reciprocal_rank_v1"
+        ),
+        "predictions": [str(path) for path in prediction_paths or []],
+        "prediction_sha256": [file_sha256(path) for path in prediction_paths or []],
+        "prediction_records": prediction_records,
         "output": str(output_path),
         "output_sha256": file_sha256(output_path),
     }
@@ -586,6 +651,7 @@ def command_aggregate(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         confusers_per_skill=args.confusers_per_skill,
         expected_views_per_skill=args.expected_views_per_skill,
+        prediction_paths=args.predictions,
     )
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
 
@@ -772,6 +838,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--output-dir", type=Path, required=True)
     aggregate.add_argument("--confusers-per-skill", type=int, default=3)
     aggregate.add_argument("--expected-views-per-skill", type=int, default=8)
+    aggregate.add_argument("--predictions", type=Path, action="append")
     aggregate.set_defaults(func=command_aggregate)
 
     preview = subparsers.add_parser("preview")

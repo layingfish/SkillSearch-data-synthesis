@@ -85,6 +85,7 @@ class ConfuserAwareQueriesTest(unittest.TestCase):
             catalog = root / "skills.jsonl"
             mining = root / "mining.jsonl"
             candidates = root / "candidates.jsonl"
+            predictions = root / "predictions.jsonl"
             candidate_manifest = root / "candidate_manifest.json"
             write_jsonl(targets, [{"skill_id": "skill/a"}])
             write_jsonl(
@@ -108,12 +109,17 @@ class ConfuserAwareQueriesTest(unittest.TestCase):
             ]
             write_jsonl(mining, mining_rows)
             candidate_rows = []
+            prediction_rows = []
             for index in range(8):
-                negatives = (
-                    ["skill/n2", "skill/n1", "skill/n3"]
-                    if index < 5
-                    else ["skill/n1", "skill/n3", "skill/n2"]
-                )
+                if index < 5:
+                    negatives = ["skill/n2", "skill/n1", "skill/n3"]
+                    ranked = ["skill/a", *negatives]
+                elif index == 5:
+                    negatives = ["skill/n3", "skill/n1", "skill/n2"]
+                    ranked = ["skill/n3", "skill/a", "skill/n1", "skill/n2"]
+                else:
+                    negatives = ["skill/n1", "skill/n3", "skill/n2"]
+                    ranked = ["skill/a", *negatives]
                 candidate_rows.append(
                     {
                         "row_index": index,
@@ -122,7 +128,15 @@ class ConfuserAwareQueriesTest(unittest.TestCase):
                         "negative_skill_ids": negatives,
                     }
                 )
+                prediction_rows.append(
+                    {
+                        "index": index,
+                        "gold_skill_ids": ["skill/a"],
+                        "ranked_skill_ids": ranked,
+                    }
+                )
             write_jsonl(candidates, candidate_rows)
+            write_jsonl(predictions, prediction_rows)
             candidate_manifest.write_text(
                 json.dumps(
                     {
@@ -142,14 +156,17 @@ class ConfuserAwareQueriesTest(unittest.TestCase):
                 output_dir=root / "aggregated",
                 confusers_per_skill=2,
                 expected_views_per_skill=8,
+                prediction_paths=[predictions],
             )
             pairs = [
                 json.loads(line)
                 for line in (root / "aggregated/confuser_pairs.jsonl").read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual([row["confuser_skill_id"] for row in pairs], ["skill/n2", "skill/n1"])
+            self.assertEqual(pairs[0]["confuser_skill_id"], "skill/n3")
+            self.assertEqual(pairs[0]["top1_error_view_count"], 1)
             self.assertEqual(manifest["pair_count"], 2)
             self.assertEqual(manifest["mining_checkpoint_sha256"], "checkpoint-sha")
+            self.assertEqual(manifest["prediction_records"], 8)
 
     def test_prompt_and_materialization_bind_the_confuser(self) -> None:
         target = {

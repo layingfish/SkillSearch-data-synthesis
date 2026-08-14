@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh || exit 1
+bash /mnt/cfs_algo_bj/workspace/chenyufei03/skillact/scripts/setup_cfs_aliases.sh --with-dataset-rw || exit 1
 
 CODE_ROOT=/workspace/SkillSearch-data-synthesis
 cd "${CODE_ROOT}"
 
 OUTPUT_ROOT="${CONFUSER_MINING_OUTPUT_ROOT:-/models_rw/SkillSearch-data-synthesis/experiments/a800_confuser_aware_mining_20260814_v1}"
-PAIR_ROOT="${CONFUSER_PAIR_OUTPUT_ROOT:-/dataset_rw/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/confuser_pairs_cum082}"
+PAIR_ROOT="${CONFUSER_PAIR_OUTPUT_ROOT:-/mnt/cfs_algo_bj/workspace/chenyufei03/datasets/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/confuser_pairs_cum082_top1_v1}"
 if [[ -e "${OUTPUT_ROOT}" ]]; then
   echo "refusing to overwrite confuser mining output: ${OUTPUT_ROOT}" >&2
   exit 1
@@ -34,7 +34,7 @@ PIPELINE_SHA256=5ee736cddebca4a7e7251d95e85bcdfbaeede3a6d60f78696481c64a81a66f59
 MINER="${CODE_ROOT}/scripts/prepare_gr_self_mined_hard_negatives.py"
 MINER_SHA256=05d1698619bea860fd344929a398cddd482e0e310332da32cdf71b742ce9a924
 BUILDER="${CODE_ROOT}/scripts/build_confuser_aware_queries.py"
-BUILDER_SHA256=cf740a8bd5b1911a06396f30fbafc77cb9b633af3b606fd3bbd623a8923137f0
+BUILDER_SHA256=6d0123af9935a877b3a6136258058bffc3e7271f9dc62135bdd37d51484195bd
 
 DATA_ROOT=/mnt/cfs_algo_bj/workspace/chenyufei03/datasets/SkillSearch-data-synthesis
 MINING_ROWS="${DATA_ROOT}/processed/confuser_aware_mode4_20260814_v1/mining_input/mining_rows.jsonl"
@@ -238,6 +238,7 @@ PY
   --target-skills "${TARGET_SKILLS}" \
   --output-dir "${PAIR_ROOT}" \
   --confusers-per-skill 3 \
-  --expected-views-per-skill 8
+  --expected-views-per-skill 8 \
+  "${PREDICTION_ARGS[@]}"
 
 echo "confuser-aware mining complete pairs=${PAIR_ROOT}/confuser_pairs.jsonl"
