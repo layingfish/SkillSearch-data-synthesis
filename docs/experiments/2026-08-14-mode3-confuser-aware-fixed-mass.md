@@ -1,6 +1,6 @@
 # Experiment: Confuser-aware single-query synthesis with fixed per-skill mass
 
-Status: running
+Status: done
 Risk Tier: 2
 
 ## Goal / Hypothesis / Change Scope
@@ -20,17 +20,17 @@ Mine: job=`tide-chenyufei03-10706-ldvau`; `CONFUSER_MINING_LAUNCH_COMMIT=9395ec4
 
 Generate: GPT-4o through the Huayan profile, workers=`8`, temperature=`0.7`, top_p=`0.9`, max_tokens=`512`, target/confuser body limits=`2,200/1,200` characters, output query limit=`1,500` characters, maximum attempts=`3` per pair. Full output: `/dataset_rw/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/generation_gpt4o_top1_v1`.
 
-Train: `FIXED_MASS_MANIFEST_SHA256=52963a94b4d8d3b2805f9524b9dccdb4fa9d6b60e9a552f48d943e6a3a67d867 CONFUSER_FIXED_MASS_LAUNCH_COMMIT=<commit> bash scripts/run_confuser_fixed_mass_training_node_20260814.sh` on one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`.
+Train: job=`tide-chenyufei03-10707-hkjqu`; `FIXED_MASS_MANIFEST_SHA256=52963a94b4d8d3b2805f9524b9dccdb4fa9d6b60e9a552f48d943e6a3a67d867 CONFUSER_FIXED_MASS_LAUNCH_COMMIT=f960a2d bash scripts/run_confuser_fixed_mass_training_node_20260814.sh` on one node=`8×A800`, queue=`rudder-exper`, image=`chenyufei03/skillsearch-gr:cu128-torch28-v1`.
 
 Eval: Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob; checkpoint selection uses this requested test protocol.
 
 ## Outputs
 
-Checkpoint: pending.
+Checkpoint: `/models_rw/SkillSearch-data-synthesis/experiments/a800_confuser_fixed_mass_top1_20260814_v1/selected/single_top1_best` (`step=3,800` under Official core75=`75`, single/multi=`24/51`, beam=`50`), SHA-256=`7bdf03a843161d4335fbf3920ad7951f38eb192b064af3d0dd969e47b92f21da`.
 
-Log: pending.
+Log: `/models_rw/SkillSearch-data-synthesis/experiments/a800_confuser_fixed_mass_top1_20260814_v1/logs/node.log`.
 
-Metrics: pending.
+Metrics: the selected `step=3,800` checkpoint reaches Overall R@1/R@10/R@50=`30.0349/70.6984/73.3333%`, Single R@1/R@10/R@50=`45.8333/54.1667/54.1667%`, and Multi R@1/R@10/R@50=`22.6004/78.4781/82.3529%` under Official core75=`75`, single/multi=`24/51`, beam=`50`, beam-order, CE log-prob, and macro recall.
 
 ## Verification
 
@@ -40,10 +40,18 @@ Metrics: pending.
 - [x] Official rows are absent from mining and synthesis inputs; target selection reads training co-occurrence only
 - [x] Fixed-mass builder test verifies exactly `5` pseudo rows per catalog skill in each of the two materialized exposure cycles
 - [x] Reviewer required? no; local semantic review verifies row/candidate SHA binding, exact per-cycle skill mass, optimizer-step closure, cum_082 initialization, and Official checkpoint selection
+- [x] Training completed exactly `9,349/9,349` optimizer steps under DDP world size=`8`, batch=`2/GPU`, global batch=`16`; all `46` periodic checkpoints plus `final` are present
+- [x] Evaluation completed for `49/49` entries: `46` periodic checkpoints, `final`, cum_002 anchor, and cum_082 anchor under Official core75=`75`, single/multi=`24/51`, beam=`50`
 
 ## Result / Notes
 
-Pending.
+The training job completed with pod restart=`0`. Epoch=`1` mean CE loss was `0.490545` over `149,570` fixed-mass rows with DDP world size=`8`, batch=`2/GPU`, global batch=`16`, and optimizer steps=`9,349`.
+
+The selected `step=3,800` checkpoint does not improve the target Single metrics over cum_082: both have Single R@1/R@10/R@50=`45.8333/54.1667/54.1667%` under Official core75=`24` single queries and beam=`50`. Relative to cum_082 under the full Official core75=`75`, `step=3,800` changes Overall R@1/R@10/R@50 by `+0.4444/-0.2222/-0.4444` points and Multi R@1/R@10/R@50 by `+0.6536/-0.3268/-0.6536` points. The late `step=9,000` checkpoint reaches Single R@50=`58.3333%` under the same `24`-query, beam=`50` condition, but Single R@1 remains `45.8333%`.
+
+Across all `47` trained checkpoints evaluated on the `24` Official single queries with beam=`50`, the set of `11/24` correct top-1 queries is identical to cum_082. Up to `5/13` missed queries change which wrong skill occupies top-1, so training moves scores without flipping a Single correctness decision.
+
+The coverage audit explains the plateau. For the `13` cum_082 Single misses under Official core75, only `1/13` actual wrong top-1 skills appears among the top `3` confusers mined for the corresponding gold from `8` training-side pseudo views per target. The one covered boundary, `gt/timeseries-detrending` versus `other/timeseries-detrending`, moves in the intended direction: the gold-minus-confuser log-prob margin improves from `-4.4899` at cum_082 to `-2.7867` at `step=9,000` on the same Official single query with beam=`50`, but remains below zero. Further training should first expand training-side query-scenario coverage and re-mine actual model failures; increasing the weight of the same `5,166` rows would reinforce mostly irrelevant boundaries.
 
 Mining input: `/dataset_rw/SkillSearch-data-synthesis/processed/confuser_aware_mode4_20260814_v1/mining_input/mining_rows.jsonl`, SHA-256=`5b9002c69052717acdf6098bfb93300cb9923ff732601eb553e6d4bf9db8f4d5`. Canonical-owner selection discarded `20` alias-derived task5 rows: `4` canonical targets had an additional `5` mapped task5 rows each in the historical augmented file. The resulting input has exactly `5` canonical task5 plus `3` mode3 views for every target skill.
 
