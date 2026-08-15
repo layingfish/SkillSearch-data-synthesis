@@ -1,0 +1,9 @@
+transformers==5.3.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
+safetensors==0.7.0
+numpy==2.2.6
+scipy==1.15.3
+faiss-cpu==1.13.2
+pytest==9.0.2
+huggingface-hub==1.7.1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import random
 import sys
 import tempfile
@@ -27,8 +28,13 @@ from skill_gr_pipeline import (  # noqa: E402
     append_loss_history,
     audit_source_token_lengths,
     allowed_next_tokens_for_skill_trie,
+    balanced_trie_multilabel_binary_cross_entropy,
+    build_pag_prefix_to_skill_ids,
+    build_single_sid_optimizer,
     build_decoder_target,
     build_arg_parser,
+    build_query_balanced_multi_positive_targets,
+    build_query_balanced_trie_multilabel_states,
     build_single_sid_catalog_rows,
     expand_single_sid_query_rows,
     build_prefix_trie,
@@ -37,9 +43,11 @@ from skill_gr_pipeline import (  # noqa: E402
     compute_at_k_metrics,
     compute_ranked_subset_metrics,
     compute_retrieval_metrics,
+    count_query_balanced_trie_multilabel_states,
     command_rescore_ranked,
     deduplicate_code_tuples,
     decoder_source_text,
+    decoupled_multi_positive_cross_entropy,
     encode_structured_sid_target,
     format_skillrouter_query,
     format_skillrouter_skill,
@@ -48,16 +56,27 @@ from skill_gr_pipeline import (  # noqa: E402
     load_semantic_ids_with_mode,
     load_structured_decoder_checkpoint,
     make_structured_t5_sid_model,
+    mean_active_loss_per_source_query_and_depth,
+    mean_loss_per_source_query,
     native_semantic_id_text,
+    pag_candidate_lexical_scores,
+    pag_augmented_beam_score,
+    pag_lexical_potential,
+    ranked_skill_ids_from_pag_beams,
     prepared_selected_skill_ids,
+    query_balanced_standard_ce_structured_sid_batch,
     remap_row_skill_aliases,
     resolve_eval_max_source_length,
     save_structured_decoder_checkpoint,
     semantic_ids_sha256,
+    single_sid_stage_batch_objective,
     split_and_expand_single_sid_query_rows,
     stratified_split_rows,
     structured_allowed_values,
+    structured_decoder_allowed_scores,
+    structured_decoder_log_scores,
     summarize_source_token_lengths,
+    trie_multi_positive_set_cross_entropy,
     validate_checkpoint_semantic_ids,
     validate_rank_capacity,
 )
@@ -69,6 +88,11 @@ from train_letter_rqvae_official import (  # noqa: E402
 
 
 class SkillGRPipelineTest(unittest.TestCase):
+    def test_query_objectives_never_replace_catalog_cross_entropy(self) -> None:
+        flags = [False, False, False, True]
+        self.assertEqual(single_sid_stage_batch_objective("catalog", *flags), "standard_ce")
+        self.assertEqual(single_sid_stage_batch_objective("query", *flags), "query_balanced_trie_set_ce")
+
     def test_append_loss_history_writes_jsonl_rows(self) -> None:
         import json
         import tempfile
@@ -166,6 +190,46 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(restored_optimizer.param_groups[0]["lr"], 1e-4)
         for saved, restored in zip(model.parameters(), restored_model.parameters()):
             self.assertTrue(torch.equal(saved, restored))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_single_sid_optimizer_assigns_encoder_decoder_and_sid_groups_once(self) -> None:
+        import torch
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.backbone = torch.nn.Module()
+                self.backbone.encoder = torch.nn.Module()
+                self.backbone.encoder.block = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+                self.backbone.encoder.final_layer_norm = torch.nn.LayerNorm(2)
+                self.backbone.shared = torch.nn.Embedding(3, 2)
+                self.backbone.decoder = torch.nn.Linear(2, 2)
+                self.sid_embedding = torch.nn.Embedding(4, 2)
+                self.code_heads = torch.nn.ModuleList([torch.nn.Linear(2, 3)])
+
+        model = DummyModel()
+        optimizer, metadata = build_single_sid_optimizer(
+            model,
+            lr=3e-4,
+            weight_decay=0.0,
+            encoder_lr=1e-5,
+            decoder_lr=3e-5,
+            sid_lr=3e-4,
+        )
+
+        self.assertEqual([group["group_name"] for group in optimizer.param_groups], ["encoder", "decoder", "sid"])
+        self.assertEqual([group["lr"] for group in optimizer.param_groups], [1e-5, 3e-5, 3e-4])
+        assigned = [id(parameter) for group in optimizer.param_groups for parameter in group["params"]]
+        expected = [id(parameter) for parameter in model.parameters() if parameter.requires_grad]
+        self.assertEqual(len(assigned), len(set(assigned)))
+        self.assertEqual(set(assigned), set(expected))
+        self.assertTrue(metadata["uses_module_learning_rates"])
+        self.assertEqual(metadata["groups"]["encoder"]["first_parameter"], "backbone.encoder.block.0.weight")
+        self.assertEqual(metadata["groups"]["decoder"]["first_parameter"], "backbone.shared.weight")
+        self.assertEqual(metadata["groups"]["sid"]["first_parameter"], "sid_embedding.weight")
+
+        with self.assertRaisesRegex(ValueError, "must be provided together"):
+            build_single_sid_optimizer(model, 3e-4, 0.0, encoder_lr=1e-5)
 
     def test_semantic_id_fingerprint_is_order_invariant_and_checkpoint_checked(self) -> None:
         semantic_ids = {"skill/b": [4, 5, 6, 0], "skill/a": [1, 2, 3, 0]}
@@ -357,6 +421,280 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(encoded["target_token_ids"], [1, 258, 515, 772, 1025])
         self.assertEqual(encoded["bos_id"], 1026)
 
+    def test_query_balanced_targets_share_positive_labels_only_at_matching_prefixes(self) -> None:
+        semantic_ids = {
+            "skill/a": [1, 3, 5, 7],
+            "skill/b": [1, 4, 6, 8],
+        }
+
+        targets, source_group_ids, positive_labels = build_query_balanced_multi_positive_targets(
+            [{"index": 9, "selected_skill_ids": ["skill/b", "skill/a"]}],
+            semantic_ids,
+            codebook_size=256,
+            depth=4,
+            dedup_size=0,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+        )
+
+        self.assertEqual(len(targets), 2)
+        self.assertEqual(source_group_ids, [0, 0])
+        self.assertEqual([target["skill_ids"] for target in targets], [["skill/a"], ["skill/b"]])
+        self.assertEqual(positive_labels[0][0], [1])
+        self.assertEqual(positive_labels[1][0], [1])
+        self.assertEqual(positive_labels[0][1], [3, 4])
+        self.assertEqual(positive_labels[1][1], [3, 4])
+        self.assertEqual(positive_labels[0][2], [5])
+        self.assertEqual(positive_labels[1][2], [6])
+        self.assertEqual(positive_labels[0][-1], [1])
+        self.assertEqual(positive_labels[1][-1], [1])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_decoupled_multi_positive_ce_does_not_push_alternative_positives_down(self) -> None:
+        import torch
+
+        logits = torch.tensor([[2.0, 2.0, 0.0], [2.0, 2.0, 0.0]], requires_grad=True)
+        labels = torch.tensor([0, 1])
+        positive_labels = torch.tensor([[0, 1], [0, 1]])
+
+        losses = decoupled_multi_positive_cross_entropy(logits, labels, positive_labels)
+        losses.sum().backward()
+
+        expected = torch.log1p(torch.exp(torch.tensor(-2.0)))
+        self.assertTrue(torch.allclose(losses, torch.full_like(losses, expected)))
+        self.assertEqual(float(logits.grad[0, 1]), 0.0)
+        self.assertEqual(float(logits.grad[1, 0]), 0.0)
+        self.assertGreater(float(logits.grad[0, 2]), 0.0)
+        self.assertGreater(float(logits.grad[1, 2]), 0.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_grouped_loss_gives_each_source_query_equal_weight(self) -> None:
+        import torch
+
+        row_losses = torch.tensor([1.0, 3.0, 5.0], requires_grad=True)
+        source_group_ids = torch.tensor([0, 0, 1])
+
+        loss = mean_loss_per_source_query(row_losses, source_group_ids)
+        loss.backward()
+
+        self.assertAlmostEqual(float(loss.detach()), 3.5)
+        self.assertTrue(torch.allclose(row_losses.grad, torch.tensor([0.25, 0.25, 0.5])))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_trie_set_ce_marginalizes_positives_and_ignores_invalid_children(self) -> None:
+        import torch
+
+        logits = torch.tensor(
+            [[2.0, 2.0, 0.0, 10.0], [3.0, -1.0, 8.0, 9.0]],
+            requires_grad=True,
+        )
+        positive_labels = torch.tensor([[0, 1], [0, -1]])
+        candidate_labels = torch.tensor([[0, 1, 2], [0, -1, -1]])
+
+        losses, active = trie_multi_positive_set_cross_entropy(
+            logits,
+            positive_labels,
+            candidate_labels,
+        )
+        losses.sum().backward()
+
+        expected = torch.logsumexp(torch.tensor([2.0, 2.0, 0.0]), dim=0) - torch.logsumexp(
+            torch.tensor([2.0, 2.0]), dim=0
+        )
+        self.assertTrue(torch.allclose(losses, torch.tensor([expected, 0.0])))
+        self.assertEqual(active.tolist(), [True, False])
+        self.assertAlmostEqual(float(logits.grad[0, 0]), float(logits.grad[0, 1]), places=7)
+        self.assertEqual(float(logits.grad[0, 3]), 0.0)
+        self.assertTrue(torch.equal(logits.grad[1], torch.zeros(4)))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_active_trie_loss_averages_states_then_depths_then_queries(self) -> None:
+        import torch
+
+        state_losses = torch.tensor([1.0, 3.0, 10.0, 5.0], requires_grad=True)
+        source_group_ids = torch.tensor([0, 0, 0, 1])
+        target_types = torch.tensor([0, 0, 1, 0])
+        active_states = torch.tensor([True, True, False, True])
+
+        loss = mean_active_loss_per_source_query_and_depth(
+            state_losses,
+            source_group_ids,
+            target_types,
+            active_states,
+            semantic_length=2,
+        )
+        loss.backward()
+
+        self.assertAlmostEqual(float(loss.detach()), 3.5)
+        self.assertTrue(torch.allclose(state_losses.grad, torch.tensor([0.25, 0.25, 0.0, 0.5])))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_trie_local_softmax_normalizes_only_allowed_children(self) -> None:
+        import torch
+
+        logits = torch.tensor([8.0, 2.0, 1.0, -3.0])
+        raw = structured_decoder_log_scores(logits, "trie_local_softmax")
+        allowed = structured_decoder_allowed_scores(raw, torch.tensor([1, 2]), "trie_local_softmax")
+
+        self.assertTrue(torch.allclose(allowed.exp().sum(), torch.tensor(1.0)))
+        self.assertGreater(float(allowed[0]), float(allowed[1]))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_conditional_logit_scores_preserve_raw_logits(self) -> None:
+        import torch
+
+        logits = torch.tensor([[8.0, 2.0, 1.0, -3.0]])
+        scores = structured_decoder_log_scores(logits, "conditional_logit")
+        allowed = structured_decoder_allowed_scores(
+            scores[0], torch.tensor([1, 2]), "conditional_logit"
+        )
+
+        self.assertTrue(torch.equal(scores, logits))
+        self.assertTrue(torch.equal(allowed, torch.tensor([2.0, 1.0])))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_query_balanced_standard_ce_averages_tokens_then_targets_then_queries(self) -> None:
+        import torch
+
+        class DummyTokenizer:
+            def __call__(self, texts, **_kwargs):
+                return {
+                    "input_ids": torch.ones((len(texts), 2), dtype=torch.long),
+                    "attention_mask": torch.ones((len(texts), 2), dtype=torch.long),
+                }
+
+        class DummyEncoder(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                hidden = torch.zeros((*input_ids.shape, 4), dtype=torch.float32, device=input_ids.device)
+                return types.SimpleNamespace(last_hidden_state=hidden)
+
+        class DummyDecoder(torch.nn.Module):
+            def forward(self, inputs_embeds, **_kwargs):
+                return types.SimpleNamespace(last_hidden_state=inputs_embeds)
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=4)
+                self.encoder = DummyEncoder()
+                self.decoder = DummyDecoder()
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=4,
+                depth=2,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        semantic_ids = {
+            "skill/a": [0, 1],
+            "skill/b": [1, 2],
+            "skill/c": [2, 3],
+        }
+        rows = [
+            {"query": "first", "selected_skill_ids": ["skill/a", "skill/b"]},
+            {"query": "second", "selected_skill_ids": ["skill/c"]},
+        ]
+
+        def batch(batch_rows):
+            return query_balanced_standard_ce_structured_sid_batch(
+                batch_rows,
+                DummyTokenizer(),
+                semantic_ids,
+                codebook_size=4,
+                depth=2,
+                dedup_size=0,
+                max_source_length=16,
+                device=torch.device("cpu"),
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+            )
+
+        combined_batch = batch(rows)
+        combined_loss = model(**combined_batch)
+        first_query_loss = model(**batch([rows[0]]))
+        second_query_loss = model(**batch([rows[1]]))
+
+        self.assertEqual(combined_batch["input_ids"].shape[0], 2)
+        self.assertEqual(combined_batch["decoder_input_ids"].shape[0], 3)
+        self.assertEqual(combined_batch["source_group_ids"].tolist(), [0, 0, 1])
+        self.assertTrue(torch.allclose(combined_loss, (first_query_loss + second_query_loss) / 2))
+        combined_loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
+
+    def test_query_balanced_trie_states_merge_gold_children_at_shared_prefix(self) -> None:
+        semantic_ids = {
+            "skill/a": [1, 3, 5, 7],
+            "skill/b": [1, 4, 6, 8],
+            "skill/c": [2, 9, 10, 11],
+        }
+        rows = [{"index": 1, "selected_skill_ids": ["skill/b", "skill/a"]}]
+
+        states, source_group_ids = build_query_balanced_trie_multilabel_states(
+            rows,
+            semantic_ids,
+            codebook_size=256,
+            depth=4,
+            dedup_size=0,
+            semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+        )
+
+        self.assertEqual(len(states), 8)
+        self.assertEqual(count_query_balanced_trie_multilabel_states(rows, semantic_ids), 8)
+        self.assertEqual(source_group_ids, [0] * 8)
+        root = next(state for state in states if state["target_type"] == 0)
+        shared_prefix = next(
+            state for state in states if state["target_type"] == 1 and state["prefix"] == [1]
+        )
+        controls = [state for state in states if state["target_type"] == 4]
+        self.assertEqual(root["positive_labels"], [1])
+        self.assertEqual(root["candidate_labels"], [1, 2])
+        self.assertEqual(shared_prefix["positive_labels"], [3, 4])
+        self.assertEqual(shared_prefix["candidate_labels"], [3, 4])
+        self.assertEqual(len(controls), 2)
+        self.assertTrue(all(state["candidate_labels"] == [0, 1] for state in controls))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_balanced_trie_multilabel_bce_has_independent_positive_gradients(self) -> None:
+        import torch
+
+        logits = torch.tensor([[2.0, 2.0, 0.0]], requires_grad=True)
+        positive_labels = torch.tensor([[0, 1]])
+        candidate_labels = torch.tensor([[0, 1, 2]])
+
+        loss = balanced_trie_multilabel_binary_cross_entropy(
+            logits,
+            positive_labels,
+            candidate_labels,
+            negative_weight=1.0,
+        ).mean()
+        loss.backward()
+
+        expected = torch.nn.functional.softplus(torch.tensor(-2.0)) + torch.nn.functional.softplus(torch.tensor(0.0))
+        self.assertTrue(torch.allclose(loss.detach(), expected))
+        self.assertLess(float(logits.grad[0, 0]), 0.0)
+        self.assertAlmostEqual(float(logits.grad[0, 0]), float(logits.grad[0, 1]), places=7)
+        self.assertGreater(float(logits.grad[0, 2]), 0.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_sigmoid_decoder_scores_do_not_normalize_across_positive_children(self) -> None:
+        import torch
+
+        logits = torch.tensor([[2.0, 0.0]])
+        sigmoid_scores = structured_decoder_log_scores(logits, "sigmoid")
+        softmax_scores = structured_decoder_log_scores(logits, "softmax")
+
+        self.assertAlmostEqual(float(sigmoid_scores[0, 1]), -0.693147, places=5)
+        self.assertLess(float(softmax_scores[0, 1]), -2.0)
+
     def test_learned_structured_beam_completes_after_four_codes(self) -> None:
         beam = {
             "decoder_input_ids": [1026, 1, 258, 515],
@@ -451,6 +789,62 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(model.sid_embedding.num_embeddings, 1027)
         self.assertFalse(any(name.startswith("dedup_head") for name in model.state_dict()))
 
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_codebook_initialization_ties_decoder_inputs_and_code_outputs(self) -> None:
+        import torch
+
+        class DummyBackbone(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = types.SimpleNamespace(d_model=8)
+                self.shared = torch.nn.Embedding(16, 8)
+                with torch.no_grad():
+                    self.shared.weight.fill_(1.0)
+
+        class DummyAutoModel:
+            @staticmethod
+            def from_pretrained(_base_model: str):
+                return DummyBackbone()
+
+        initial = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(2, 4, 8) / 10.0
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForSeq2SeqLM = DummyAutoModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            model = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=4,
+                depth=2,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+                codebook_embeddings=initial,
+                tie_code_input_output=True,
+            )
+            restored = make_structured_t5_sid_model(
+                "dummy",
+                codebook_size=4,
+                depth=2,
+                dedup_size=0,
+                semantic_id_mode=SEMANTIC_ID_MODE_LEARNED,
+                tie_code_input_output=True,
+            )
+
+        self.assertTrue(model.tie_code_input_output)
+        self.assertTrue(model.sid_codebook_initialized)
+        self.assertIs(model.code_heads[0].embedding, model.sid_embedding)
+        expected = initial / initial.square().mean().sqrt()
+        self.assertTrue(torch.allclose(model.sid_embedding.weight[:4], expected[0]))
+        self.assertTrue(torch.allclose(model.sid_embedding.weight[4:8], expected[1]))
+        self.assertAlmostEqual(model.sid_codebook_init_scale, 1.0 / float(initial.square().mean().sqrt()))
+
+        hidden = torch.ones((1, 8), requires_grad=True)
+        model.code_heads[1](hidden).sum().backward()
+        self.assertIsNotNone(model.sid_embedding.weight.grad)
+        self.assertEqual(int(torch.count_nonzero(model.sid_embedding.weight.grad[:4])), 0)
+        self.assertGreater(int(torch.count_nonzero(model.sid_embedding.weight.grad[4:8])), 0)
+
+        restored.load_state_dict(model.state_dict())
+        self.assertTrue(torch.equal(restored.sid_embedding.weight, model.sid_embedding.weight))
+
     def test_advance_structured_beam_appends_codes_and_control_tokens(self) -> None:
         beam = {
             "decoder_input_ids": [772, 1, 259, 517],
@@ -488,6 +882,101 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(stopped_beam["completed"], [(1, 3, 5, 0)])
         self.assertTrue(stopped_beam["stopped"])
         self.assertAlmostEqual(stopped_beam["score"], -2.75)
+
+    def test_pag_prefix_potential_uses_best_unseen_descendant(self) -> None:
+        semantic_ids = {
+            "skill-a": [1, 2],
+            "skill-b": [1, 3],
+            "skill-c": [4, 5],
+        }
+        prefix_index = build_pag_prefix_to_skill_ids(semantic_ids)
+        sequence_to_skill_id = {tuple(values): sid for sid, values in semantic_ids.items()}
+        lexical_scores = {"skill-a": 2.0, "skill-b": 5.0, "skill-c": 9.0}
+        beam = {
+            "current_prefix": [1],
+            "completed": [],
+            "score": -3.0,
+            "stopped": False,
+        }
+
+        self.assertEqual(
+            pag_lexical_potential(beam, prefix_index, sequence_to_skill_id, lexical_scores),
+            5.0,
+        )
+        self.assertEqual(
+            pag_augmented_beam_score(
+                beam,
+                prefix_index,
+                sequence_to_skill_id,
+                lexical_scores,
+                alpha=0.25,
+            ),
+            -1.75,
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is available in the remote training environment")
+    def test_pag_candidate_lexical_scores_max_pools_query_positions(self) -> None:
+        import torch
+
+        query_hidden = torch.tensor([[[1.0, 0.0], [0.0, 2.0], [9.0, 9.0]]])
+        query_mask = torch.tensor([[1, 1, 0]])
+        vocabulary_weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        candidate_ids = torch.tensor([[[0, 1], [2, 0]]])
+        candidate_mask = torch.tensor([[[1, 1], [1, 0]]])
+
+        scores = pag_candidate_lexical_scores(
+            query_hidden,
+            query_mask,
+            vocabulary_weight,
+            candidate_ids,
+            candidate_mask,
+        )
+
+        expected = torch.tensor(
+            [[math.log1p(1.0) + math.log1p(2.0), math.log1p(2.0)]]
+        )
+        self.assertTrue(torch.allclose(scores, expected))
+
+    def test_pag_prefix_potential_does_not_reuse_completed_skill(self) -> None:
+        semantic_ids = {"skill-a": [1, 2], "skill-b": [1, 3]}
+        prefix_index = build_pag_prefix_to_skill_ids(semantic_ids)
+        sequence_to_skill_id = {tuple(values): sid for sid, values in semantic_ids.items()}
+        lexical_scores = {"skill-a": 7.0, "skill-b": 2.0}
+        continuing = {
+            "current_prefix": [],
+            "completed": [(1, 2)],
+            "score": -1.0,
+            "stopped": False,
+        }
+        stopped = {**continuing, "stopped": True}
+
+        self.assertEqual(
+            pag_lexical_potential(continuing, prefix_index, sequence_to_skill_id, lexical_scores),
+            9.0,
+        )
+        self.assertEqual(
+            pag_lexical_potential(stopped, prefix_index, sequence_to_skill_id, lexical_scores),
+            7.0,
+        )
+
+    def test_pag_final_ranking_uses_semantic_scores_only(self) -> None:
+        sequence_to_skill_id = {(0,): "semantic-best", (1,): "lexical-best"}
+        beams = [
+            {"score": -1.0, "completed": [[0]], "stopped": True},
+            {"score": -2.0, "completed": [[1]], "stopped": True},
+        ]
+
+        ranked, scores = ranked_skill_ids_from_pag_beams(
+            beams,
+            sequence_to_skill_id,
+            {(0,): ("semantic-best",), (1,): ("lexical-best",)},
+            {"semantic-best": 0.0, "lexical-best": 100.0},
+            alpha=10.0,
+            max_rank=2,
+        )
+
+        self.assertEqual(ranked, ["semantic-best", "lexical-best"])
+        self.assertEqual(scores, {"semantic-best": -1.0, "lexical-best": -2.0})
 
     def test_native_semantic_id_text_uses_base_vocab_words_and_digits(self) -> None:
         self.assertEqual(
@@ -943,10 +1432,81 @@ class SkillGRPipelineTest(unittest.TestCase):
                 "128",
                 "--periodic-document-epochs",
                 "1",
+                "--interleave-document-batches",
+                "--query-balanced-multi-positive-ce",
                 "--query-batch-size",
                 "32",
                 "--document-batch-size",
                 "16",
+                "--disable-dev-eval",
+                "--official-eval-rows",
+                "official.jsonl",
+            ]
+        )
+        differential_lr_args = parser.parse_args(
+            [
+                "train-single-sid-decoder",
+                "--rows",
+                "train.jsonl",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--skills-jsonl",
+                "skills.jsonl",
+                "--output-dir",
+                "differential-lr-out",
+                "--init-model-dir",
+                "catalog-final",
+                "--reset-optimizer-on-init",
+                "--encoder-lr",
+                "1e-5",
+                "--decoder-lr",
+                "3e-5",
+                "--sid-lr",
+                "3e-4",
+            ]
+        )
+        trie_train_args = parser.parse_args(
+            [
+                "train-single-sid-decoder",
+                "--rows",
+                "train.jsonl",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--skills-jsonl",
+                "skills.jsonl",
+                "--output-dir",
+                "trie-out",
+                "--query-balanced-trie-multilabel-bce",
+                "--trie-multilabel-negative-weight",
+                "0.5",
+            ]
+        )
+        balanced_ce_args = parser.parse_args(
+            [
+                "train-single-sid-decoder",
+                "--rows",
+                "train.jsonl",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--skills-jsonl",
+                "skills.jsonl",
+                "--output-dir",
+                "balanced-ce-out",
+                "--query-balanced-standard-ce",
+            ]
+        )
+        trie_set_ce_args = parser.parse_args(
+            [
+                "train-single-sid-decoder",
+                "--rows",
+                "train.jsonl",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--skills-jsonl",
+                "skills.jsonl",
+                "--output-dir",
+                "trie-set-ce-out",
+                "--query-balanced-trie-set-ce",
                 "--disable-dev-eval",
                 "--official-eval-rows",
                 "official.jsonl",
@@ -982,6 +1542,8 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(train_args.initial_best_dev_loss, 1.269171)
         self.assertEqual(train_args.eval_batch_size, 128)
         self.assertEqual(train_args.periodic_document_epochs, 1)
+        self.assertTrue(train_args.interleave_document_batches)
+        self.assertTrue(train_args.query_balanced_multi_positive_ce)
         self.assertEqual(train_args.query_batch_size, 32)
         self.assertEqual(train_args.document_batch_size, 16)
         self.assertTrue(train_args.disable_dev_eval)
@@ -989,9 +1551,38 @@ class SkillGRPipelineTest(unittest.TestCase):
         self.assertEqual(train_args.official_eval_every_epochs, 2)
         self.assertEqual(train_args.official_selection_subset, "overall")
         self.assertEqual(train_args.official_selection_k, 1)
+        self.assertTrue(differential_lr_args.reset_optimizer_on_init)
+        self.assertEqual(differential_lr_args.encoder_lr, 1e-5)
+        self.assertEqual(differential_lr_args.decoder_lr, 3e-5)
+        self.assertEqual(differential_lr_args.sid_lr, 3e-4)
+        self.assertTrue(trie_train_args.query_balanced_trie_multilabel_bce)
+        self.assertAlmostEqual(trie_train_args.trie_multilabel_negative_weight, 0.5)
+        self.assertTrue(balanced_ce_args.query_balanced_standard_ce)
+        self.assertTrue(trie_set_ce_args.query_balanced_trie_set_ce)
+        self.assertTrue(trie_set_ce_args.disable_dev_eval)
         self.assertEqual(eval_args.command, "eval-single-sid-decoder")
         self.assertEqual(eval_args.max_skills, 1)
         self.assertIsNone(eval_args.max_source_length)
+        self.assertEqual(eval_args.decoder_score_mode, "auto")
+
+        conditional_eval_args = parser.parse_args(
+            [
+                "eval-single-sid-decoder",
+                "--rows",
+                "dev.jsonl",
+                "--model-dir",
+                "model",
+                "--semantic-ids",
+                "semantic_ids.jsonl",
+                "--output-dir",
+                "eval",
+                "--split-name",
+                "dev",
+                "--decoder-score-mode",
+                "conditional_logit",
+            ]
+        )
+        self.assertEqual(conditional_eval_args.decoder_score_mode, "conditional_logit")
 
         structured_eval_args = parser.parse_args(
             [

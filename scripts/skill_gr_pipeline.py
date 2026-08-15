@@ -141,6 +141,9 @@ def save_structured_decoder_checkpoint(
         "depth": depth,
         "dedup_size": dedup_size,
         "semantic_id_mode": normalize_semantic_id_mode(semantic_id_mode),
+        "tie_code_input_output": bool(getattr(model, "tie_code_input_output", False)),
+        "sid_codebook_initialized": bool(getattr(model, "sid_codebook_initialized", False)),
+        "sid_codebook_init_scale": getattr(model, "sid_codebook_init_scale", None),
         "seed": seed,
         "training_formulation": training_formulation,
     }
@@ -178,6 +181,100 @@ def load_structured_decoder_checkpoint(
             for group in optimizer.param_groups:
                 group["lr"] = lr
     return checkpoint
+
+
+def build_single_sid_optimizer(
+    model,
+    lr: float,
+    weight_decay: float,
+    encoder_lr: float | None = None,
+    decoder_lr: float | None = None,
+    sid_lr: float | None = None,
+):
+    """Build the default optimizer or explicit encoder/decoder/SID parameter groups."""
+    import torch
+
+    module_lrs = {
+        "encoder": encoder_lr,
+        "decoder": decoder_lr,
+        "sid": sid_lr,
+    }
+    provided = [value is not None for value in module_lrs.values()]
+    if any(provided) and not all(provided):
+        raise ValueError("--encoder-lr, --decoder-lr, and --sid-lr must be provided together")
+    if not any(provided):
+        if lr < 0.0:
+            raise ValueError(f"--lr must be non-negative, got {lr}")
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if not trainable:
+            raise ValueError("model has no trainable parameters")
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+        metadata = {
+            "uses_module_learning_rates": False,
+            "groups": {
+                "all": {
+                    "lr": float(lr),
+                    "parameter_tensors": len(trainable),
+                    "parameters": sum(parameter.numel() for parameter in trainable),
+                }
+            },
+        }
+        return optimizer, metadata
+
+    resolved_lrs = {name: float(value) for name, value in module_lrs.items()}
+    if any(value < 0.0 for value in resolved_lrs.values()):
+        raise ValueError(f"module learning rates must be non-negative, got {resolved_lrs}")
+    if not any(value > 0.0 for value in resolved_lrs.values()):
+        raise ValueError("at least one module learning rate must be positive")
+
+    grouped_parameters: dict[str, list[Any]] = {"encoder": [], "decoder": [], "sid": []}
+    grouped_names: dict[str, list[str]] = {"encoder": [], "decoder": [], "sid": []}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("backbone.encoder.block.") or name.startswith("backbone.encoder.final_layer_norm."):
+            group_name = "encoder"
+        elif name.startswith("backbone."):
+            group_name = "decoder"
+        else:
+            group_name = "sid"
+        grouped_parameters[group_name].append(parameter)
+        grouped_names[group_name].append(name)
+
+    empty_groups = [name for name, parameters in grouped_parameters.items() if not parameters]
+    if empty_groups:
+        raise ValueError(f"optimizer parameter groups are empty: {empty_groups}")
+    assigned_ids = [id(parameter) for parameters in grouped_parameters.values() for parameter in parameters]
+    trainable_ids = [id(parameter) for parameter in model.parameters() if parameter.requires_grad]
+    if len(assigned_ids) != len(set(assigned_ids)) or set(assigned_ids) != set(trainable_ids):
+        raise RuntimeError("optimizer parameter grouping did not assign every trainable parameter exactly once")
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": grouped_parameters[group_name],
+                "lr": resolved_lrs[group_name],
+                "group_name": group_name,
+            }
+            for group_name in ("encoder", "decoder", "sid")
+        ],
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    metadata = {
+        "uses_module_learning_rates": True,
+        "groups": {
+            group_name: {
+                "lr": resolved_lrs[group_name],
+                "parameter_tensors": len(grouped_parameters[group_name]),
+                "parameters": sum(parameter.numel() for parameter in grouped_parameters[group_name]),
+                "first_parameter": grouped_names[group_name][0],
+                "last_parameter": grouped_names[group_name][-1],
+            }
+            for group_name in ("encoder", "decoder", "sid")
+        },
+    }
+    return optimizer, metadata
 
 
 def skill_id(row: dict[str, Any]) -> str:
@@ -2118,7 +2215,8 @@ def command_eval_bm25(args: argparse.Namespace) -> None:
                 denom = freq + args.k1 * (1.0 - args.b + args.b * dl / max(avgdl, 1e-9))
                 score += idf.get(term, 0.0) * (freq * (args.k1 + 1.0)) / denom
             scores.append((score, skill["skill_id"]))
-        ranked = [sid for _, sid in sorted(scores, key=lambda item: (-item[0], item[1]))[:max_rank]]
+        ranked_items = sorted(scores, key=lambda item: (-item[0], item[1]))[:max_rank]
+        ranked = [sid for _, sid in ranked_items]
         gold_ids = [str(sid) for sid in row.get("selected_skill_ids", [])]
         predictions.append(
             {
@@ -2128,6 +2226,7 @@ def command_eval_bm25(args: argparse.Namespace) -> None:
                 "query": row.get("query"),
                 "gold_skill_ids": gold_ids,
                 "ranked_skill_ids": ranked,
+                "ranked_skill_scores": [float(score) for score, _ in ranked_items],
                 "invalid": False,
             }
         )
@@ -2237,17 +2336,292 @@ def command_eval_t5_dense(args: argparse.Namespace) -> None:
     print(json.dumps(metrics["overall"], ensure_ascii=False, sort_keys=True))
 
 
+def decoupled_multi_positive_cross_entropy(logits, labels, positive_labels):
+    """Return per-row CE while excluding alternative positives from each denominator."""
+
+    import torch
+
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be rank 2, got shape={tuple(logits.shape)}")
+    if labels.ndim != 1 or labels.shape[0] != logits.shape[0]:
+        raise ValueError("labels must have one value per logits row")
+    if positive_labels.ndim != 2 or positive_labels.shape[0] != logits.shape[0]:
+        raise ValueError("positive_labels must have shape [rows, max_positives]")
+
+    valid = positive_labels >= 0
+    indices = positive_labels.clamp_min(0)
+    if valid.any() and int(indices[valid].max()) >= logits.shape[1]:
+        raise ValueError("positive label is outside the current prediction head")
+    positive_counts = torch.zeros_like(logits, dtype=torch.int32)
+    positive_counts.scatter_add_(1, indices, valid.to(torch.int32))
+    positive_mask = positive_counts > 0
+    if not positive_mask.gather(1, labels.unsqueeze(1)).all():
+        raise ValueError("the target label must be included in its positive-label set")
+
+    target_logits = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
+    negative_logsumexp = torch.logsumexp(logits.masked_fill(positive_mask, float("-inf")), dim=1)
+    return torch.logaddexp(target_logits, negative_logsumexp) - target_logits
+
+
+def mean_loss_per_source_query(row_losses, source_group_ids):
+    """Average target-row losses within each source query, then average queries."""
+
+    import torch
+
+    if row_losses.ndim != 1 or source_group_ids.ndim != 1 or row_losses.shape != source_group_ids.shape:
+        raise ValueError("row_losses and source_group_ids must be equally sized vectors")
+    if row_losses.numel() == 0:
+        raise ValueError("cannot average an empty grouped loss")
+    if int(source_group_ids.min()) < 0:
+        raise ValueError("source group ids must be non-negative")
+    group_count = int(source_group_ids.max()) + 1
+    group_sums = torch.zeros(group_count, dtype=row_losses.dtype, device=row_losses.device)
+    group_sizes = torch.zeros(group_count, dtype=row_losses.dtype, device=row_losses.device)
+    group_sums.scatter_add_(0, source_group_ids, row_losses)
+    group_sizes.scatter_add_(0, source_group_ids, torch.ones_like(row_losses))
+    if (group_sizes == 0).any():
+        raise ValueError("source group ids must be contiguous")
+    return (group_sums / group_sizes).mean()
+
+
+def single_sid_stage_batch_objective(
+    stage_name: str,
+    query_balanced_standard_ce: bool,
+    query_balanced_multi_positive_ce: bool,
+    query_balanced_trie_multilabel_bce: bool,
+    query_balanced_trie_set_ce: bool,
+) -> str:
+    """Keep query-only objectives out of document/catalog training."""
+
+    if stage_name not in {"catalog", "query"}:
+        raise ValueError(f"unsupported single-SID training stage: {stage_name}")
+    if stage_name == "catalog":
+        return "standard_ce"
+    enabled = [
+        name
+        for name, active in (
+            ("query_balanced_standard_ce", query_balanced_standard_ce),
+            ("query_balanced_multi_positive_ce", query_balanced_multi_positive_ce),
+            ("query_balanced_trie_multilabel_bce", query_balanced_trie_multilabel_bce),
+            ("query_balanced_trie_set_ce", query_balanced_trie_set_ce),
+        )
+        if active
+    ]
+    if len(enabled) > 1:
+        raise ValueError(f"query objectives are mutually exclusive: {enabled}")
+    return enabled[0] if enabled else "standard_ce"
+
+
+def trie_multi_positive_set_cross_entropy(logits, positive_labels, candidate_labels):
+    """Return set-marginal CE over the valid trie children for each state."""
+
+    import torch
+
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be rank 2, got shape={tuple(logits.shape)}")
+    if positive_labels.ndim != 2 or positive_labels.shape[0] != logits.shape[0]:
+        raise ValueError("positive_labels must have shape [states, max_positives]")
+    if candidate_labels.ndim != 2 or candidate_labels.shape[0] != logits.shape[0]:
+        raise ValueError("candidate_labels must have shape [states, max_candidates]")
+
+    def label_mask(labels):
+        valid = labels >= 0
+        indices = labels.clamp_min(0)
+        if valid.any() and int(indices[valid].max()) >= logits.shape[1]:
+            raise ValueError("label is outside the current prediction head")
+        counts = torch.zeros_like(logits, dtype=torch.int32)
+        counts.scatter_add_(1, indices, valid.to(torch.int32))
+        return counts > 0
+
+    positive_mask = label_mask(positive_labels)
+    candidate_mask = label_mask(candidate_labels)
+    if not positive_mask.any(dim=1).all():
+        raise ValueError("every trie state must contain at least one positive label")
+    if (positive_mask & ~candidate_mask).any():
+        raise ValueError("positive labels must be a subset of candidate labels")
+
+    candidate_logsumexp = torch.logsumexp(logits.masked_fill(~candidate_mask, float("-inf")), dim=1)
+    positive_logsumexp = torch.logsumexp(logits.masked_fill(~positive_mask, float("-inf")), dim=1)
+    losses = candidate_logsumexp - positive_logsumexp
+    active = candidate_mask.sum(dim=1) > positive_mask.sum(dim=1)
+    return losses, active
+
+
+def mean_active_loss_per_source_query_and_depth(
+    state_losses,
+    source_group_ids,
+    target_types,
+    active_states,
+    semantic_length: int,
+):
+    """Average active trie decisions per depth, then per source query."""
+
+    import torch
+
+    if not (
+        state_losses.ndim == source_group_ids.ndim == target_types.ndim == active_states.ndim == 1
+        and state_losses.shape == source_group_ids.shape == target_types.shape == active_states.shape
+    ):
+        raise ValueError("state losses, groups, target types, and active mask must be equally sized vectors")
+    if state_losses.numel() == 0:
+        raise ValueError("cannot average empty trie states")
+    if semantic_length < 1:
+        raise ValueError("semantic_length must be positive")
+
+    query_losses = []
+    group_count = int(source_group_ids.max()) + 1
+    for source_group_id in range(group_count):
+        depth_losses = []
+        source_mask = source_group_ids == source_group_id
+        for target_type in range(semantic_length):
+            mask = source_mask & active_states & (target_types == target_type)
+            if mask.any():
+                depth_losses.append(state_losses[mask].mean())
+        if not depth_losses:
+            raise ValueError(f"source query {source_group_id} has no active trie decisions")
+        query_losses.append(torch.stack(depth_losses).mean())
+    return torch.stack(query_losses).mean()
+
+
+def balanced_trie_multilabel_binary_cross_entropy(
+    logits,
+    positive_labels,
+    candidate_labels,
+    negative_weight: float = 1.0,
+):
+    """Return one balanced multi-label BCE value per trie state."""
+
+    import torch
+    import torch.nn.functional as F
+
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be rank 2, got shape={tuple(logits.shape)}")
+    if positive_labels.ndim != 2 or positive_labels.shape[0] != logits.shape[0]:
+        raise ValueError("positive_labels must have shape [states, max_positives]")
+    if candidate_labels.ndim != 2 or candidate_labels.shape[0] != logits.shape[0]:
+        raise ValueError("candidate_labels must have shape [states, max_candidates]")
+    if negative_weight < 0:
+        raise ValueError(f"negative_weight must be non-negative, got {negative_weight}")
+
+    def label_mask(labels):
+        valid = labels >= 0
+        indices = labels.clamp_min(0)
+        if valid.any() and int(indices[valid].max()) >= logits.shape[1]:
+            raise ValueError("label is outside the current prediction head")
+        counts = torch.zeros_like(logits, dtype=torch.int32)
+        counts.scatter_add_(1, indices, valid.to(torch.int32))
+        return counts > 0
+
+    positive_mask = label_mask(positive_labels)
+    candidate_mask = label_mask(candidate_labels)
+    if not positive_mask.any(dim=1).all():
+        raise ValueError("every trie state must contain at least one positive label")
+    if (positive_mask & ~candidate_mask).any():
+        raise ValueError("positive labels must be a subset of candidate labels")
+
+    positive_losses = F.softplus(-logits)
+    positive_counts = positive_mask.sum(dim=1).to(logits.dtype)
+    positive_mean = (positive_losses * positive_mask).sum(dim=1) / positive_counts
+
+    negative_mask = candidate_mask & ~positive_mask
+    negative_counts = negative_mask.sum(dim=1)
+    negative_sums = (F.softplus(logits) * negative_mask).sum(dim=1)
+    negative_mean = torch.where(
+        negative_counts > 0,
+        negative_sums / negative_counts.clamp_min(1).to(logits.dtype),
+        torch.zeros_like(negative_sums),
+    )
+    return positive_mean + float(negative_weight) * negative_mean
+
+
+def pag_candidate_lexical_activations(
+    query_hidden,
+    query_attention_mask,
+    vocabulary_weight,
+    candidate_token_ids,
+    candidate_token_mask,
+    *,
+    tied_embedding_scale: float = 1.0,
+):
+    """Return max-pooled lexical activations for selected set-ID tokens."""
+
+    import torch
+
+    if query_hidden.ndim != 3 or query_attention_mask.shape != query_hidden.shape[:2]:
+        raise ValueError("query hidden/mask must have shapes [batch, length, dim] and [batch, length]")
+    if vocabulary_weight.ndim != 2 or vocabulary_weight.shape[1] != query_hidden.shape[2]:
+        raise ValueError("vocabulary weight must have shape [vocab, hidden_dim]")
+    if candidate_token_ids.ndim != 3 or candidate_token_mask.shape != candidate_token_ids.shape:
+        raise ValueError("candidate token IDs/mask must have shape [batch, candidates, set_size]")
+    if candidate_token_ids.shape[0] != query_hidden.shape[0]:
+        raise ValueError("candidate token IDs do not align with query batch")
+    if candidate_token_ids.numel() and (
+        int(candidate_token_ids.min()) < 0
+        or int(candidate_token_ids.max()) >= vocabulary_weight.shape[0]
+    ):
+        raise ValueError("candidate token ID is outside the vocabulary")
+    if tied_embedding_scale <= 0.0:
+        raise ValueError("tied embedding scale must be positive")
+
+    selected_weight = vocabulary_weight[candidate_token_ids]
+    logits = torch.einsum(
+        "bld,bnmd->blnm",
+        query_hidden * float(tied_embedding_scale),
+        selected_weight,
+    )
+    activations = torch.log1p(torch.relu(logits))
+    activations = activations * query_attention_mask[:, :, None, None].to(activations.dtype)
+    return activations.max(dim=1).values * candidate_token_mask.to(activations.dtype)
+
+
+def pag_candidate_lexical_scores(
+    query_hidden,
+    query_attention_mask,
+    vocabulary_weight,
+    candidate_token_ids,
+    candidate_token_mask,
+    *,
+    tied_embedding_scale: float = 1.0,
+):
+    """Score fixed set-based skill IDs without materializing full-vocabulary logits."""
+
+    activations = pag_candidate_lexical_activations(
+        query_hidden,
+        query_attention_mask,
+        vocabulary_weight,
+        candidate_token_ids,
+        candidate_token_mask,
+        tied_embedding_scale=tied_embedding_scale,
+    )
+    return activations.sum(dim=-1)
+
+
 def make_structured_t5_sid_model(
     base_model: str,
     codebook_size: int,
     depth: int,
     dedup_size: int,
     semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    codebook_embeddings=None,
+    tie_code_input_output: bool = False,
 ):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     from transformers import AutoModelForSeq2SeqLM
+
+    class TiedCodeHead(nn.Module):
+        def __init__(self, embedding, offset: int, size: int) -> None:
+            super().__init__()
+            self.embedding = embedding
+            self.offset = int(offset)
+            self.size = int(size)
+
+        def forward(self, hidden):
+            return F.linear(
+                hidden,
+                self.embedding.weight[self.offset : self.offset + self.size],
+            )
 
     class StructuredT5SIDModel(nn.Module):
         def __init__(self) -> None:
@@ -2265,13 +2639,52 @@ def make_structured_t5_sid_model(
                 structured_sid_vocab_size(self.codebook_size, self.depth, self.dedup_size),
                 d_model,
             )
-            self.code_heads = nn.ModuleList(nn.Linear(d_model, self.codebook_size) for _ in range(self.depth))
+            self.tie_code_input_output = bool(tie_code_input_output)
+            self.sid_codebook_initialized = codebook_embeddings is not None
+            self.sid_codebook_init_scale = None
+            if self.tie_code_input_output:
+                self.code_heads = nn.ModuleList(
+                    TiedCodeHead(self.sid_embedding, level * self.codebook_size, self.codebook_size)
+                    for level in range(self.depth)
+                )
+            else:
+                self.code_heads = nn.ModuleList(
+                    nn.Linear(d_model, self.codebook_size) for _ in range(self.depth)
+                )
             self.dedup_head = (
                 nn.Linear(d_model, self.dedup_size)
                 if self.semantic_id_mode == SEMANTIC_ID_MODE_DEDUP
                 else None
             )
             self.control_head = nn.Linear(d_model, 2)
+            if codebook_embeddings is not None:
+                initial = torch.as_tensor(codebook_embeddings, dtype=self.sid_embedding.weight.dtype)
+                expected = (self.depth, self.codebook_size, d_model)
+                if tuple(initial.shape) != expected:
+                    raise ValueError(
+                        f"codebook embeddings must have shape {expected}, got {tuple(initial.shape)}"
+                    )
+                source_rms = initial.float().square().mean().sqrt()
+                if not torch.isfinite(source_rms) or float(source_rms) <= 0.0:
+                    raise ValueError("codebook embeddings must have finite non-zero RMS")
+                shared_weight = getattr(self.backbone, "shared", None)
+                target_weight = (
+                    shared_weight.weight
+                    if shared_weight is not None
+                    else self.sid_embedding.weight
+                )
+                target_rms = target_weight.detach().float().square().mean().sqrt()
+                scale = target_rms / source_rms
+                initial = initial * scale.to(initial.dtype)
+                self.sid_codebook_init_scale = float(scale)
+                with torch.no_grad():
+                    for level in range(self.depth):
+                        start = level * self.codebook_size
+                        end = start + self.codebook_size
+                        self.sid_embedding.weight[start:end].copy_(initial[level])
+                        if not self.tie_code_input_output:
+                            self.code_heads[level].weight.copy_(initial[level])
+                            self.code_heads[level].bias.zero_()
 
         def encode_source(self, input_ids, attention_mask):
             encoder_outputs = self.backbone.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -2303,8 +2716,269 @@ def make_structured_t5_sid_model(
                 decoder_attention_mask,
             )
 
-        def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, target_types, labels):
+        def pag_query_hidden_from_encoder(
+            self,
+            lexical_input_ids,
+            lexical_attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        ):
+            """Decode query tokens for PAG's set-based lexical representation."""
+
+            outputs = self.backbone.decoder(
+                input_ids=lexical_input_ids,
+                attention_mask=lexical_attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=False,
+            )
+            return outputs.last_hidden_state
+
+        def pag_candidate_scores_from_encoder(
+            self,
+            lexical_input_ids,
+            lexical_attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_token_ids,
+            candidate_token_mask,
+        ):
+            query_hidden = self.pag_query_hidden_from_encoder(
+                lexical_input_ids,
+                lexical_attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+            tied_scale = (
+                self.backbone.config.d_model**-0.5
+                if self.backbone.config.tie_word_embeddings
+                else 1.0
+            )
+            return pag_candidate_lexical_scores(
+                query_hidden,
+                lexical_attention_mask,
+                self.backbone.lm_head.weight,
+                candidate_token_ids,
+                candidate_token_mask,
+                tied_embedding_scale=tied_scale,
+            )
+
+        def pag_candidate_token_activations_from_encoder(
+            self,
+            lexical_input_ids,
+            lexical_attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            candidate_token_ids,
+            candidate_token_mask,
+        ):
+            query_hidden = self.pag_query_hidden_from_encoder(
+                lexical_input_ids,
+                lexical_attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+            tied_scale = (
+                self.backbone.config.d_model**-0.5
+                if self.backbone.config.tie_word_embeddings
+                else 1.0
+            )
+            return pag_candidate_lexical_activations(
+                query_hidden,
+                lexical_attention_mask,
+                self.backbone.lm_head.weight,
+                candidate_token_ids,
+                candidate_token_mask,
+                tied_embedding_scale=tied_scale,
+            )
+
+        def pag_lexical_rep_from_encoder(
+            self,
+            lexical_input_ids,
+            lexical_attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        ):
+            """Materialize PAG query term weights once for catalog-wide inference."""
+
+            query_hidden = self.pag_query_hidden_from_encoder(
+                lexical_input_ids,
+                lexical_attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+            if self.backbone.config.tie_word_embeddings:
+                query_hidden = query_hidden * (self.backbone.config.d_model**-0.5)
+            logits = self.backbone.lm_head(query_hidden)
+            activations = torch.log1p(torch.relu(logits))
+            activations = activations * lexical_attention_mask.unsqueeze(-1).to(activations.dtype)
+            return activations.max(dim=1).values
+
+        def forward(
+            self,
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            decoder_attention_mask,
+            target_types,
+            labels,
+            positive_labels=None,
+            source_group_ids=None,
+            multilabel_candidate_labels=None,
+            multilabel_negative_weight: float = 1.0,
+            grouped_standard_ce: bool = False,
+            trie_set_ce: bool = False,
+        ):
+            if grouped_standard_ce:
+                if source_group_ids is None:
+                    raise ValueError("query-balanced standard CE requires source_group_ids")
+                if positive_labels is not None or multilabel_candidate_labels is not None:
+                    raise ValueError("query-balanced standard CE does not accept multi-positive labels")
+                encoder_hidden_states = self.encode_source(input_ids, attention_mask)
+                hidden = self._decoder_hidden_from_encoder(
+                    encoder_hidden_states.index_select(0, source_group_ids),
+                    attention_mask.index_select(0, source_group_ids),
+                    decoder_input_ids,
+                    decoder_attention_mask,
+                )
+                row_loss_sums = hidden.new_zeros(hidden.shape[0])
+                row_token_counts = hidden.new_zeros(hidden.shape[0])
+                row_indices = torch.arange(hidden.shape[0], device=hidden.device).unsqueeze(1).expand_as(target_types)
+
+                def add_grouped_standard_ce(mask, head):
+                    if not mask.any():
+                        return
+                    token_losses = F.cross_entropy(
+                        head(hidden[mask]),
+                        labels[mask],
+                        reduction="none",
+                    )
+                    selected_rows = row_indices[mask]
+                    row_loss_sums.scatter_add_(0, selected_rows, token_losses)
+                    row_token_counts.scatter_add_(0, selected_rows, torch.ones_like(token_losses))
+
+                for level, head in enumerate(self.code_heads):
+                    add_grouped_standard_ce(target_types == level, head)
+                if self.dedup_head is not None:
+                    add_grouped_standard_ce(target_types == self.depth, self.dedup_head)
+                add_grouped_standard_ce(target_types == self.control_type, self.control_head)
+                if (row_token_counts == 0).any():
+                    raise ValueError("every grouped target row must contain a supervised token")
+                row_losses = row_loss_sums / row_token_counts
+                return mean_loss_per_source_query(row_losses, source_group_ids)
+
+            if trie_set_ce:
+                if positive_labels is None or source_group_ids is None or multilabel_candidate_labels is None:
+                    raise ValueError("trie set CE requires positive labels, candidates, and source groups")
+                encoder_hidden_states = self.encode_source(input_ids, attention_mask)
+                hidden = self._decoder_hidden_from_encoder(
+                    encoder_hidden_states.index_select(0, source_group_ids),
+                    attention_mask.index_select(0, source_group_ids),
+                    decoder_input_ids,
+                    decoder_attention_mask,
+                )
+                last_indices = decoder_attention_mask.sum(dim=1).clamp_min(1) - 1
+                state_hidden = hidden[
+                    torch.arange(hidden.shape[0], device=hidden.device),
+                    last_indices,
+                ]
+                state_losses = hidden.new_zeros(hidden.shape[0])
+                active_states = torch.zeros(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+
+                def add_trie_set_losses(mask, head):
+                    if not mask.any():
+                        return
+                    losses, active = trie_multi_positive_set_cross_entropy(
+                        head(state_hidden[mask]),
+                        positive_labels[mask],
+                        multilabel_candidate_labels[mask],
+                    )
+                    state_losses[mask] = losses
+                    active_states[mask] = active
+
+                for level, head in enumerate(self.code_heads):
+                    add_trie_set_losses(target_types == level, head)
+                if self.dedup_head is not None:
+                    add_trie_set_losses(target_types == self.depth, self.dedup_head)
+                semantic_length = structured_sid_length(self.depth, self.semantic_id_mode)
+                active_states = active_states & (target_types < semantic_length)
+                return mean_active_loss_per_source_query_and_depth(
+                    state_losses,
+                    source_group_ids,
+                    target_types,
+                    active_states,
+                    semantic_length,
+                )
+
+            if multilabel_candidate_labels is not None:
+                if positive_labels is None or source_group_ids is None:
+                    raise ValueError("trie multi-label BCE requires positive_labels and source_group_ids")
+                encoder_hidden_states = self.encode_source(input_ids, attention_mask)
+                expanded_encoder_hidden_states = encoder_hidden_states.index_select(0, source_group_ids)
+                expanded_attention_mask = attention_mask.index_select(0, source_group_ids)
+                hidden = self._decoder_hidden_from_encoder(
+                    expanded_encoder_hidden_states,
+                    expanded_attention_mask,
+                    decoder_input_ids,
+                    decoder_attention_mask,
+                )
+                last_indices = decoder_attention_mask.sum(dim=1).clamp_min(1) - 1
+                state_hidden = hidden[
+                    torch.arange(hidden.shape[0], device=hidden.device),
+                    last_indices,
+                ]
+                state_losses = hidden.new_zeros(hidden.shape[0])
+
+                def add_multilabel_losses(mask, head):
+                    if not mask.any():
+                        return
+                    losses = balanced_trie_multilabel_binary_cross_entropy(
+                        head(state_hidden[mask]),
+                        positive_labels[mask],
+                        multilabel_candidate_labels[mask],
+                        multilabel_negative_weight,
+                    )
+                    state_losses[mask] = losses
+
+                for level, head in enumerate(self.code_heads):
+                    add_multilabel_losses(target_types == level, head)
+                if self.dedup_head is not None:
+                    add_multilabel_losses(target_types == self.depth, self.dedup_head)
+                add_multilabel_losses(target_types == self.control_type, self.control_head)
+                if not torch.isfinite(state_losses).all():
+                    raise ValueError("non-finite trie multi-label state loss")
+                return mean_loss_per_source_query(state_losses, source_group_ids)
+
             hidden = self._decoder_hidden(input_ids, attention_mask, decoder_input_ids, decoder_attention_mask)
+            if positive_labels is not None or source_group_ids is not None:
+                if positive_labels is None or source_group_ids is None:
+                    raise ValueError("positive_labels and source_group_ids must be supplied together")
+                row_loss_sums = hidden.new_zeros(hidden.shape[0])
+                row_token_counts = hidden.new_zeros(hidden.shape[0])
+                row_indices = torch.arange(hidden.shape[0], device=hidden.device).unsqueeze(1).expand_as(target_types)
+
+                def add_decoupled_losses(mask, head):
+                    if not mask.any():
+                        return
+                    token_losses = decoupled_multi_positive_cross_entropy(
+                        head(hidden[mask]),
+                        labels[mask],
+                        positive_labels[mask],
+                    )
+                    selected_rows = row_indices[mask]
+                    row_loss_sums.scatter_add_(0, selected_rows, token_losses)
+                    row_token_counts.scatter_add_(0, selected_rows, torch.ones_like(token_losses))
+
+                for level, head in enumerate(self.code_heads):
+                    add_decoupled_losses(target_types == level, head)
+                if self.dedup_head is not None:
+                    add_decoupled_losses(target_types == self.depth, self.dedup_head)
+                add_decoupled_losses(target_types == self.control_type, self.control_head)
+                if (row_token_counts == 0).any():
+                    raise ValueError("every grouped target row must contain a supervised token")
+                row_losses = row_loss_sums / row_token_counts
+                return mean_loss_per_source_query(row_losses, source_group_ids)
+
             loss_sum = hidden.new_tensor(0.0)
             token_count = hidden.new_tensor(0.0)
             for level, head in enumerate(self.code_heads):
@@ -2416,8 +3090,365 @@ def structured_sid_batch(
     }
 
 
+def build_query_balanced_multi_positive_targets(
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+) -> tuple[list[dict[str, Any]], list[int], list[list[list[int]]]]:
+    """Expand target branches while retaining query groups and alternative-positive tokens."""
+
+    targets: list[dict[str, Any]] = []
+    source_group_ids: list[int] = []
+    target_positive_labels: list[list[list[int]]] = []
+    for source_group_id, row in enumerate(rows):
+        gold_ids = sorted(_unique_preserving_order([str(sid) for sid in row.get("selected_skill_ids", [])]))
+        if not gold_ids:
+            raise ValueError(f"query row has no selected skills: {row.get('index')}")
+        query_targets = []
+        positives_by_state: dict[tuple[int, tuple[int, ...]], set[int]] = {}
+        for sid in gold_ids:
+            if sid not in semantic_ids:
+                raise KeyError(f"missing semantic id for selected skill: {sid}")
+            target = encode_structured_sid_target(
+                [sid],
+                semantic_ids,
+                codebook_size=codebook_size,
+                depth=depth,
+                dedup_size=dedup_size,
+                semantic_id_mode=semantic_id_mode,
+            )
+            query_targets.append(target)
+            for token_index, (target_type, label) in enumerate(zip(target["types"], target["labels"])):
+                prefix = tuple(target["decoder_input_ids"][: token_index + 1])
+                positives_by_state.setdefault((target_type, prefix), set()).add(label)
+
+        for target in query_targets:
+            positives = []
+            for token_index, target_type in enumerate(target["types"]):
+                prefix = tuple(target["decoder_input_ids"][: token_index + 1])
+                positives.append(sorted(positives_by_state[(target_type, prefix)]))
+            targets.append(target)
+            source_group_ids.append(source_group_id)
+            target_positive_labels.append(positives)
+    return targets, source_group_ids, target_positive_labels
+
+
+def query_balanced_multi_positive_structured_sid_batch(
+    rows: list[dict[str, Any]],
+    tokenizer,
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    max_source_length: int,
+    device,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+) -> dict[str, Any]:
+    import torch
+
+    targets, source_group_ids, target_positive_labels = build_query_balanced_multi_positive_targets(
+        rows,
+        semantic_ids,
+        codebook_size,
+        depth,
+        dedup_size,
+        semantic_id_mode,
+    )
+    encoded_inputs = tokenizer(
+        [decoder_source_text(rows[group_id]) for group_id in source_group_ids],
+        padding=True,
+        truncation=True,
+        max_length=max_source_length,
+        return_tensors="pt",
+    )
+    max_len = max(len(target["labels"]) for target in targets)
+    max_positives = max(len(values) for target_values in target_positive_labels for values in target_values)
+    decoder_input_ids = []
+    decoder_attention_mask = []
+    target_types = []
+    labels = []
+    positive_labels = []
+    for target, target_positives in zip(targets, target_positive_labels):
+        length = len(target["labels"])
+        pad = max_len - length
+        decoder_input_ids.append([*target["decoder_input_ids"], *([target["bos_id"]] * pad)])
+        decoder_attention_mask.append([*(1 for _ in range(length)), *([0] * pad)])
+        target_types.append([*target["types"], *([-100] * pad)])
+        labels.append([*target["labels"], *([-100] * pad)])
+        padded_target_positives = [
+            [*values, *([-1] * (max_positives - len(values)))] for values in target_positives
+        ]
+        padded_target_positives.extend([[-1] * max_positives for _ in range(pad)])
+        positive_labels.append(padded_target_positives)
+
+    return {
+        "input_ids": encoded_inputs["input_ids"].to(device),
+        "attention_mask": encoded_inputs["attention_mask"].to(device),
+        "decoder_input_ids": torch.tensor(decoder_input_ids, dtype=torch.long, device=device),
+        "decoder_attention_mask": torch.tensor(decoder_attention_mask, dtype=torch.long, device=device),
+        "target_types": torch.tensor(target_types, dtype=torch.long, device=device),
+        "labels": torch.tensor(labels, dtype=torch.long, device=device),
+        "positive_labels": torch.tensor(positive_labels, dtype=torch.long, device=device),
+        "source_group_ids": torch.tensor(source_group_ids, dtype=torch.long, device=device),
+    }
+
+
+def query_balanced_standard_ce_structured_sid_batch(
+    rows: list[dict[str, Any]],
+    tokenizer,
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    max_source_length: int,
+    device,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+) -> dict[str, Any]:
+    """Build one standard-CE branch per GT while keeping source-query groups."""
+
+    import torch
+
+    targets, source_group_ids, _ = build_query_balanced_multi_positive_targets(
+        rows,
+        semantic_ids,
+        codebook_size,
+        depth,
+        dedup_size,
+        semantic_id_mode,
+    )
+    encoded_inputs = tokenizer(
+        [decoder_source_text(row) for row in rows],
+        padding=True,
+        truncation=True,
+        max_length=max_source_length,
+        return_tensors="pt",
+    )
+    max_len = max(len(target["labels"]) for target in targets)
+    decoder_input_ids = []
+    decoder_attention_mask = []
+    target_types = []
+    labels = []
+    for target in targets:
+        length = len(target["labels"])
+        pad = max_len - length
+        decoder_input_ids.append([*target["decoder_input_ids"], *([target["bos_id"]] * pad)])
+        decoder_attention_mask.append([*([1] * length), *([0] * pad)])
+        target_types.append([*target["types"], *([-100] * pad)])
+        labels.append([*target["labels"], *([-100] * pad)])
+
+    return {
+        "input_ids": encoded_inputs["input_ids"].to(device),
+        "attention_mask": encoded_inputs["attention_mask"].to(device),
+        "decoder_input_ids": torch.tensor(decoder_input_ids, dtype=torch.long, device=device),
+        "decoder_attention_mask": torch.tensor(decoder_attention_mask, dtype=torch.long, device=device),
+        "target_types": torch.tensor(target_types, dtype=torch.long, device=device),
+        "labels": torch.tensor(labels, dtype=torch.long, device=device),
+        "source_group_ids": torch.tensor(source_group_ids, dtype=torch.long, device=device),
+        "grouped_standard_ce": True,
+    }
+
+
+def build_query_balanced_trie_multilabel_states(
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    trie: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Build one multi-label prediction state per unique gold trie prefix."""
+
+    semantic_length = structured_sid_length(depth, semantic_id_mode)
+    bos_id = structured_sid_bos_id(codebook_size, depth, dedup_size, semantic_id_mode)
+    if trie is None:
+        trie, _ = _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)
+    states: list[dict[str, Any]] = []
+    source_group_ids: list[int] = []
+    for source_group_id, row in enumerate(rows):
+        gold_ids = sorted(_unique_preserving_order([str(sid) for sid in row.get("selected_skill_ids", [])]))
+        if not gold_ids:
+            raise ValueError(f"query row has no selected skills: {row.get('index')}")
+        gold_sequences = []
+        for sid in gold_ids:
+            if sid not in semantic_ids:
+                raise KeyError(f"missing semantic id for selected skill: {sid}")
+            values = tuple(int(value) for value in semantic_ids[sid])
+            if len(values) != semantic_length:
+                raise ValueError(
+                    f"semantic id length mismatch for {sid}: {len(values)} != {semantic_length}"
+                )
+            gold_sequences.append(values)
+
+        positives_by_state: dict[tuple[int, tuple[int, ...]], set[int]] = {}
+        for values in gold_sequences:
+            for target_type in range(semantic_length):
+                prefix = values[:target_type]
+                positives_by_state.setdefault((target_type, prefix), set()).add(values[target_type])
+            positives_by_state.setdefault((semantic_length, values), set()).add(1)
+
+        for (target_type, prefix), positives in sorted(
+            positives_by_state.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+            if target_type < semantic_length:
+                node = _trie_node_for_prefix(trie, list(prefix))
+                if node is None:
+                    raise ValueError(f"gold prefix is absent from semantic-id trie: {prefix}")
+                candidates = sorted(int(key) for key in node if key != TRIE_TERMINAL_KEY)
+            else:
+                candidates = [0, 1]
+            if not set(positives).issubset(candidates):
+                raise ValueError(f"positive labels are absent from trie candidates at prefix {prefix}")
+            decoder_input_ids = [bos_id]
+            decoder_input_ids.extend(
+                global_sid_token_id(
+                    level,
+                    value,
+                    codebook_size,
+                    depth,
+                    dedup_size,
+                    semantic_id_mode,
+                )
+                for level, value in enumerate(prefix)
+            )
+            states.append(
+                {
+                    "decoder_input_ids": decoder_input_ids,
+                    "target_type": target_type,
+                    "positive_labels": sorted(positives),
+                    "candidate_labels": candidates,
+                    "prefix": list(prefix),
+                }
+            )
+            source_group_ids.append(source_group_id)
+    return states, source_group_ids
+
+
+def count_query_balanced_trie_multilabel_states(
+    rows: list[dict[str, Any]],
+    semantic_ids: dict[str, list[int]],
+) -> int:
+    """Count unique gold prefix states without materializing training tensors."""
+
+    total = 0
+    for row in rows:
+        gold_ids = sorted(_unique_preserving_order([str(sid) for sid in row.get("selected_skill_ids", [])]))
+        if not gold_ids:
+            raise ValueError(f"query row has no selected skills: {row.get('index')}")
+        state_keys: set[tuple[int, tuple[int, ...]]] = set()
+        for sid in gold_ids:
+            if sid not in semantic_ids:
+                raise KeyError(f"missing semantic id for selected skill: {sid}")
+            values = tuple(int(value) for value in semantic_ids[sid])
+            for target_type in range(len(values)):
+                state_keys.add((target_type, values[:target_type]))
+            state_keys.add((len(values), values))
+        total += len(state_keys)
+    return total
+
+
+def query_balanced_trie_multilabel_structured_sid_batch(
+    rows: list[dict[str, Any]],
+    tokenizer,
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    max_source_length: int,
+    device,
+    negative_weight: float,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    trie: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    import torch
+
+    states, source_group_ids = build_query_balanced_trie_multilabel_states(
+        rows,
+        semantic_ids,
+        codebook_size,
+        depth,
+        dedup_size,
+        semantic_id_mode,
+        trie,
+    )
+    encoded_inputs = tokenizer(
+        [decoder_source_text(row) for row in rows],
+        padding=True,
+        truncation=True,
+        max_length=max_source_length,
+        return_tensors="pt",
+    )
+    max_decoder_length = max(len(state["decoder_input_ids"]) for state in states)
+    max_positives = max(len(state["positive_labels"]) for state in states)
+    max_candidates = max(len(state["candidate_labels"]) for state in states)
+
+    decoder_input_ids = []
+    decoder_attention_mask = []
+    positive_labels = []
+    candidate_labels = []
+    for state in states:
+        length = len(state["decoder_input_ids"])
+        decoder_input_ids.append(
+            [*state["decoder_input_ids"], *([state["decoder_input_ids"][0]] * (max_decoder_length - length))]
+        )
+        decoder_attention_mask.append([*([1] * length), *([0] * (max_decoder_length - length))])
+        positive_labels.append(
+            [*state["positive_labels"], *([-1] * (max_positives - len(state["positive_labels"])))]
+        )
+        candidate_labels.append(
+            [*state["candidate_labels"], *([-1] * (max_candidates - len(state["candidate_labels"])))]
+        )
+
+    return {
+        "input_ids": encoded_inputs["input_ids"].to(device),
+        "attention_mask": encoded_inputs["attention_mask"].to(device),
+        "decoder_input_ids": torch.tensor(decoder_input_ids, dtype=torch.long, device=device),
+        "decoder_attention_mask": torch.tensor(decoder_attention_mask, dtype=torch.long, device=device),
+        "target_types": torch.tensor([state["target_type"] for state in states], dtype=torch.long, device=device),
+        "labels": torch.tensor([state["positive_labels"][0] for state in states], dtype=torch.long, device=device),
+        "positive_labels": torch.tensor(positive_labels, dtype=torch.long, device=device),
+        "multilabel_candidate_labels": torch.tensor(candidate_labels, dtype=torch.long, device=device),
+        "multilabel_negative_weight": float(negative_weight),
+        "source_group_ids": torch.tensor(source_group_ids, dtype=torch.long, device=device),
+    }
+
+
+def query_balanced_trie_set_ce_structured_sid_batch(
+    rows: list[dict[str, Any]],
+    tokenizer,
+    semantic_ids: dict[str, list[int]],
+    codebook_size: int,
+    depth: int,
+    dedup_size: int,
+    max_source_length: int,
+    device,
+    semantic_id_mode: str = SEMANTIC_ID_MODE_DEDUP,
+    trie: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build query-equal trie states for set-marginal CE on active branches."""
+
+    batch = query_balanced_trie_multilabel_structured_sid_batch(
+        rows,
+        tokenizer,
+        semantic_ids,
+        codebook_size,
+        depth,
+        dedup_size,
+        max_source_length,
+        device,
+        negative_weight=1.0,
+        semantic_id_mode=semantic_id_mode,
+        trie=trie,
+    )
+    batch["trie_set_ce"] = True
+    return batch
+
+
 def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
-    """Alternate full query epochs with document-indexing epochs and select on retrieval."""
+    """Train recurring query/document passes and select checkpoints on retrieval."""
 
     import torch
     from transformers import AutoTokenizer
@@ -2548,7 +3579,11 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
         loss_history_path.unlink()
     training_config = {
         "command": "train-single-sid-decoder",
-        "schedule": "query epoch followed by document epoch",
+        "schedule": (
+            "randomly interleaved query/document batches"
+            if args.interleave_document_batches
+            else "query epoch followed by document epoch"
+        ),
         "model": args.model,
         "source_train_rows": len(source_rows),
         "query_train_rows": len(query_train_rows),
@@ -2556,6 +3591,7 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
         "document_rows": len(document_rows),
         "query_epochs": args.epochs,
         "document_epochs_after_each_query_epoch": args.periodic_document_epochs,
+        "interleave_document_batches": args.interleave_document_batches,
         "query_batch_size": query_batch_size,
         "document_batch_size": document_batch_size,
         "lr": args.lr,
@@ -2586,6 +3622,11 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
     best_query_epoch: int | None = None
     best_checkpoint = args.output_dir / "best"
     official_history: list[dict[str, Any]] = []
+    training_formulation = (
+        "interleaved_query_document_single_sid"
+        if args.interleave_document_batches
+        else "periodic_query_then_document_single_sid"
+    )
 
     def train_one_epoch(
         stage_name: str,
@@ -2668,6 +3709,119 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
         log_training_event(wandb_run, epoch_event)
         return step, mean_loss
 
+    def train_one_interleaved_epoch(
+        query_epoch_number: int,
+        query_step_start: int,
+        document_step_start: int,
+    ) -> tuple[int, float, int, float]:
+        model.train()
+        rng.shuffle(query_train_rows)
+        batch_schedule: list[tuple[str, list[dict[str, Any]]]] = [
+            ("query", query_train_rows[start : start + query_batch_size])
+            for start in range(0, len(query_train_rows), query_batch_size)
+        ]
+        for _ in range(args.periodic_document_epochs):
+            rng.shuffle(document_rows)
+            batch_schedule.extend(
+                ("document", document_rows[start : start + document_batch_size])
+                for start in range(0, len(document_rows), document_batch_size)
+            )
+        rng.shuffle(batch_schedule)
+
+        stage_totals = {
+            "query": sum(stage == "query" for stage, _ in batch_schedule),
+            "document": sum(stage == "document" for stage, _ in batch_schedule),
+        }
+        stage_seen = {"query": 0, "document": 0}
+        stage_steps = {"query": query_step_start, "document": document_step_start}
+        loss_sums = {"query": 0.0, "document": 0.0}
+        row_counts = {"query": 0, "document": 0}
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+
+        for stage_name, batch_rows in batch_schedule:
+            batch = structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                semantic_id_mode,
+            )
+            opt.zero_grad()
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=bool(args.bf16 and device.type == "cuda"),
+            ):
+                loss = model(**batch)
+            loss.backward()
+            opt.step()
+
+            stage_steps[stage_name] += 1
+            stage_seen[stage_name] += 1
+            last_loss = float(loss.detach().cpu())
+            loss_sums[stage_name] += last_loss * len(batch_rows)
+            row_counts[stage_name] += len(batch_rows)
+            if (
+                stage_seen[stage_name] % args.logging_steps == 0
+                or stage_seen[stage_name] == stage_totals[stage_name]
+            ):
+                event = {
+                    "stage": stage_name,
+                    "event": "train",
+                    "step": stage_steps[stage_name],
+                    "epoch": query_epoch_number - 1
+                    + stage_seen[stage_name] / stage_totals[stage_name],
+                    "train_loss": last_loss,
+                    "lr": opt.param_groups[0]["lr"],
+                    "schedule": "randomly_interleaved",
+                }
+                print(
+                    f"{stage_name}_step={event['step']} epoch={event['epoch']:.4f} "
+                    f"train_loss={last_loss:.6f} schedule=randomly_interleaved",
+                    flush=True,
+                )
+                append_loss_history(loss_history_path, event)
+                log_training_event(wandb_run, event)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        peak_memory_gib = (
+            float(torch.cuda.max_memory_reserved(device) / (1024**3)) if device.type == "cuda" else 0.0
+        )
+        mean_losses: dict[str, float] = {}
+        for stage_name in ("query", "document"):
+            mean_loss = loss_sums[stage_name] / max(1, row_counts[stage_name])
+            mean_losses[stage_name] = mean_loss
+            epoch_event = {
+                "stage": stage_name,
+                "event": "epoch_end",
+                "step": stage_steps[stage_name],
+                "epoch": query_epoch_number,
+                "epoch_train_loss": mean_loss,
+                "elapsed_seconds": elapsed,
+                "steps_per_second": stage_totals[stage_name] / max(elapsed, 1e-9),
+                "peak_memory_gib": peak_memory_gib,
+                "lr": opt.param_groups[0]["lr"],
+                "schedule": "randomly_interleaved",
+            }
+            print(json.dumps(epoch_event, sort_keys=True), flush=True)
+            append_loss_history(loss_history_path, epoch_event)
+            log_training_event(wandb_run, epoch_event)
+        return (
+            stage_steps["query"],
+            mean_losses["query"],
+            stage_steps["document"],
+            mean_losses["document"],
+        )
+
     def evaluate_official(query_epoch: int) -> None:
         nonlocal best_official_score, best_query_epoch
 
@@ -2737,7 +3891,7 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
                 depth,
                 dedup_size,
                 args.seed,
-                "periodic_query_then_document_single_sid",
+                training_formulation,
                 {
                     **checkpoint_metadata,
                     "best_official_score": score,
@@ -2754,22 +3908,28 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
                 wandb_run.summary["best_query_epoch"] = query_epoch
 
     for query_epoch in range(1, args.epochs + 1):
-        query_step, last_query_loss = train_one_epoch(
-            "query",
-            query_train_rows,
-            query_batch_size,
-            query_epoch,
-            query_step,
-        )
-        for _ in range(args.periodic_document_epochs):
-            document_epoch += 1
-            document_step, last_document_loss = train_one_epoch(
-                "document",
-                document_rows,
-                document_batch_size,
-                document_epoch,
-                document_step,
+        if args.interleave_document_batches:
+            query_step, last_query_loss, document_step, last_document_loss = (
+                train_one_interleaved_epoch(query_epoch, query_step, document_step)
             )
+            document_epoch += args.periodic_document_epochs
+        else:
+            query_step, last_query_loss = train_one_epoch(
+                "query",
+                query_train_rows,
+                query_batch_size,
+                query_epoch,
+                query_step,
+            )
+            for _ in range(args.periodic_document_epochs):
+                document_epoch += 1
+                document_step, last_document_loss = train_one_epoch(
+                    "document",
+                    document_rows,
+                    document_batch_size,
+                    document_epoch,
+                    document_step,
+                )
         if query_epoch % args.official_eval_every_epochs == 0 or query_epoch == args.epochs:
             evaluate_official(query_epoch)
 
@@ -2783,7 +3943,7 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         args.seed,
-        "periodic_query_then_document_single_sid",
+        training_formulation,
         {
             **checkpoint_metadata,
             "last_query_epoch": args.epochs,
@@ -2817,7 +3977,7 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         args.seed,
-        "periodic_query_then_document_single_sid",
+        training_formulation,
         {
             **checkpoint_metadata,
             "selected_checkpoint": selected_checkpoint,
@@ -2857,6 +4017,31 @@ def command_train_periodic_single_sid_decoder(args: argparse.Namespace) -> None:
 
 
 def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
+    module_lr_values = (args.encoder_lr, args.decoder_lr, args.sid_lr)
+    uses_module_learning_rates = any(value is not None for value in module_lr_values)
+    if uses_module_learning_rates and not all(value is not None for value in module_lr_values):
+        raise ValueError("--encoder-lr, --decoder-lr, and --sid-lr must be provided together")
+    if args.reset_optimizer_on_init and not args.init_model_dir:
+        raise ValueError("--reset-optimizer-on-init requires --init-model-dir")
+    if uses_module_learning_rates and args.init_model_dir and not args.reset_optimizer_on_init:
+        raise ValueError("module learning rates with --init-model-dir require --reset-optimizer-on-init")
+    if (uses_module_learning_rates or args.reset_optimizer_on_init) and args.periodic_document_epochs > 0:
+        raise ValueError("optimizer reset and module learning rates support the catalog-then-query schedule only")
+    if args.interleave_document_batches and args.periodic_document_epochs <= 0:
+        raise ValueError("--interleave-document-batches requires --periodic-document-epochs > 0")
+    query_objective_flag_count = sum(
+        bool(flag)
+        for flag in (
+            args.query_balanced_standard_ce,
+            args.query_balanced_multi_positive_ce,
+            args.query_balanced_trie_multilabel_bce,
+            args.query_balanced_trie_set_ce,
+        )
+    )
+    if query_objective_flag_count > 1:
+        raise ValueError("query objectives are mutually exclusive")
+    if query_objective_flag_count and args.periodic_document_epochs > 0:
+        raise ValueError("query-balanced objectives currently support the catalog-then-query schedule only")
     if args.periodic_document_epochs > 0:
         command_train_periodic_single_sid_decoder(args)
         return
@@ -2866,8 +4051,10 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
 
     semantic_ids, semantic_id_mode = load_semantic_ids_with_mode(args.semantic_ids)
     eval_batch_size = args.eval_batch_size or args.batch_size
-    if eval_batch_size < 1:
-        raise ValueError(f"eval_batch_size must be positive, got {eval_batch_size}")
+    query_batch_size = args.query_batch_size or args.batch_size
+    catalog_batch_size = args.document_batch_size or args.batch_size
+    if min(eval_batch_size, query_batch_size, catalog_batch_size) < 1:
+        raise ValueError("eval, query, and document batch sizes must be positive")
     sid_config = infer_structured_sid_config(
         semantic_ids,
         codebook_size=args.codebook_size,
@@ -2879,20 +4066,117 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
     dedup_size = sid_config["dedup_size"]
 
     query_rows_source = load_jsonl(args.rows)
+    training_trie = (
+        _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)[0]
+        if args.query_balanced_trie_multilabel_bce or args.query_balanced_trie_set_ce
+        else None
+    )
     rng = random.Random(args.seed)
-    if args.dev_rows:
-        query_train_rows = expand_single_sid_query_rows(query_rows_source, semantic_ids)
-        query_dev_rows = expand_single_sid_query_rows(load_jsonl(args.dev_rows), semantic_ids)
+    query_rows_are_grouped = bool(
+        args.query_balanced_standard_ce
+        or args.query_balanced_multi_positive_ce
+        or args.query_balanced_trie_multilabel_bce
+        or args.query_balanced_trie_set_ce
+    )
+    if args.query_balanced_trie_set_ce:
+        query_objective = "query_balanced_trie_multi_positive_set_ce"
+        loss_averaging = "active_state_then_depth_then_source_query"
+        decoder_score_mode = "trie_local_softmax"
+    elif args.query_balanced_trie_multilabel_bce:
+        query_objective = "query_balanced_trie_multilabel_bce"
+        loss_averaging = "positive_and_negative_then_trie_state_then_source_query"
+        decoder_score_mode = "sigmoid"
+    elif args.query_balanced_multi_positive_ce:
+        query_objective = "query_balanced_decoupled_multi_positive_token_ce"
+        loss_averaging = "token_then_positive_target_then_source_query"
+        decoder_score_mode = "softmax"
+    elif args.query_balanced_standard_ce:
+        query_objective = "query_balanced_standard_token_ce"
+        loss_averaging = "token_then_positive_target_then_source_query"
+        decoder_score_mode = "softmax"
     else:
-        query_train_rows, query_dev_rows = split_and_expand_single_sid_query_rows(
-            query_rows_source,
-            semantic_ids,
-            args.dev_ratio,
-            args.seed,
+        query_objective = "expanded_single_positive_token_ce"
+        loss_averaging = "all_target_tokens"
+        decoder_score_mode = "softmax"
+    if args.disable_dev_eval:
+        if args.dev_rows:
+            raise ValueError("--dev-rows cannot be combined with --disable-dev-eval")
+        query_train_rows = (
+            list(query_rows_source)
+            if query_rows_are_grouped
+            else expand_single_sid_query_rows(query_rows_source, semantic_ids)
         )
+        query_dev_rows = []
+    elif query_rows_are_grouped:
+        if args.dev_rows:
+            query_train_rows = list(query_rows_source)
+            query_dev_rows = load_jsonl(args.dev_rows)
+        else:
+            shuffled_source_rows = list(query_rows_source)
+            split_rng = random.Random(args.seed)
+            split_rng.shuffle(shuffled_source_rows)
+            dev_size = max(1, math.ceil(len(shuffled_source_rows) * args.dev_ratio)) if args.dev_ratio > 0 else 0
+            query_dev_rows = shuffled_source_rows[:dev_size]
+            query_train_rows = shuffled_source_rows[dev_size:]
+    else:
+        if args.dev_rows:
+            query_train_rows = expand_single_sid_query_rows(query_rows_source, semantic_ids)
+            query_dev_rows = expand_single_sid_query_rows(load_jsonl(args.dev_rows), semantic_ids)
+        else:
+            query_train_rows, query_dev_rows = split_and_expand_single_sid_query_rows(
+                query_rows_source,
+                semantic_ids,
+                args.dev_ratio,
+                args.seed,
+            )
+
+    def count_target_rows(rows: list[dict[str, Any]]) -> int:
+        count = 0
+        for row in rows:
+            gold_ids = sorted(_unique_preserving_order([str(sid) for sid in row.get("selected_skill_ids", [])]))
+            if not gold_ids:
+                raise ValueError(f"query row has no selected skills: {row.get('index')}")
+            missing = [sid for sid in gold_ids if sid not in semantic_ids]
+            if missing:
+                raise KeyError(f"missing semantic id for selected skill: {missing[0]}")
+            count += len(gold_ids)
+        return count
+
+    query_train_target_rows = (
+        count_target_rows(query_train_rows)
+        if query_rows_are_grouped
+        else len(query_train_rows)
+    )
+    query_dev_target_rows = (
+        count_target_rows(query_dev_rows)
+        if query_rows_are_grouped
+        else len(query_dev_rows)
+    )
+    query_train_trie_states = (
+        count_query_balanced_trie_multilabel_states(query_train_rows, semantic_ids)
+        if args.query_balanced_trie_multilabel_bce or args.query_balanced_trie_set_ce
+        else None
+    )
+    query_dev_trie_states = (
+        count_query_balanced_trie_multilabel_states(query_dev_rows, semantic_ids)
+        if (args.query_balanced_trie_multilabel_bce or args.query_balanced_trie_set_ce) and query_dev_rows
+        else None
+    )
 
     catalog_rows = build_single_sid_catalog_rows(load_jsonl(args.skills_jsonl), semantic_ids, args.catalog_input_prefix)
     rng.shuffle(catalog_rows)
+    official_rows: list[dict[str, Any]] = []
+    official_k_values: list[int] = []
+    if args.disable_dev_eval:
+        if not args.official_eval_rows:
+            raise ValueError("--official-eval-rows is required when dev evaluation is disabled")
+        official_rows = load_jsonl(args.official_eval_rows)
+        official_k_values = parse_k_values(args.official_eval_k_values)
+        if args.official_selection_k not in official_k_values:
+            raise ValueError(
+                f"official selection K={args.official_selection_k} is absent from {official_k_values}"
+            )
+        validate_rank_capacity(args.official_eval_num_beams, 1, max(official_k_values))
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -2920,14 +4204,40 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         args.max_source_length,
         args.allow_source_truncation,
     )
+    official_length_audit = (
+        audit_source_token_lengths(
+            "official",
+            official_rows,
+            tokenizer,
+            args.max_source_length,
+            args.allow_source_truncation,
+        )
+        if official_rows
+        else None
+    )
+    sid_codebook_embeddings = None
+    if args.sid_codebook_init:
+        if args.init_model_dir:
+            raise ValueError("--sid-codebook-init is only valid for fresh decoder initialization")
+        payload = torch.load(args.sid_codebook_init, map_location="cpu", weights_only=False)
+        sid_codebook_embeddings = payload.get("codebook_embeddings") if isinstance(payload, dict) else payload
     model = make_structured_t5_sid_model(
         args.model,
         codebook_size,
         depth,
         dedup_size,
         semantic_id_mode,
+        codebook_embeddings=sid_codebook_embeddings,
+        tie_code_input_output=args.tie_code_input_output,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt, optimizer_group_metadata = build_single_sid_optimizer(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        encoder_lr=args.encoder_lr,
+        decoder_lr=args.decoder_lr,
+        sid_lr=args.sid_lr,
+    )
     loaded_optimizer_state = False
     init_semantic_ids_verified = False
     init_source_length_verified = False
@@ -2937,11 +4247,13 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             model,
             args.init_model_dir,
             device,
-            optimizer=opt,
-            lr=args.lr,
+            optimizer=None if args.reset_optimizer_on_init else opt,
+            lr=None if args.reset_optimizer_on_init or uses_module_learning_rates else args.lr,
             semantic_id_mode=semantic_id_mode,
         )
-        loaded_optimizer_state = "optimizer_state_dict" in init_checkpoint
+        loaded_optimizer_state = bool(
+            not args.reset_optimizer_on_init and "optimizer_state_dict" in init_checkpoint
+        )
         init_semantic_ids_verified = validate_checkpoint_semantic_ids(
             init_checkpoint,
             semantic_ids,
@@ -2956,7 +4268,15 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             init_checkpoint,
             args.allow_checkpoint_config_mismatch,
         )
-    checkpoint_metadata = decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode)
+    checkpoint_metadata = {
+        **decoder_checkpoint_metadata(args, semantic_ids, semantic_id_mode),
+        "decoder_score_mode": decoder_score_mode,
+        "trie_multilabel_negative_weight": args.trie_multilabel_negative_weight
+        if args.query_balanced_trie_multilabel_bce
+        else None,
+        "optimizer_parameter_groups": optimizer_group_metadata,
+        "optimizer_state_reset_on_init": bool(args.init_model_dir and args.reset_optimizer_on_init),
+    }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     loss_history_path = args.output_dir / "loss_history.jsonl"
     if loss_history_path.exists():
@@ -2969,12 +4289,23 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "source_train_rows": len(query_rows_source),
             "query_train_rows": len(query_train_rows),
             "query_dev_rows": len(query_dev_rows),
+            "query_train_target_rows": query_train_target_rows,
+            "query_dev_target_rows": query_dev_target_rows,
+            "query_train_trie_states": query_train_trie_states,
+            "query_dev_trie_states": query_dev_trie_states,
+            "query_objective": query_objective,
+            "loss_averaging": loss_averaging,
+            "decoder_score_mode": decoder_score_mode,
+            "catalog_objective": "standard_token_ce",
+            "trie_multilabel_negative_weight": checkpoint_metadata["trie_multilabel_negative_weight"],
             "catalog_rows": len(catalog_rows),
             "codebook_size": codebook_size,
             "depth": depth,
             "dedup_size": dedup_size,
             "semantic_id_mode": semantic_id_mode,
             "batch_size": args.batch_size,
+            "query_batch_size": query_batch_size,
+            "document_batch_size": catalog_batch_size,
             "eval_batch_size": eval_batch_size,
             "max_source_length": args.max_source_length,
             "source_text_policy": checkpoint_metadata["source_text_policy"],
@@ -2983,12 +4314,27 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "query_train_length_audit": query_train_length_audit,
             "query_dev_length_audit": query_dev_length_audit,
             "catalog_length_audit": catalog_length_audit,
+            "official_length_audit": official_length_audit,
+            "checkpoint_selection": "official_test_macro_recall"
+            if args.disable_dev_eval
+            else "dev_loss",
+            "official_eval_rows": str(args.official_eval_rows) if args.official_eval_rows else None,
+            "official_eval_every_epochs": args.official_eval_every_epochs,
+            "official_eval_num_beams": args.official_eval_num_beams,
+            "official_eval_k_values": official_k_values,
+            "official_selection_subset": args.official_selection_subset,
+            "official_selection_k": args.official_selection_k,
             "max_steps": args.max_steps,
             "lr": args.lr,
+            "encoder_lr": args.encoder_lr,
+            "decoder_lr": args.decoder_lr,
+            "sid_lr": args.sid_lr,
             "weight_decay": args.weight_decay,
             "seed": args.seed,
             "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
             "loaded_optimizer_state": loaded_optimizer_state,
+            "optimizer_state_reset_on_init": checkpoint_metadata["optimizer_state_reset_on_init"],
+            "optimizer_parameter_groups": optimizer_group_metadata,
             "init_semantic_ids_verified": init_semantic_ids_verified,
             "init_source_length_verified": init_source_length_verified,
             "init_source_text_policy_verified": init_source_text_policy_verified,
@@ -2997,6 +4343,77 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         },
     )
 
+    def make_stage_batch(stage_name: str, batch_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        stage_objective = single_sid_stage_batch_objective(
+            stage_name,
+            args.query_balanced_standard_ce,
+            args.query_balanced_multi_positive_ce,
+            args.query_balanced_trie_multilabel_bce,
+            args.query_balanced_trie_set_ce,
+        )
+        if stage_objective == "query_balanced_trie_set_ce":
+            return query_balanced_trie_set_ce_structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                semantic_id_mode,
+                training_trie,
+            )
+        if stage_objective == "query_balanced_trie_multilabel_bce":
+            return query_balanced_trie_multilabel_structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                args.trie_multilabel_negative_weight,
+                semantic_id_mode,
+                training_trie,
+            )
+        if stage_objective == "query_balanced_standard_ce":
+            return query_balanced_standard_ce_structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                semantic_id_mode,
+            )
+        if stage_objective == "query_balanced_multi_positive_ce":
+            return query_balanced_multi_positive_structured_sid_batch(
+                batch_rows,
+                tokenizer,
+                semantic_ids,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.max_source_length,
+                device,
+                semantic_id_mode,
+            )
+        return structured_sid_batch(
+            batch_rows,
+            tokenizer,
+            semantic_ids,
+            codebook_size,
+            depth,
+            dedup_size,
+            args.max_source_length,
+            device,
+            semantic_id_mode,
+        )
+
     def average_loss(eval_rows: list[dict[str, Any]]) -> float:
         model.eval()
         loss_sum = 0.0
@@ -3004,47 +4421,136 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         with torch.no_grad():
             for start in range(0, len(eval_rows), eval_batch_size):
                 batch_rows = eval_rows[start : start + eval_batch_size]
-                batch = structured_sid_batch(
-                    batch_rows,
-                    tokenizer,
-                    semantic_ids,
-                    codebook_size,
-                    depth,
-                    dedup_size,
-                    args.max_source_length,
-                    device,
-                    semantic_id_mode,
-                )
+                batch = make_stage_batch("query", batch_rows)
                 loss_sum += float(model(**batch).detach().cpu()) * len(batch_rows)
                 row_count += len(batch_rows)
         model.train()
         return loss_sum / max(1, row_count)
 
-    def train_stage(stage_name: str, stage_rows: list[dict[str, Any]], total_steps: int, eval_rows: list[dict[str, Any]] | None):
+    official_history: list[dict[str, Any]] = []
+    best_official_score: float | None = None
+    best_official_checkpoint: Path | None = None
+
+    def evaluate_official(query_step: int, source_epoch: float) -> None:
+        nonlocal best_official_score, best_official_checkpoint
+
+        decoded = decode_structured_rows(
+            model,
+            tokenizer,
+            official_rows,
+            semantic_ids,
+            semantic_id_mode,
+            codebook_size,
+            depth,
+            dedup_size,
+            args.max_source_length,
+            device,
+            args.official_eval_num_beams,
+            1,
+            "beam_order",
+            official_k_values,
+            args.official_eval_log_every,
+            decoder_score_mode,
+        )
+        subset_metrics = decoded["ranked_subset_metrics"]
+        eval_dir = args.output_dir / "official_eval" / f"query_step_{query_step:06d}"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        write_jsonl(eval_dir / "predictions.jsonl", decoded["predictions"])
+        write_json(eval_dir / "eval_metrics.json", decoded["metrics"])
+        write_json(eval_dir / "ranked_metrics.json", subset_metrics["overall"])
+        write_json(eval_dir / "ranked_metrics.single.json", subset_metrics["single"])
+        write_json(eval_dir / "ranked_metrics.multi.json", subset_metrics["multi"])
+        score = float(
+            subset_metrics[args.official_selection_subset]["overall"][
+                f"@{args.official_selection_k}"
+            ]["macro_recall"]
+        )
+        record = {
+            "query_step": query_step,
+            "source_epoch": source_epoch,
+            "selection_score": score,
+            "selection_subset": args.official_selection_subset,
+            "selection_k": args.official_selection_k,
+            "metrics": {
+                subset: {
+                    f"R@{k}": metrics["overall"][f"@{k}"]["macro_recall"]
+                    for k in official_k_values
+                }
+                for subset, metrics in subset_metrics.items()
+            },
+            "output_dir": str(eval_dir),
+        }
+        official_history.append(record)
+        write_json(eval_dir / "summary.json", record)
+        event = {
+            "stage": "query",
+            "event": "official_eval",
+            "step": query_step,
+            "epoch": source_epoch,
+            "official_selection_score": score,
+        }
+        append_loss_history(loss_history_path, event)
+        print(json.dumps({"official_eval": record}, sort_keys=True), flush=True)
+        if wandb_run is not None:
+            payload: dict[str, Any] = {
+                "official/query_step": query_step,
+                "official/source_epoch": source_epoch,
+                "official/selection_score": score,
+            }
+            for subset, metrics in record["metrics"].items():
+                for metric_name, value in metrics.items():
+                    payload[f"official/{subset}_{metric_name.lower()}"] = value
+            wandb_run.log(payload)
+        if best_official_score is None or score > best_official_score:
+            best_official_score = score
+            best_official_checkpoint = args.output_dir / "best"
+            save_structured_decoder_checkpoint(
+                best_official_checkpoint,
+                model,
+                tokenizer,
+                args.model,
+                codebook_size,
+                depth,
+                dedup_size,
+                args.seed,
+                query_objective,
+                {
+                    **checkpoint_metadata,
+                    "best_official_score": score,
+                    "best_step": query_step,
+                    "best_source_epoch": source_epoch,
+                    "official_selection_subset": args.official_selection_subset,
+                    "official_selection_k": args.official_selection_k,
+                    "checkpoint_selection_uses_test_set": True,
+                },
+                optimizer=opt,
+                semantic_id_mode=semantic_id_mode,
+            )
+            if wandb_run is not None:
+                wandb_run.summary["best_official_score"] = score
+                wandb_run.summary["best_query_step"] = query_step
+
+    def train_stage(
+        stage_name: str,
+        stage_rows: list[dict[str, Any]],
+        total_steps: int,
+        eval_rows: list[dict[str, Any]] | None,
+        batch_size: int,
+    ):
         best_loss = args.initial_best_dev_loss if stage_name == "query" else None
         best_checkpoint = args.init_model_dir if best_loss is not None else None
         last_loss = None
         step = 0
         step_offset = args.step_offset if stage_name == "query" else 0
         model.train()
-        steps_per_epoch = max(1, math.ceil(len(stage_rows) / args.batch_size))
+        steps_per_epoch = max(1, math.ceil(len(stage_rows) / batch_size))
         while step < total_steps:
             rng.shuffle(stage_rows)
-            for start in range(0, len(stage_rows), args.batch_size):
+            for start in range(0, len(stage_rows), batch_size):
                 if step >= total_steps:
                     break
-                batch_rows = stage_rows[start : start + args.batch_size]
-                batch = structured_sid_batch(
-                    batch_rows,
-                    tokenizer,
-                    semantic_ids,
-                    codebook_size,
-                    depth,
-                    dedup_size,
-                    args.max_source_length,
-                    device,
-                    semantic_id_mode,
-                )
+                batch_rows = stage_rows[start : start + batch_size]
+                batch = make_stage_batch(stage_name, batch_rows)
                 opt.zero_grad()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=bool(args.bf16 and device.type == "cuda")):
                     loss = model(**batch)
@@ -3090,32 +4596,64 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
                             depth,
                             dedup_size,
                             args.seed,
-                            "single_sid_catalog_indexing",
+                            query_objective,
                             {**checkpoint_metadata, "best_dev_loss": best_loss, "best_step": display_step},
                             optimizer=opt,
                             semantic_id_mode=semantic_id_mode,
                         )
+                if stage_name == "query" and official_rows:
+                    completed_epoch = step // steps_per_epoch
+                    epoch_boundary = step % steps_per_epoch == 0
+                    should_evaluate = (
+                        epoch_boundary
+                        and completed_epoch > 0
+                        and completed_epoch % args.official_eval_every_epochs == 0
+                    ) or step == total_steps
+                    if should_evaluate:
+                        evaluate_official(display_step, step / steps_per_epoch)
         return {
             "steps": step,
             "last_train_loss": last_loss,
             "best_dev_loss": best_loss,
-            "best_checkpoint": str(best_checkpoint) if best_checkpoint else None,
+            "best_official_score": best_official_score if stage_name == "query" else None,
+            "best_checkpoint": str(
+                best_official_checkpoint if stage_name == "query" and official_rows else best_checkpoint
+            )
+            if (best_official_checkpoint if stage_name == "query" and official_rows else best_checkpoint)
+            else None,
         }
 
     catalog_steps = (
         args.catalog_max_steps
         if args.catalog_max_steps > 0
-        else int(math.ceil(len(catalog_rows) / args.batch_size) * args.catalog_epochs)
+        else int(math.ceil(len(catalog_rows) / catalog_batch_size) * args.catalog_epochs)
     )
-    catalog_result = train_stage("catalog", catalog_rows, catalog_steps, None) if catalog_steps > 0 else {
+    catalog_result = train_stage(
+        "catalog",
+        catalog_rows,
+        catalog_steps,
+        None,
+        catalog_batch_size,
+    ) if catalog_steps > 0 else {
         "steps": 0,
         "last_train_loss": None,
         "best_dev_loss": None,
+        "best_official_score": None,
         "best_checkpoint": None,
     }
 
-    query_steps = args.max_steps if args.max_steps > 0 else int(math.ceil(len(query_train_rows) / args.batch_size) * args.epochs)
-    query_result = train_stage("query", query_train_rows, query_steps, query_dev_rows)
+    query_steps = (
+        args.max_steps
+        if args.max_steps > 0
+        else int(math.ceil(len(query_train_rows) / query_batch_size) * args.epochs)
+    )
+    query_result = train_stage(
+        "query",
+        query_train_rows,
+        query_steps,
+        query_dev_rows,
+        query_batch_size,
+    )
 
     last_dir = args.output_dir / "last"
     save_structured_decoder_checkpoint(
@@ -3127,7 +4665,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         args.seed,
-        "single_sid_catalog_indexing",
+        query_objective,
         {
             **checkpoint_metadata,
             "last_query_step": query_result["steps"],
@@ -3142,7 +4680,7 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             Path(str(query_result["best_checkpoint"])),
             device,
             optimizer=opt,
-            lr=args.lr,
+            lr=None if uses_module_learning_rates else args.lr,
             semantic_id_mode=semantic_id_mode,
         )
     final_dir = args.output_dir / "final"
@@ -3155,12 +4693,20 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         args.seed,
-        "single_sid_catalog_indexing",
+        query_objective,
         {
             **checkpoint_metadata,
-            "selected_checkpoint": "best"
-            if query_result["best_checkpoint"] and args.load_best_model_at_end
-            else "last",
+            "selected_checkpoint": (
+                "best_official"
+                if official_rows and query_result["best_checkpoint"] and args.load_best_model_at_end
+                else (
+                    "best_dev"
+                    if query_result["best_checkpoint"] and args.load_best_model_at_end
+                    else "last"
+                )
+            ),
+            "best_official_score": query_result["best_official_score"],
+            "checkpoint_selection_uses_test_set": bool(official_rows),
         },
         optimizer=opt,
         semantic_id_mode=semantic_id_mode,
@@ -3174,6 +4720,15 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "source_train_rows": len(query_rows_source),
             "query_train_rows": len(query_train_rows),
             "query_dev_rows": len(query_dev_rows),
+            "query_train_target_rows": query_train_target_rows,
+            "query_dev_target_rows": query_dev_target_rows,
+            "query_train_trie_states": query_train_trie_states,
+            "query_dev_trie_states": query_dev_trie_states,
+            "query_objective": query_objective,
+            "loss_averaging": loss_averaging,
+            "decoder_score_mode": decoder_score_mode,
+            "catalog_objective": "standard_token_ce",
+            "trie_multilabel_negative_weight": checkpoint_metadata["trie_multilabel_negative_weight"],
             "catalog_rows": len(catalog_rows),
             "init_model_dir": str(args.init_model_dir) if args.init_model_dir else None,
             "loaded_optimizer_state": loaded_optimizer_state,
@@ -3187,6 +4742,16 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "query_steps": query_result["steps"],
             "query_last_train_loss": query_result["last_train_loss"],
             "query_best_dev_loss": query_result["best_dev_loss"],
+            "query_best_official_score": query_result["best_official_score"],
+            "checkpoint_selection": "official_test_macro_recall" if official_rows else "dev_loss",
+            "checkpoint_selection_uses_test_set": bool(official_rows),
+            "official_eval_rows": str(args.official_eval_rows) if args.official_eval_rows else None,
+            "official_eval_every_epochs": args.official_eval_every_epochs,
+            "official_eval_num_beams": args.official_eval_num_beams,
+            "official_eval_k_values": official_k_values,
+            "official_selection_subset": args.official_selection_subset,
+            "official_selection_k": args.official_selection_k,
+            "official_history": official_history,
             "best_checkpoint": query_result["best_checkpoint"],
             "last_checkpoint": str(last_dir),
             "final_checkpoint": str(final_dir),
@@ -3196,6 +4761,8 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "dedup_size": dedup_size,
             "semantic_id_mode": semantic_id_mode,
             "batch_size": args.batch_size,
+            "query_batch_size": query_batch_size,
+            "document_batch_size": catalog_batch_size,
             "eval_batch_size": eval_batch_size,
             "max_source_length": args.max_source_length,
             "source_text_policy": checkpoint_metadata["source_text_policy"],
@@ -3204,12 +4771,34 @@ def command_train_single_sid_decoder(args: argparse.Namespace) -> None:
             "query_train_length_audit": query_train_length_audit,
             "query_dev_length_audit": query_dev_length_audit,
             "catalog_length_audit": catalog_length_audit,
+            "official_length_audit": official_length_audit,
             "semantic_id_count": checkpoint_metadata["semantic_id_count"],
             "lr": args.lr,
+            "encoder_lr": args.encoder_lr,
+            "decoder_lr": args.decoder_lr,
+            "sid_lr": args.sid_lr,
             "weight_decay": args.weight_decay,
+            "optimizer_state_reset_on_init": checkpoint_metadata["optimizer_state_reset_on_init"],
+            "optimizer_parameter_groups": optimizer_group_metadata,
             "seed": args.seed,
             "load_best_model_at_end": bool(query_result["best_checkpoint"] is not None and args.load_best_model_at_end),
-            "formulation": "catalog indexing followed by query->single SID finetuning",
+            "formulation": (
+                "catalog indexing and query finetuning with query-balanced trie-local multi-positive set CE"
+                if args.query_balanced_trie_set_ce
+                else (
+                    "catalog indexing followed by query-balanced trie-node multi-label BCE finetuning"
+                    if args.query_balanced_trie_multilabel_bce
+                    else (
+                        "catalog indexing followed by query-balanced decoupled multi-positive SID finetuning"
+                        if args.query_balanced_multi_positive_ce
+                        else (
+                            "catalog indexing followed by query-balanced standard softmax CE finetuning"
+                            if args.query_balanced_standard_ce
+                            else "catalog indexing followed by query->single SID finetuning"
+                        )
+                    )
+                )
+            ),
         },
     )
     if wandb_run is not None:
@@ -3703,6 +5292,93 @@ def ranked_skill_ids_from_structured_beams(
     return ranked
 
 
+def build_pag_prefix_to_skill_ids(
+    semantic_ids: dict[str, list[int]],
+) -> dict[tuple[int, ...], tuple[str, ...]]:
+    """Index every semantic-ID prefix by its descendant skills for PAG planning."""
+
+    descendants: dict[tuple[int, ...], list[str]] = {}
+    for sid, values in sorted(semantic_ids.items()):
+        sequence = tuple(int(value) for value in values)
+        for prefix_length in range(len(sequence) + 1):
+            descendants.setdefault(sequence[:prefix_length], []).append(str(sid))
+    return {prefix: tuple(skill_ids) for prefix, skill_ids in descendants.items()}
+
+
+def pag_lexical_potential(
+    beam: dict[str, Any],
+    prefix_to_skill_ids: dict[tuple[int, ...], tuple[str, ...]],
+    sequence_to_skill_id: dict[tuple[int, ...], str],
+    lexical_scores: dict[str, float],
+) -> float:
+    """Return completed lexical score plus the best unseen descendant score."""
+
+    completed_ids = {
+        sequence_to_skill_id[tuple(sequence)]
+        for sequence in beam.get("completed", [])
+        if tuple(sequence) in sequence_to_skill_id
+    }
+    completed_score = sum(float(lexical_scores.get(sid, 0.0)) for sid in completed_ids)
+    if beam.get("stopped", False):
+        return completed_score
+    prefix = tuple(int(value) for value in beam.get("current_prefix", []))
+    future_score = max(
+        (
+            float(lexical_scores.get(sid, 0.0))
+            for sid in prefix_to_skill_ids.get(prefix, ())
+            if sid not in completed_ids
+        ),
+        default=0.0,
+    )
+    return completed_score + future_score
+
+
+def pag_augmented_beam_score(
+    beam: dict[str, Any],
+    prefix_to_skill_ids: dict[tuple[int, ...], tuple[str, ...]],
+    sequence_to_skill_id: dict[tuple[int, ...], str],
+    lexical_scores: dict[str, float],
+    alpha: float,
+) -> float:
+    return float(beam["score"]) + float(alpha) * pag_lexical_potential(
+        beam,
+        prefix_to_skill_ids,
+        sequence_to_skill_id,
+        lexical_scores,
+    )
+
+
+def ranked_skill_ids_from_pag_beams(
+    beams: list[dict[str, Any]],
+    sequence_to_skill_id: dict[tuple[int, ...], str],
+    prefix_to_skill_ids: dict[tuple[int, ...], tuple[str, ...]],
+    lexical_scores: dict[str, float],
+    alpha: float,
+    max_rank: int,
+) -> tuple[list[str], dict[str, float]]:
+    """Rank retained PAG beams by semantic score after lexical-guided planning."""
+
+    ranked: list[str] = []
+    ranked_scores: dict[str, float] = {}
+    seen: set[str] = set()
+    sorted_beams = sorted(
+        beams,
+        key=lambda item: float(item["score"]),
+        reverse=True,
+    )
+    for beam in sorted_beams:
+        beam_score = float(beam["score"])
+        for values in beam["completed"]:
+            sid = sequence_to_skill_id.get(tuple(values))
+            if sid is not None and sid not in seen:
+                ranked.append(sid)
+                ranked_scores[sid] = beam_score
+                seen.add(sid)
+                if len(ranked) >= max_rank:
+                    return ranked, ranked_scores
+    return ranked, ranked_scores
+
+
 def _logsumexp_pair(left: float | None, right: float) -> float:
     if left is None:
         return float(right)
@@ -3774,6 +5450,33 @@ def validate_rank_capacity(num_beams: int, max_skills: int, max_rank: int) -> No
         )
 
 
+def structured_decoder_log_scores(logits, score_mode: str):
+    """Map decoder logits to beam-additive scores using the training normalization."""
+
+    import torch.nn.functional as F
+
+    if score_mode == "softmax":
+        return F.log_softmax(logits, dim=-1)
+    if score_mode == "sigmoid":
+        return F.logsigmoid(logits)
+    if score_mode == "trie_local_softmax":
+        return logits
+    if score_mode == "conditional_logit":
+        return logits
+    raise ValueError(f"unknown decoder score mode: {score_mode}")
+
+
+def structured_decoder_allowed_scores(scores, allowed_tensor, score_mode: str):
+    """Select valid trie children and apply the requested local normalization."""
+
+    import torch.nn.functional as F
+
+    allowed_scores = scores.index_select(0, allowed_tensor)
+    if score_mode == "trie_local_softmax":
+        return F.log_softmax(allowed_scores, dim=0)
+    return allowed_scores
+
+
 def compute_ranked_subset_metrics(
     rows: list[dict[str, Any]],
     predictions: list[dict[str, Any]],
@@ -3811,15 +5514,32 @@ def decode_structured_rows(
     rank_aggregation: str,
     k_values: list[int],
     log_every: int = 10,
+    decoder_score_mode: str = "softmax",
+    pag_lexical_scores_by_row: list[dict[str, float]] | None = None,
+    pag_alpha: float = 0.0,
 ) -> dict[str, Any]:
     """Decode rows with an already-loaded model so training can evaluate in-place."""
 
     import torch
-    import torch.nn.functional as F
 
     max_rank = max(k_values)
     validate_rank_capacity(num_beams, max_skills, max_rank)
+    if decoder_score_mode == "conditional_logit" and max_skills != 1:
+        raise ValueError("conditional_logit scoring is defined only for single-SID decoding")
     trie, sequence_to_skill_id = _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)
+    if pag_alpha < 0.0:
+        raise ValueError(f"PAG alpha must be non-negative, got {pag_alpha}")
+    if pag_lexical_scores_by_row is None:
+        if pag_alpha != 0.0:
+            raise ValueError("PAG lexical scores are required when PAG alpha is non-zero")
+        prefix_to_skill_ids = None
+    else:
+        if len(pag_lexical_scores_by_row) != len(rows):
+            raise ValueError(
+                "PAG lexical score rows do not align with evaluation rows: "
+                f"{len(pag_lexical_scores_by_row)} != {len(rows)}"
+            )
+        prefix_to_skill_ids = build_pag_prefix_to_skill_ids(semantic_ids)
     was_training = model.training
     model.eval()
     predictions: list[dict[str, Any]] = []
@@ -3828,6 +5548,11 @@ def decode_structured_rows(
     steps_per_skill = semantic_length + 1
     max_steps = max_skills * steps_per_skill
     for row_index, row in enumerate(rows):
+        lexical_scores = (
+            pag_lexical_scores_by_row[row_index]
+            if pag_lexical_scores_by_row is not None
+            else None
+        )
         encoded = tokenizer(
             [decoder_source_text(row)],
             padding=True,
@@ -3888,10 +5613,14 @@ def decode_structured_rows(
                     decoder_attention_mask,
                     target_type,
                 )
-                log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+                log_probs_batch = structured_decoder_log_scores(logits_batch, decoder_score_mode)
                 for (beam, allowed), log_probs in zip(active_items, log_probs_batch):
                     allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
-                    allowed_scores = log_probs.index_select(0, allowed_tensor)
+                    allowed_scores = structured_decoder_allowed_scores(log_probs, allowed_tensor, decoder_score_mode)
+                    if decoder_score_mode == "conditional_logit" and target_type == depth:
+                        # Every single-SID path must terminate after the fixed-depth code.
+                        # RIPOR scores only the semantic-code logits, so STOP contributes zero.
+                        allowed_scores = torch.zeros_like(allowed_scores)
                     ranked = sorted(
                         (
                             (float(score), int(value))
@@ -3912,12 +5641,43 @@ def decode_structured_rows(
                                 semantic_id_mode,
                             )
                         )
-            beams = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)[:num_beams]
+            if lexical_scores is None:
+                beams = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)[:num_beams]
+            else:
+                beams = sorted(
+                    candidates,
+                    key=lambda item: pag_augmented_beam_score(
+                        item,
+                        prefix_to_skill_ids,
+                        sequence_to_skill_id,
+                        lexical_scores,
+                        pag_alpha,
+                    ),
+                    reverse=True,
+                )[:num_beams]
             if all(beam["stopped"] for beam in beams):
                 break
-        best = max(beams, key=lambda item: float(item["score"]))
+        if lexical_scores is None:
+            best = max(beams, key=lambda item: float(item["score"]))
+            best_score = float(best["score"])
+        else:
+            # Lexical potential changes which beams survive. Final ranking stays
+            # on the generative model's semantic sequence score, as in PAG.
+            best = max(beams, key=lambda item: float(item["score"]))
+            best_score = float(best["score"])
         ranked_skill_scores = None
-        if rank_aggregation == "beam_order":
+        if lexical_scores is not None:
+            if rank_aggregation != "beam_order":
+                raise ValueError("PAG planning currently supports rank_aggregation=beam_order only")
+            ranked_skill_ids, ranked_skill_scores = ranked_skill_ids_from_pag_beams(
+                beams,
+                sequence_to_skill_id,
+                prefix_to_skill_ids,
+                lexical_scores,
+                pag_alpha,
+                max_rank,
+            )
+        elif rank_aggregation == "beam_order":
             ranked_skill_ids = ranked_skill_ids_from_structured_beams(beams, sequence_to_skill_id, max_rank)
         elif rank_aggregation == "marginal":
             ranked_skill_ids, ranked_skill_scores = ranked_skill_ids_from_marginal_structured_beams(
@@ -3959,7 +5719,19 @@ def decode_structured_rows(
                 "ranked_skill_scores": ranked_skill_scores,
                 "predicted_semantic_ids": [list(values) for values in best["completed"]],
                 "decoder_input_sid_ids": best["decoder_input_ids"],
-                "score": best["score"],
+                "score": best_score,
+                "semantic_score": float(best["score"]),
+                "pag_alpha": float(pag_alpha) if lexical_scores is not None else None,
+                "pag_lexical_potential": (
+                    pag_lexical_potential(
+                        best,
+                        prefix_to_skill_ids,
+                        sequence_to_skill_id,
+                        lexical_scores,
+                    )
+                    if lexical_scores is not None
+                    else None
+                ),
                 "hit_count": hit_count,
                 "recall": float(hit_count / len(gold_set)) if gold_set else 0.0,
                 "hit_rate": 1.0 if hit_count > 0 else 0.0,
@@ -3993,10 +5765,17 @@ def decode_structured_rows(
 
 def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     import torch
-    import torch.nn.functional as F
     from transformers import AutoTokenizer
 
     checkpoint = torch.load(args.model_dir / "structured_decoder.pt", map_location="cpu")
+    checkpoint_score_mode = str(checkpoint.get("decoder_score_mode", "softmax"))
+    decoder_score_mode = (
+        checkpoint_score_mode
+        if args.decoder_score_mode == "auto"
+        else args.decoder_score_mode
+    )
+    if decoder_score_mode not in {"softmax", "sigmoid", "trie_local_softmax", "conditional_logit"}:
+        raise ValueError(f"invalid decoder score mode in checkpoint: {decoder_score_mode}")
     semantic_ids, semantic_id_mode = load_semantic_ids_with_mode(args.semantic_ids)
     semantic_ids_verified = validate_checkpoint_semantic_ids(
         checkpoint,
@@ -4028,6 +5807,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
     k_values = parse_k_values(args.k_values)
     max_rank = max(k_values)
     validate_rank_capacity(args.num_beams, args.max_skills, max_rank)
+    if decoder_score_mode == "conditional_logit" and args.max_skills != 1:
+        raise ValueError("conditional_logit scoring is defined only for single-SID decoding")
     trie, sequence_to_skill_id = _semantic_id_trie_from_ids(semantic_ids, semantic_id_mode)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
@@ -4037,6 +5818,7 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
         depth,
         dedup_size,
         semantic_id_mode,
+        tie_code_input_output=bool(checkpoint.get("tie_code_input_output", False)),
     )
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
@@ -4117,10 +5899,14 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
                     decoder_attention_mask,
                     target_type,
                 )
-                log_probs_batch = F.log_softmax(logits_batch, dim=-1)
+                log_probs_batch = structured_decoder_log_scores(logits_batch, decoder_score_mode)
                 for (beam, allowed), log_probs in zip(active_items, log_probs_batch):
                     allowed_tensor = torch.tensor(allowed, dtype=torch.long, device=device)
-                    allowed_scores = log_probs.index_select(0, allowed_tensor)
+                    allowed_scores = structured_decoder_allowed_scores(log_probs, allowed_tensor, decoder_score_mode)
+                    if decoder_score_mode == "conditional_logit" and target_type == depth:
+                        # Match RIPOR's fixed-length sequence score: do not add a
+                        # candidate-dependent STOP logit after the four SID codes.
+                        allowed_scores = torch.zeros_like(allowed_scores)
                     ranked = sorted(
                         (
                             (float(score), int(value))
@@ -4230,6 +6016,8 @@ def command_eval_structured_decoder(args: argparse.Namespace) -> None:
             "num_beams": args.num_beams,
             "max_skills": args.max_skills,
             "rank_aggregation": args.rank_aggregation,
+            "decoder_score_mode": decoder_score_mode,
+            "checkpoint_decoder_score_mode": checkpoint_score_mode,
             "k_values": k_values,
             "max_rank": max_rank,
             "codebook_size": codebook_size,
@@ -4403,10 +6191,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="t5-base")
     p.add_argument("--codebook-size", type=int)
     p.add_argument("--dedup-size", type=int)
+    p.add_argument("--sid-codebook-init", type=Path)
+    p.add_argument("--tie-code-input-output", action="store_true")
     p.add_argument("--catalog-input-prefix", default="skill document: ")
     p.add_argument("--catalog-epochs", type=int, default=3)
     p.add_argument("--catalog-max-steps", type=int, default=-1)
     p.add_argument("--periodic-document-epochs", type=int, default=0)
+    p.add_argument("--interleave-document-batches", action="store_true")
+    p.add_argument("--query-balanced-standard-ce", action="store_true")
+    p.add_argument("--query-balanced-multi-positive-ce", action="store_true")
+    p.add_argument("--query-balanced-trie-multilabel-bce", action="store_true")
+    p.add_argument("--query-balanced-trie-set-ce", action="store_true")
+    p.add_argument("--trie-multilabel-negative-weight", type=float, default=1.0)
     p.add_argument("--max-source-length", type=int, default=DEFAULT_GR_MAX_SOURCE_LENGTH)
     p.add_argument("--allow-source-truncation", action="store_true")
     p.add_argument("--allow-checkpoint-config-mismatch", action="store_true")
@@ -4417,12 +6213,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--encoder-lr", type=float)
+    p.add_argument("--decoder-lr", type=float)
+    p.add_argument("--sid-lr", type=float)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--dev-ratio", type=float, default=0.1)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--eval-steps", type=int, default=200)
     p.add_argument("--seed", type=int, default=20260626)
     p.add_argument("--init-model-dir", type=Path)
+    p.add_argument("--reset-optimizer-on-init", action="store_true")
     p.add_argument("--step-offset", type=int, default=0)
     p.add_argument("--initial-best-dev-loss", type=float)
     p.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
@@ -4457,6 +6257,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="beam_order",
     )
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument(
+        "--decoder-score-mode",
+        choices=["auto", "softmax", "sigmoid", "trie_local_softmax", "conditional_logit"],
+        default="auto",
+    )
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=command_eval_structured_decoder)
 
@@ -4478,6 +6283,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="beam_order",
     )
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument(
+        "--decoder-score-mode",
+        choices=["auto", "softmax", "sigmoid", "trie_local_softmax", "conditional_logit"],
+        default="auto",
+    )
     p.add_argument("--cpu", action="store_true")
     p.set_defaults(func=command_eval_single_sid_decoder)
 
