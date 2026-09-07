@@ -2,6 +2,7 @@
 # CUDA/torch base runtime.  Do not add torch or transformers here.
 scipy
 scikit-learn
+faiss-cpu==1.13.2
 k-means-constrained
 vector-quantize-pytorch
 tqdm
