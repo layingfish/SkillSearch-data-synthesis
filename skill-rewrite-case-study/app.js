@@ -31,10 +31,10 @@ function diffPrompt(prompt, base) {
 }
 
 const NOTES = {
-  "GR": "提示词模板与 DR 完全相同，只是候选来自 GR 的 top-10。",
-  "DR": "提示词模板与 GR 完全相同，只是候选来自 DR 的 top-10。",
-  "GR+SID_RAW": "候选与 GR 条件相同；每个候选后多一行 semantic_id（64 位 OPQ 码），候选列表后多一段 ID 含义说明（黄色为相对 GR 提示词新增的行）。",
-  "GR+SID_GROUPS": "候选与 GR 条件相同；候选列表后多一段候选之间共享码位数的统计（黄色为相对 GR 提示词新增的行）。",
+  "GR": "提示词模板与 SkillRouter 条件完全相同，只是候选来自 SkillGR 的 top-10。",
+  "DR": "提示词模板与 SkillGR 条件完全相同，只是候选来自 SkillRouter 的 top-10。",
+  "GR+SID_RAW": "候选与 SkillGR 条件相同；每个候选后多一行 semantic_id（64 位 OPQ 码），候选列表后多一段 ID 含义说明（黄色为相对 SkillGR 提示词新增的行）。",
+  "GR+SID_GROUPS": "候选与 SkillGR 条件相同；候选列表后多一段候选之间共享码位数的统计（黄色为相对 SkillGR 提示词新增的行）。",
 };
 
 function rewritePanel(r, basePrompt) {
@@ -43,7 +43,7 @@ function rewritePanel(r, basePrompt) {
       <b>改写模型</b><span>deepseek-v4-flash（thinking 关闭）</span>
       <b>temperature</b><span>0.3</span>
       <b>max_tokens</b><span>3000</span>
-      <b>候选来源</b><span>${r.variant === "DR" ? "DR top-10" : "GR top-10"}</span>
+      <b>候选来源</b><span>${r.variant === "DR" ? "SkillRouter top-10" : "SkillGR top-10"}</span>
     </div>
     <div class="note">${NOTES[r.variant]}</div>
     <details class="pr"><summary>改写模型接收的提示词（system + user，${(r.system.length + r.prompt.length).toLocaleString()} 字符）</summary>
@@ -64,7 +64,7 @@ async function showCase(c) {
     <section><h2>${esc(d.key.split(":")[1])} <span class="meta">${esc(d.bench)}</span></h2>
       <details${d.task.length < 1500 ? " open" : ""}><summary>任务描述（${d.task.length.toLocaleString()} 字符）</summary><pre>${esc(d.task)}</pre></details></section>
     <section><h2>检索结果 top-10</h2><div class="cols">
-      ${retrievalCol("gr", "GR（W3-B）", d.GR, d.DR)}${retrievalCol("dr", "DR（SkillRouter 复现）", d.DR, d.GR)}
+      ${retrievalCol("gr", "SkillGR", d.GR, d.DR)}${retrievalCol("dr", "SkillRouter", d.DR, d.GR)}
     </div></section>
     <section><h2>改写结果</h2>
       <div class="tabs">${d.rewrites.map((r, i) => `<button data-i="${i}">${esc(r.label)}</button>`).join("")}</div>

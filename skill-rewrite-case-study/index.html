@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Skill Rewrite Case Study: GR vs DR</title>
+<title>Skill Rewrite Case Study: SkillGR vs SkillRouter</title>
 <style>
 :root{--bg:#fafafa;--fg:#1f2328;--mut:#656d76;--line:#d0d7de;--card:#fff;--gr:#0969da;--dr:#8250df;--hl:#fff8c5;--code:#f6f8fa}
 *{box-sizing:border-box}
@@ -48,8 +48,8 @@ table.set th{background:var(--code)}
 </head>
 <body>
 <header>
-<h1>Skill Rewrite Case Study：生成式检索（GR）vs 稠密检索（DR）</h1>
-<p>每个 query 展示 GR 与 DR 的 top-10 检索结果，以及同一改写模型在 GR / DR / GR + semantic ID 三类输入下的改写结果和完整提示词。</p>
+<h1>Skill Rewrite Case Study：SkillGR vs SkillRouter</h1>
+<p>每个 query 展示 SkillGR 与 SkillRouter 的 top-10 检索结果，以及同一改写模型在 SkillGR / SkillRouter / SkillGR + semantic ID 三类输入下的改写结果和完整提示词。</p>
 <p id="sampleRule"></p>
 </header>
 <div class="wrap">
@@ -58,14 +58,9 @@ table.set th{background:var(--code)}
 <section id="setup">
 <h2>实验设置</h2>
 <table class="set">
-<tr><th>检索器</th><th>说明</th></tr>
-<tr><td style="color:var(--gr)"><b>GR</b>（W3-B）</td><td>Qwen3-Embedding-0.6B 编码器 + T5-base 解码器，2 步 latent reasoning；每个 skill 的 ID 是 64 位 OPQ 码（每位 256 个取值，80% 语义 embedding + 20% LightGCN 共现 embedding）。SkillsBench 用 92k 步检查点（在 Core75 上选点），SRA-Bench 用训练结束时的检查点。</td></tr>
-<tr><td style="color:var(--dr)"><b>DR</b>（SkillRouter 复现）</td><td>按 SkillRouter（arXiv 2603.22455）SR-Emb 训练配方，从 Qwen3-Embedding-0.6B 在同一份训练数据上训练的稠密检索器。SkillsBench 用 Core75 数据上的复现模型；SRA-Bench 用不截断 query 的重训模型。</td></tr>
-</table>
-<table class="set" style="margin-top:10px">
 <tr><th>改写模型</th><td>deepseek-v4-flash，thinking 关闭，temperature 0.3，max_tokens 3000，每个条件采样 1 次</td></tr>
 <tr><th>改写输入</th><td>任务描述 + top-10 候选（每个候选：name、description、body 前 1800 字符）+ 改写指令</td></tr>
-<tr><th>四种改写条件</th><td><b>GR</b>：GR top-10。<b>DR</b>：DR top-10。两者提示词模板完全相同，只是填入的候选不同。<br><b>GR + semantic ID（原始码）</b>：GR top-10，每个候选后附 64 位 OPQ 码，并加一段 ID 含义说明。<br><b>GR + semantic ID（共享码分组提示）</b>：GR top-10，在候选后附候选之间共享码位数的统计。<br>两种 SID 条件下，提示词中相对 GR 新增的行用 <span class="add" style="display:inline;padding:0 4px">黄色</span> 标出。</td></tr>
+<tr><th>四种改写条件</th><td><b>SkillGR</b>：SkillGR top-10。<b>SkillRouter</b>：SkillRouter top-10。两者提示词模板完全相同，只是填入的候选不同。<br><b>SkillGR + semantic ID（原始码）</b>：SkillGR top-10，每个候选后附 64 位 OPQ 码，并加一段 ID 含义说明。<br><b>SkillGR + semantic ID（共享码分组提示）</b>：SkillGR top-10，在候选后附候选之间共享码位数的统计。<br>两种 SID 条件下，提示词中相对 SkillGR 新增的行用 <span class="add" style="display:inline;padding:0 4px">黄色</span> 标出。</td></tr>
 </table>
 </section>
 <div id="case"></div>
