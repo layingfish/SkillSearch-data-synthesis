@@ -1,0 +1,113 @@
+{
+ "sample": {
+  "seed": 20261102,
+  "rule": "SkillsBench: 5 uniform from the 49 bash-exec tasks; SRA: 2 uniform per executed dataset"
+ },
+ "cases": [
+  {
+   "key": "sb:pddl-tpp-planning",
+   "slug": "sb_pddl-tpp-planning",
+   "bench": "SkillsBench",
+   "title": "pddl-tpp-planning",
+   "preview": "Solve travelling purchase problem (TPP) tasks using PDDL (Planning Domain Definition Language).\n\nEach task has two input files: a PDDL domain file and a PDDL pr"
+  },
+  {
+   "key": "sb:civ6-adjacency-optimizer",
+   "slug": "sb_civ6-adjacency-optimizer",
+   "bench": "SkillsBench",
+   "title": "civ6-adjacency-optimizer",
+   "preview": "# Sid Meier's Civilization 6 District Adjacency Bonus Optimizer\n\n## Task\n\nImagining you are acting as an optimizer for adjacency bonus in Sid Meier's Civilizati"
+  },
+  {
+   "key": "sb:jpg-ocr-stat",
+   "slug": "sb_jpg-ocr-stat",
+   "bench": "SkillsBench",
+   "title": "jpg-ocr-stat",
+   "preview": "## Task description\n\nIn `/app/workspace/dataset/img`, I provide a set of scanned receipt images. Each receipt image contains text such as date, product name, un"
+  },
+  {
+   "key": "sb:sec-financial-report",
+   "slug": "sb_sec-financial-report",
+   "bench": "SkillsBench",
+   "title": "sec-financial-report",
+   "preview": "You are a financial analyst in hedge fund, your task is to analyze the activities of hedge funds in q3 2025 by compare it with q2 2025. The dataset is downloade"
+  },
+  {
+   "key": "sb:seismic-phase-picking",
+   "slug": "sb_seismic-phase-picking",
+   "bench": "SkillsBench",
+   "title": "seismic-phase-picking",
+   "preview": "You have 100 earthquake traces at `/root/data/`. Each file represents a trace recorded at a station.\n\nYour task is seismic phase picking i.e. picking the arriva"
+  },
+  {
+   "key": "sra:theoremqa_00163",
+   "slug": "sra_theoremqa_00163",
+   "bench": "SRA-Bench / theoremqa",
+   "title": "theoremqa_00163",
+   "preview": "Suppose H is a Banach space, and {x_n}\\in H, x\\in H. Then x_n weakly converges to x is equivalent to: ||x_n|| is bounded; for a dense set M* in H*, it holds \\li"
+  },
+  {
+   "key": "sra:theoremqa_00124",
+   "slug": "sra_theoremqa_00124",
+   "bench": "SRA-Bench / theoremqa",
+   "title": "theoremqa_00124",
+   "preview": "Let M be the inverse of the group element ((3, 5), (4, 6)) in Z_7. What is M[0][1]?"
+  },
+  {
+   "key": "sra:logicbench_00424",
+   "slug": "sra_logicbench_00424",
+   "bench": "SRA-Bench / logicbench",
+   "title": "logicbench_00424",
+   "preview": "If Sam decides to embark on the daunting challenge of climbing a tall mountain, it is almost certain that he will find himself gasping for breath once he reache"
+  },
+  {
+   "key": "sra:logicbench_00045",
+   "slug": "sra_logicbench_00045",
+   "bench": "SRA-Bench / logicbench",
+   "title": "logicbench_00045",
+   "preview": "We are aware that either he is an exceptionally intelligent scientist or he is known for making revolutionary discoveries. It remains uncertain which one of the"
+  },
+  {
+   "key": "sra:medcalcbench_00415",
+   "slug": "sra_medcalcbench_00415",
+   "bench": "SRA-Bench / medcalcbench",
+   "title": "medcalcbench_00415",
+   "preview": "Patient Note:\nA 72-year-old Caucasian (white) man with a history of diffuse large B-cell lymphoma (DLBCL), immunoglobin M (IgM) monoclonal gammopathy of undeter"
+  },
+  {
+   "key": "sra:medcalcbench_00829",
+   "slug": "sra_medcalcbench_00829",
+   "bench": "SRA-Bench / medcalcbench",
+   "title": "medcalcbench_00829",
+   "preview": "Patient Note:\nA 58-year-old Caucasian female presented to her local emergency department with fever and diarrhea. The patient developed nonbloody, large-volume "
+  },
+  {
+   "key": "sra:champ_00154",
+   "slug": "sra_champ_00154",
+   "bench": "SRA-Bench / champ",
+   "title": "champ_00154",
+   "preview": "Find all integer solutions to the equation (n-2)^2+(n-1)^2+n^2+(n+1)^2+(n+2)^2=m^2."
+  },
+  {
+   "key": "sra:champ_00182",
+   "slug": "sra_champ_00182",
+   "bench": "SRA-Bench / champ",
+   "title": "champ_00182",
+   "preview": "Find a polynomial f(x) such that x*f(x−1)=(x+1)*f(x) for all x?"
+  },
+  {
+   "key": "sra:bigcodebench_00956",
+   "slug": "sra_bigcodebench_00956",
+   "bench": "SRA-Bench / bigcodebench",
+   "title": "bigcodebench_00956",
+   "preview": "Transforms a given string by removing special characters, normalizing whitespace, and randomizing character casing.\nNote that: This function considers special c"
+  },
+  {
+   "key": "sra:bigcodebench_00394",
+   "slug": "sra_bigcodebench_00394",
+   "bench": "SRA-Bench / bigcodebench",
+   "title": "bigcodebench_00394",
+   "preview": "Generate a random string of a given length using ASCII letters and calculate the frequency of each character.​\nThe function should output with:\n    dict: A dict"
+  }
+ ]
+}
