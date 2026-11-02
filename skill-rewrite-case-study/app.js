@@ -54,6 +54,17 @@ function rewritePanel(r, basePrompt) {
     <pre>${esc(r.output)}</pre>`;
 }
 
+function styleBox(d) {
+  const st = d.style, src = d.bench === "SkillsBench" ? "SkillsBench 自带 skill" : "本数据集自带 skill（非网上 skill）";
+  const row = (n, s) => `<tr><td>${n}</td><td>${s.cos.toFixed(2)}</td><td>${s.native}/10</td><td>${s.dup}</td></tr>`;
+  return `<div class="style">
+    <div class="sty-t"><b>风格对比</b>：${esc(st.text)}</div>
+    <table class="set"><tr><th></th><th>top-10 两两平均余弦相似度</th><th>${src}</th><th>同名重复</th></tr>
+      ${row("SkillGR", st.GR)}${row("SkillRouter", st.DR)}</table>
+    <div class="meta">两边 top-10 重合 ${st.overlap} 个。相似度用 Qwen3-Embedding-0.6B 对 skill 文本编码后计算，越高说明 10 个候选越集中在同一主题。</div>
+  </div>`;
+}
+
 async function showCase(c) {
   document.querySelectorAll("nav a").forEach(a => a.classList.toggle("on", a.dataset.slug === c.slug));
   const box = $("#case");
@@ -63,7 +74,7 @@ async function showCase(c) {
   box.innerHTML = `
     <section><h2>${esc(d.key.split(":")[1])} <span class="meta">${esc(d.bench)}</span></h2>
       <details${d.task.length < 1500 ? " open" : ""}><summary>任务描述（${d.task.length.toLocaleString()} 字符）</summary><pre>${esc(d.task)}</pre></details></section>
-    <section><h2>检索结果 top-10</h2><div class="cols">
+    <section><h2>检索结果 top-10</h2>${styleBox(d)}<div class="cols">
       ${retrievalCol("gr", "SkillGR", d.GR, d.DR)}${retrievalCol("dr", "SkillRouter", d.DR, d.GR)}
     </div></section>
     <section><h2>改写结果</h2>
